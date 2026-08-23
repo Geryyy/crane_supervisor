@@ -6,7 +6,7 @@
 # and the 20 Hz status rate of ROS 2 Interfaces 2 are constants in the source, so
 # a deployment cannot rename or re-rate a stream the task layer and the operator
 # panel subscribe to. What is left is what is a property of a rig rather than of
-# the architecture: three margins and the wiring of one remote.
+# the architecture: four margins and the wiring of one remote.
 #
 # **`tracking_tolerance` is deliberately absent from this file, exactly as it is
 # from crane_control/config/follow_controllers.yaml.** It is the one number that
@@ -41,6 +41,13 @@ crane_supervisor:
     # same number as pendulum_state_timeout -- both are 100 Hz streams out of the
     # manager's cycle, sampled here at 20 Hz.
     controller_state_timeout: 0.15
+    # Seconds. Past this the inner velocity loop counts as no longer reporting
+    # its own health, and the fault it computes every cycle -- including a
+    # missing commissioning prerequisite -- is reported as unread rather than as
+    # clear (control_architecture.md 5.3,
+    # commissioning_prerequisites.md 2). Same derivation and same number as
+    # remote_ctrl_timeout: both are 20 Hz contracts sampled here at 20 Hz.
+    controller_health_timeout: 0.25
     # Which RemoteCtrlStates button the deadman is. 12 is read from the retained
     # stack -- epsilon_crane_behavior_tree's approval gate tests button12, and
     # the TUI maps it to the z key control_architecture.md 6.2 names -- and not

@@ -61,6 +61,30 @@ crane_supervisor:
       can move underneath a running stream makes the status unreproducible."
     validation:
       bounds<>: [0.001, 10.0]
+  controller_health_timeout:
+    type: double
+    default_value: 0.25
+    read_only: true
+    description: "Longest age of the newest crane_msgs/VelocityControllerHealth
+      on /crane/velocity_controller/health that still counts as arriving, s. Past
+      it the supervisor reports FAULT_STATE_HEALTH and says the inner velocity
+      loop's verdict on itself is unread rather than clear: a controller that
+      stopped publishing must not be indistinguishable from one that is healthy
+      and commissioned, and an uncommissioned axis reported to nobody is the
+      state this stream exists to end (wiki/control_architecture.md 5.3,
+      wiki/implementation/commissioning_prerequisites.md 2). Derived exactly as
+      remote_ctrl_timeout is and to the same number, because the two streams have
+      the same shape: /crane/velocity_controller/health is a 20 Hz contract --
+      the 100 Hz loop decimates to the rate of its consumers -- sampled here at
+      20 Hz, so a healthy sample is up to 50 ms of publication period plus 50 ms
+      of status period old when it is read and the worst control-cycle gap in the
+      recorded machine data adds a further 50.4 ms. 250 ms clears the resulting
+      150 ms. Only 'arriving' against 'stopped' is decided here; the general
+      staleness policy of 5.3 is a later issue and this stream joins it there.
+      Read-only, for the reason the other three margins are: a margin an operator
+      can move underneath a running stream makes the status unreproducible."
+    validation:
+      bounds<>: [0.001, 10.0]
   joints:
     type: string_array
     default_value:

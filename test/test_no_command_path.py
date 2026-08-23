@@ -28,19 +28,21 @@ PACKAGE_XML = PACKAGE_ROOT / "package.xml"
 NON_SOURCE_DIRECTORIES = {".git", "__pycache__", "build", "install", "log"}
 
 # The contract names of ROS 2 Interfaces 4 and 5 this package may know: the
-# status stream it owns, the two inputs it carries end to end, and the one
+# status stream it owns, the four inputs it carries end to end, and the one
 # acknowledgement it serves.  Any other ROS name in the sources is a reach this
 # package does not have.
 STATUS_TOPIC = "/crane/supervisor/status"
 PENDULUM_STATE_TOPIC = "/crane/pendulum_state"
 REMOTE_CTRL_STATES_TOPIC = "/crane/remote_ctrl_states"
 CONTROLLER_STATE_TOPIC = "/crane/controller_state"
+CONTROLLER_HEALTH_TOPIC = "/crane/velocity_controller/health"
 CLEAR_FAULT_SERVICE = "/crane/clear_fault"
 PERMITTED_ROS_NAMES = {
     STATUS_TOPIC,
     PENDULUM_STATE_TOPIC,
     REMOTE_CTRL_STATES_TOPIC,
     CONTROLLER_STATE_TOPIC,
+    CONTROLLER_HEALTH_TOPIC,
     CLEAR_FAULT_SERVICE,
 }
 
@@ -198,12 +200,16 @@ def test_no_source_reaches_a_controller_or_a_command_interface():
 
 
 def test_the_package_publishes_one_stream_and_only_reads_its_inputs():
-    """One publisher, two subscriptions, one service, all on the contract names.
+    """One publisher, four subscriptions, one service, on the contract names.
 
     A second publisher is how a status node becomes a command node: the topic
     would be new, the QoS would be new, and nothing else about the package would
     look different.  A subscription and a `Trigger` server are the two shapes
     that cannot become that, which is why they are the two this package has.
+
+    `/crane/velocity_controller/health` is a subscription and stays one.  The
+    inner loop's fault reaches this node because the controller publishes it;
+    nothing here may publish on a topic named for a controller.
     """
     code, literals = _code_and_literals()
     publishers, subscriptions, services = [], [], []
@@ -217,6 +223,7 @@ def test_the_package_publishes_one_stream_and_only_reads_its_inputs():
         "crane_msgs::msg::PendulumState",
         "epsilon_crane_msgs::msg::RemoteCtrlStates",
         "control_msgs::msg::JointTrajectoryControllerState",
+        "crane_msgs::msg::VelocityControllerHealth",
     ], subscriptions
     assert services == PERMITTED_SERVICE_TYPES, services
 

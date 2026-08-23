@@ -57,12 +57,13 @@ constexpr char kNoStatusGiven[] =
 constexpr char kObserving[] =
   "no fault: the passive joint state is arriving inside its margin and pendulum_state_broadcaster "
   "reports it usable, the trajectory controller's own state is arriving and no axis is outside "
-  "its tolerance, the operator remote is arriving, its emergency stop is released and nothing "
-  "is latched, and the deadman is held. Those are the only inputs this supervisor watches -- "
-  "working cell, solver, sway and reference are not observed yet, inside_working_cell is not "
-  "computed and carries the value that claims nothing, and the supervisor holds no stop "
-  "authority until the hardware stop input is verified. Read FAULT_NONE as 'nothing this "
-  "supervisor watches is wrong', not as 'the machine is safe'.";
+  "its tolerance, the inner velocity loop is arriving and reports no fault of its own, the "
+  "operator remote is arriving, its emergency stop is released and nothing is latched, and the "
+  "deadman is held. Those are the only inputs this supervisor watches -- working cell, solver "
+  "and sway are not observed yet, inside_working_cell is not computed and carries the value that "
+  "claims nothing, and the supervisor holds no stop authority until the hardware stop input is "
+  "verified. Read FAULT_NONE as 'nothing this supervisor watches is wrong', not as 'the machine "
+  "is safe'.";
 
 // The trajectory controller's own state publication, and the tracking duty of
 // wiki/control_architecture.md §5 row 1 that is decided from it. Three of these
@@ -127,6 +128,84 @@ constexpr char kNoVelocityErrorReported[] =
   "it covers. It fills that field only when it holds a velocity state interface and a velocity or "
   "effort command interface; a profile that gives it neither leaves the field empty, and an empty "
   "field must not be read as a zero error.";
+
+// The inner velocity loop's own report. Three of these are §5.3's rule applied
+// to a fourth input, and the rest are the loop's three codes carried through
+// rather than restated: the controller computes them from the state interfaces
+// it claims itself and from the identified map of the tool it is driving, and
+// nothing above the controller manager can see either.
+constexpr char kControllerHealthNeverArrived[] =
+  "state health: no crane_msgs/VelocityControllerHealth has arrived on "
+  "/crane/velocity_controller/health since this supervisor started, so the inner velocity loop's "
+  "verdict on itself is not being read at all. Absence is not health -- an input that never "
+  "arrived is reported as a fault rather than left at FAULT_NONE -- and in particular a "
+  "commissioning prerequisite the controller is reporting would be reaching nobody, which is the "
+  "state the whole stream exists to end. Check that crane_velocity_controller is loaded and "
+  "active on the controller manager.";
+
+constexpr char kControllerHealthStoppedArriving[] =
+  "state health: the inner velocity loop stopped reporting its own health. The newest "
+  "crane_msgs/VelocityControllerHealth on /crane/velocity_controller/health is ";
+
+constexpr char kControllerHealthStoppedArrivingTail[] =
+  " s old, past the configured margin of ";
+
+constexpr char kControllerHealthStoppedArrivingAdvice[] =
+  " s. A controller that stopped publishing must not be indistinguishable from one that is "
+  "healthy and commissioned: check the controller manager's cycle and whether "
+  "crane_velocity_controller is still active.";
+
+constexpr char kControllerHealthStampAhead[] =
+  "state health: the age of the inner velocity loop's health report cannot be judged. The newest "
+  "crane_msgs/VelocityControllerHealth on /crane/velocity_controller/health is stamped ";
+
+constexpr char kControllerHealthStampAheadTail[] =
+  " s in this supervisor's future, further ahead than the configured margin of ";
+
+constexpr char kControllerHealthStampAheadAdvice[] =
+  " s. Synchronise the clock of the host publishing it with this one; until then a fault the "
+  "inner loop raised a moment ago and one it raised a minute ago are indistinguishable.";
+
+constexpr char kInnerLoopStateHealth[] =
+  "state health: the inner velocity loop reports a measurement of its own as stale or degraded. "
+  "It judges that per cycle from the state interfaces it claims itself -- the joint position and "
+  "velocity of each actuated axis and the chamber pressures the valve inverse is scheduled on -- "
+  "so it is the only element in this stack that can see it, and its code is carried here rather "
+  "than re-derived from anything else. The axis is not commanded and its integrator is frozen "
+  "while this holds.";
+
+constexpr char kInnerLoopReferenceStale[] =
+  "reference: the inner velocity loop reports that the horizon it was executing has run out and "
+  "nothing replaced it, so its velocity command is on the ramp to zero rather than following "
+  "anything (wiki/control_architecture.md 3.3, 5.3). Every measurement is fine and this is not a "
+  "state-health fault: the producer is gone. The motion is failed rather than held, and a silent "
+  "hold must not look like success.";
+
+constexpr char kInnerLoopUnexpectedFault[] =
+  "state health: the inner velocity loop reported a fault code it is not supposed to be able to "
+  "raise. Its own header names three -- FAULT_STATE_HEALTH, FAULT_REFERENCE_STALE and "
+  "FAULT_NOT_COMMISSIONED -- and crane_velocity_controller static_asserts all three against the "
+  "frozen crane_msgs/SupervisorStatus constants, so a fourth means the two have drifted apart. "
+  "The code is carried through unedited, because inventing a cause here would hide the drift.";
+
+constexpr char kNotCommissionedHead[] =
+  "not commissioned: the inner velocity loop is running with the feedforward disabled and PI only "
+  "on ";
+
+constexpr char kNotCommissionedTail[] =
+  ". That is a missing identified map and not a stale or degraded measurement, which is why it is "
+  "its own constant: what it asks for is a calibration, or someone who can run one, and not a "
+  "sensor check (wiki/implementation/commissioning_prerequisites.md 1, 2). It is reported below "
+  "every health cause for the same reason -- a missing calibration will still be missing next "
+  "cycle, while a state that just went stale is the one to act on now -- and only on the hardware "
+  "profile, because a rig with no hydraulics has nothing to commission. Nothing was stopped, "
+  "ramped or commanded here.";
+
+constexpr char kNotCommissionedNoAxis[] =
+  "not commissioned: the inner velocity loop reports a missing commissioning prerequisite but "
+  "named no axis for it, which is itself a defect. crane_msgs/VelocityControllerHealth carries a "
+  "feedforward flag per axis with the joint name beside it precisely so that this report can say "
+  "which calibration is missing rather than that one is.";
 
 constexpr char kNoticeHead[] =
   "no velocity-tracking tolerance for ";
@@ -394,6 +473,24 @@ std::string nothing_compared_reason(
   return any_tolerance ? kNoVelocityErrorReported : kNoToleranceAtAll;
 }
 
+/// The inner loop's own account of one of its codes, in the operator's terms.
+/**
+ * `NotCommissioned` is deliberately absent: it is answered where the axes it
+ * names are available, and it is reported at a different place in the order.
+ */
+const char * inner_loop_message(Fault fault)
+{
+  switch (fault) {
+    case Fault::StateHealth:
+      return kInnerLoopStateHealth;
+    case Fault::ReferenceStale:
+      return kInnerLoopReferenceStale;
+    default:
+      break;
+  }
+  return kInnerLoopUnexpectedFault;
+}
+
 /// One axis of a tracking fault, in the operator's terms and with its unit.
 std::string breach_text(const TrackingBreach & breach)
 {
@@ -426,6 +523,14 @@ bool validate(const SupervisorConfig & config, std::string & reason)
       "less would report the trajectory controller dead on every cycle, and one that is not a "
       "number would let a controller that stopped publishing pass for a crane that is tracking "
       "perfectly";
+    return false;
+  }
+  if (!std::isfinite(config.controller_health_timeout) || config.controller_health_timeout <= 0.0) {
+    reason =
+      "controller_health_timeout must be a finite positive number of seconds; a margin of zero or "
+      "less would report the inner velocity loop dead on every cycle, and one that is not a "
+      "number would let an inner loop that stopped publishing pass for one that is healthy and "
+      "commissioned";
     return false;
   }
   for (const AxisTolerance & axis : config.tracking_tolerance) {
@@ -513,9 +618,12 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
   const PendulumStateReport & state = input.pendulum_state;
   const RemoteCtrlReport & remote = input.remote_ctrl;
   const ControllerStateReport & controller = input.controller_state;
+  const ControllerHealthReport & inner_loop = input.controller_health;
   const StopSignal signal = stop_signal(config, remote);
   const StreamState tracking_stream =
     stream_state(config.controller_state_timeout, controller.received, controller.age);
+  const StreamState inner_loop_stream =
+    stream_state(config.controller_health_timeout, inner_loop.received, inner_loop.age);
 
   // Filled before any branch returns, for the same reason `deadman_held` is: it
   // is a field of its own on every report, so the largest deviation on the crane
@@ -603,6 +711,47 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
       break;
   }
 
+  // The fourth input's own freshness, judged the same way the other three are.
+  // §5.3 allows no input to stop arriving without a defined consequence, and the
+  // consequence here is that the inner loop's verdict is *unread* rather than
+  // clear -- an uncommissioned axis reported to nobody is the state this stream
+  // exists to end, so a stream that is not arriving must not read as one that is
+  // saying nothing is wrong. The general staleness policy is a later issue; this
+  // is the half of it that cannot wait.
+  switch (inner_loop_stream) {
+    case StreamState::NeverArrived:
+      decision.fault = Fault::StateHealth;
+      decision.message = kControllerHealthNeverArrived;
+      return decision;
+    case StreamState::StoppedArriving:
+      decision.fault = Fault::StateHealth;
+      decision.message = kControllerHealthStoppedArriving + seconds_text(inner_loop.age) +
+        kControllerHealthStoppedArrivingTail + seconds_text(config.controller_health_timeout) +
+        kControllerHealthStoppedArrivingAdvice;
+      return decision;
+    case StreamState::StampAhead:
+      decision.fault = Fault::StateHealth;
+      decision.message = kControllerHealthStampAhead + seconds_text(-inner_loop.age) +
+        kControllerHealthStampAheadTail + seconds_text(config.controller_health_timeout) +
+        kControllerHealthStampAheadAdvice;
+      return decision;
+    case StreamState::Arriving:
+      break;
+  }
+
+  // The inner loop's *health* codes, merged as the loop numbered them. Above
+  // tracking for the reason the passive state is above it -- a supervisor whose
+  // view of the crane is degraded should say so before it says anything derived
+  // -- and above the commissioning code for the reason
+  // wiki/implementation/commissioning_prerequisites.md §2 gives: the missing
+  // calibration will still be missing next cycle, and the state that just went
+  // stale is the one an operator has to act on now.
+  if (inner_loop.fault != Fault::None && inner_loop.fault != Fault::NotCommissioned) {
+    decision.fault = inner_loop.fault;
+    decision.message = inner_loop_message(inner_loop.fault);
+    return decision;
+  }
+
   // §5 row 1, as a typed cause. Per axis and in the tolerance's own unit,
   // because a max over rad/s and m/s decides nothing; the single number on the
   // wire is the indicator and this is the verdict. The decision about what to do
@@ -619,7 +768,23 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
     return decision;
   }
 
-  // Last of the four, and continuous rather than checked once at the start of a
+  // The commissioning code, below every health cause and below tracking, and
+  // above the interlock. Above it deliberately: on the hardware profile this
+  // condition is *standing* -- prerequisite 4 will hold until someone records a
+  // calibration -- while a released deadman is the ordinary resting state of the
+  // machine, so putting the interlock first would hide the report this stream
+  // exists to deliver behind the routine. Nothing is lost by the ordering,
+  // because `deadman_held` is a field of its own on every report and the
+  // commissioning code has none.
+  if (inner_loop.fault == Fault::NotCommissioned) {
+    decision.fault = Fault::NotCommissioned;
+    decision.message = inner_loop.feedforward_free_joints.empty()
+      ? kNotCommissionedNoAxis
+      : kNotCommissionedHead + joined(inner_loop.feedforward_free_joints) + kNotCommissionedTail;
+    return decision;
+  }
+
+  // Last of the five, and continuous rather than checked once at the start of a
   // motion (§6.2). It is last because it is the only one of them that is a fact
   // about the operator rather than a defect: a released deadman is the ordinary
   // resting state of the machine, and letting it outrank a dead publisher would

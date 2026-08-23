@@ -11,10 +11,28 @@
 // (wiki/control_architecture.md §5.2). What there is, is a *cause* on every
 // report (PRD user story 53).
 //
-// Three inputs are carried end to end: `crane_msgs/PendulumState` on
+// Four inputs are carried end to end: `crane_msgs/PendulumState` on
 // `/crane/pendulum_state`, `epsilon_crane_msgs/RemoteCtrlStates` on
-// `/crane/remote_ctrl_states`, and the trajectory controller's own
-// `control_msgs/JointTrajectoryControllerState`.
+// `/crane/remote_ctrl_states`, the trajectory controller's own
+// `control_msgs/JointTrajectoryControllerState`, and
+// `crane_msgs/VelocityControllerHealth` on
+// `/crane/velocity_controller/health`.
+//
+// The fourth is the inner velocity loop's verdict on itself, and it is carried
+// rather than re-derived for a reason that is not a preference: **only the
+// controller knows which axes the active tool has a valve calibration for.**
+// Nothing in `/joint_states` or in the trajectory controller's state says it, so
+// a supervisor that tried to work it out would be guessing at the one fact the
+// report exists to deliver. What arrives is a `crane_msgs/SupervisorStatus`
+// fault constant, so this package merges a code rather than translating one, and
+// the per-axis feedforward flags with the joint names beside them, so a panel
+// can say which axis is uncommissioned rather than that something is.
+//
+// Where it sits in the order below is `commissioning_prerequisites.md` §2's
+// rule and not this file's: when the controller's code and a cause this
+// supervisor watches both hold, the **health** code is reported in preference to
+// the **commissioning** code. A missing calibration will still be missing next
+// cycle; a state that just went stale is the one an operator has to act on now.
 //
 // The third is what turns the tracking duty of wiki/control_architecture.md §5
 // row 1 into a *typed cause* instead of the inferred abort §5.0 describes. The
@@ -225,6 +243,25 @@ struct SupervisorConfig
    */
   double controller_state_timeout{0.15};
 
+  /// Longest age of the newest `crane_msgs/VelocityControllerHealth` that still
+  /// counts as arriving, s.
+  /**
+   * Derived exactly as `remote_ctrl_timeout` is, and to the same number, because
+   * the two streams have the same shape rather than because one copied the
+   * other: `/crane/velocity_controller/health` is a 20 Hz contract (ROS 2
+   * Interfaces §4) — the 100 Hz loop decimates to the rate of its consumers —
+   * and this node samples it at 20 Hz, so a healthy sample can be a 50 ms
+   * publication period plus a 50 ms status period old when it is read, and the
+   * worst control-cycle gap in the recorded machine data adds a further 50.4 ms.
+   * 250 ms clears the resulting 150 ms.
+   *
+   * Only "arriving" against "stopped" is decided here. The general staleness
+   * policy of §5.3 is a later issue, and this stream joins it there; what is owed
+   * now is only that "no message yet" cannot read as a healthy, commissioned
+   * inner loop.
+   */
+  double controller_health_timeout{0.25};
+
   /// The six rows of `crane_control/config/tracking_tolerance.yaml`, in the
   /// order the actuated joints are configured in.
   /**
@@ -336,6 +373,33 @@ struct ControllerStateReport
   std::vector<AxisError> axes;
 };
 
+/// What the node observed of `/crane/velocity_controller/health` this cycle.
+/**
+ * The node computes `age` and reads the two parallel arrays off the message;
+ * everything else is the inner loop's own answer, carried and not restated.
+ */
+struct ControllerHealthReport
+{
+  /// False until the first message arrives. As with the other three inputs, a
+  /// stream that stopped is caught by `age` instead: "the controller never came
+  /// up" and "the controller died" are different things to tell an operator.
+  bool received{false};
+  /// `now - header.stamp` of the newest message, s. Negative when the stamp is
+  /// in this node's future, which is a clock fault rather than a fresh sample.
+  double age{0.0};
+  /// `crane_msgs/VelocityControllerHealth.fault`, in the numbering the wire and
+  /// this enum share. The inner loop can raise `StateHealth`, `ReferenceStale`
+  /// and `NotCommissioned`; a fourth would mean the controller's own
+  /// `static_assert` block and the frozen message have drifted apart, so it is
+  /// carried through rather than flattened into one of the three.
+  Fault fault{Fault::None};
+  /// The URDF joints the newest report marked `feedforward_applied == false` —
+  /// the axes that ran PI only. Named and not counted: a panel that says
+  /// "q9_left_rail_joint" tells an operator which calibration to run, and one
+  /// that says "one axis" does not.
+  std::vector<std::string> feedforward_free_joints;
+};
+
 /// One axis whose velocity error is outside its own tolerance.
 struct TrackingBreach
 {
@@ -347,13 +411,14 @@ struct TrackingBreach
   double tolerance{0.0};
 };
 
-/// Everything one decision is made from. Three inputs in this slice; the rest of
-/// the causes of §5 arrive as further members, one issue each.
+/// Everything one decision is made from. Four inputs so far; the rest of the
+/// causes of §5 arrive as further members, one issue each.
 struct SupervisorInput
 {
   PendulumStateReport pendulum_state;
   RemoteCtrlReport remote_ctrl;
   ControllerStateReport controller_state;
+  ControllerHealthReport controller_health;
   /// The emergency-stop latch as the previous cycle left it.
   /**
    * The latch is state and the core is a pure function, so the state is

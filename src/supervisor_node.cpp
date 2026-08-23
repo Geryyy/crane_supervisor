@@ -66,6 +66,7 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   config_.pendulum_state_timeout = parameters.pendulum_state_timeout;
   config_.remote_ctrl_timeout = parameters.remote_ctrl_timeout;
   config_.controller_state_timeout = parameters.controller_state_timeout;
+  config_.controller_health_timeout = parameters.controller_health_timeout;
   config_.deadman_button = static_cast<int>(parameters.deadman_button);
 
   // The six numbers arrive from `crane_control/config/tracking_tolerance.yaml`
@@ -127,6 +128,18 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
       controller_state_ = std::move(message);
     });
 
+  // The fourth input, and the only one this supervisor could not re-derive from
+  // anything else on the graph: which axes the active tool has an identified
+  // valve map for is known to the inner velocity loop alone. It computes the
+  // fault every cycle and publishes it at the rate of the consumers, of which
+  // this node is one.
+  controller_health_subscription_ =
+    create_subscription<crane_msgs::msg::VelocityControllerHealth>(
+    kControllerHealthTopic, contract_qos(),
+    [this](crane_msgs::msg::VelocityControllerHealth::ConstSharedPtr message) {
+      controller_health_ = std::move(message);
+    });
+
   // The acknowledgement of ROS 2 Interfaces §5, and the only thing in this
   // package a caller can ask for. It lowers a latch and does nothing else: it
   // starts nothing, resumes nothing and commands nothing, and refusing new goals
@@ -154,12 +167,12 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   RCLCPP_INFO(
     get_logger(),
     "crane_supervisor: publishing %s at %.1f Hz. It observes %s, %s -- button %d of it is the "
-    "deadman -- and %s, serves %s, and does nothing else. It holds no stop authority: the "
+    "deadman -- %s and %s, serves %s, and does nothing else. It holds no stop authority: the "
     "hardware stop input is an unverified commissioning prerequisite, so the package has no path "
     "to a motion command by construction, and what it does with the emergency stop is diagnosis "
     "and recovery rather than protection.",
     kStatusTopic, kStatusRate, kPendulumStateTopic, kRemoteCtrlStatesTopic,
-    config_.deadman_button, kControllerStateTopic, kClearFaultService);
+    config_.deadman_button, kControllerStateTopic, kControllerHealthTopic, kClearFaultService);
 }
 
 SupervisorInput SupervisorNode::observe() const
@@ -210,6 +223,28 @@ SupervisorInput SupervisorNode::observe() const
         axis.velocity_error_reported = true;
       }
       input.controller_state.axes.push_back(std::move(axis));
+    }
+  }
+
+  if (controller_health_) {
+    const auto & message = *controller_health_;
+    input.controller_health.received = true;
+    // The controller stamps the report with the control cycle's own time, the
+    // same clock the other three inputs are aged against.
+    input.controller_health.age = (now() - rclcpp::Time(message.header.stamp)).seconds();
+    // A cast and not a lookup table: the message and the core's enum share one
+    // numbering, and `test_contract.cpp` asserts every pair of them. A value
+    // outside the ten constants stays what the controller sent rather than being
+    // folded into one of them -- see `ControllerHealthReport::fault`.
+    input.controller_health.fault = static_cast<Fault>(message.fault);
+    // An axis the controller named and did not apply the feedforward to. The
+    // name is taken off the wire rather than off this node's own `joints`: the
+    // sixth valve channel drives a different joint per tool, and the controller
+    // is the one that knows which tool it is driving.
+    for (std::size_t i = 0; i < message.joint_names.size(); ++i) {
+      if (!message.joint_names[i].empty() && !message.feedforward_applied[i]) {
+        input.controller_health.feedforward_free_joints.push_back(message.joint_names[i]);
+      }
     }
   }
 

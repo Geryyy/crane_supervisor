@@ -36,6 +36,7 @@
 #include "control_msgs/msg/joint_trajectory_controller_state.hpp"
 #include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
+#include "crane_msgs/msg/velocity_controller_health.hpp"
 #include "crane_supervisor/supervisor_core.hpp"
 #include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -73,6 +74,21 @@ inline constexpr double kStatusRate = 20.0;
  * this stream; the name follows §1's rule and the row is owed.
  */
 inline constexpr char kControllerStateTopic[] = "/crane/controller_state";
+
+/// Where the inner velocity loop's own health is read from.
+/**
+ * A contract name of ROS 2 Interfaces §4 and, unlike the two above, one whose
+ * producer already publishes on it: `crane_velocity_controller` creates the
+ * publisher with this absolute name itself, so no profile has to remap anything
+ * for this input to arrive.
+ *
+ * It is the one input this supervisor could not possibly re-derive. Which axes
+ * the active tool has an identified valve map for is not in `/joint_states`, not
+ * in the trajectory controller's state and not anywhere else on the graph — the
+ * controller is the only element that knows, which is why the fault stays where
+ * it is computed and travels as a message.
+ */
+inline constexpr char kControllerHealthTopic[] = "/crane/velocity_controller/health";
 
 /// The configured deadman, out of the twelve booleans the message carries.
 /**
@@ -127,6 +143,12 @@ private:
   /// one. Held for the same reason as the other two: a trajectory controller
   /// that stopped publishing is not a crane that is tracking perfectly.
   control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr controller_state_;
+  /// The newest message on `/crane/velocity_controller/health`, or null before
+  /// the first one. Held for the same reason as the other three: an inner loop
+  /// that stopped publishing is not an inner loop with nothing to report, and
+  /// an uncommissioned axis reported to nobody is the state this input exists
+  /// to end.
+  crane_msgs::msg::VelocityControllerHealth::ConstSharedPtr controller_health_;
   /// The emergency-stop latch, carried from one decision into the next. Raised
   /// by `decide()`, lowered only by an acknowledged `/crane/clear_fault`.
   bool estop_latched_{false};
@@ -140,6 +162,8 @@ private:
     remote_ctrl_subscription_;
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
     controller_state_subscription_;
+  rclcpp::Subscription<crane_msgs::msg::VelocityControllerHealth>::SharedPtr
+    controller_health_subscription_;
   rclcpp::Publisher<crane_msgs::msg::SupervisorStatus>::SharedPtr status_publisher_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_fault_service_;
   rclcpp::TimerBase::SharedPtr status_timer_;

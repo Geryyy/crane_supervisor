@@ -58,6 +58,54 @@ crane_supervisor:
     # commissioning_prerequisites.md 2). Same derivation and same number as
     # remote_ctrl_timeout: both are 20 Hz contracts sampled here at 20 Hz.
     controller_health_timeout: 0.25
+
+    # The sway duty of control_architecture.md 5 row 7: a bound on the passive
+    # joint *rate* that raises FAULT_SWAY and names which coordinate crossed it,
+    # and a three-valued settled predicate the task layer gates a grip action on
+    # instead of on a timeout.
+    #
+    # **All four are DESIGN values, not measured ones.** Nothing on this machine
+    # has been measured to produce them, and the full derivation of each -- plus
+    # what would replace it, and who owns that -- is in
+    # src/crane_supervisor_parameters.yaml, once. In short:
+    #
+    #   dq_u_max         0.4 rad/s   peak rate of a ~0.2 rad swing at the
+    #                                pendulum's own 2 rad/s. Replaced by
+    #                                q_sway_max, which slice 5's swing envelope
+    #                                and virtual working cell fix together.
+    #   dq_u_settled     0.04 rad/s  peak rate of a ~0.02 rad swing -- the order
+    #                                of a placement budget -- and about 7 sigma
+    #                                of the identified rate noise, so a still
+    #                                crane can actually be observed to be still.
+    #                                Replaced by a recording of a grip approach
+    #                                with the load swinging: machine and human,
+    #                                like merge gate (ii-b).
+    #   release factor   1.5         hysteresis on the way out, so one noise
+    #                                sample past the bound does not cost a whole
+    #                                dwell at 20 Hz.
+    #   settle_dwell     2.0 s       above the 1.57 s half period of a 2 rad/s
+    #                                pendulum, which is the shortest window that
+    #                                must contain a rate peak. Replaced by the
+    #                                longest period over the working range,
+    #                                measured -- l_tool changes with telescope
+    #                                extension and with the tool.
+    #
+    # The bound is on the rate and not on the angle because the published angle
+    # is read out on the nominal hinge axes and carries an uncalibrated constant
+    # offset, while the rate is composed from the two gyro readings and does not.
+    # velocity_covariance is not consulted at all: it is the identified noise of
+    # the sensor pair rather than a statement about the cycle in hand.
+    #
+    # Both arrays are [tip, tilt], the index order PendulumState publishes.
+    # Unlike tracking_tolerance these numbers are refused rather than reported
+    # when absent -- they ship with the package, so a deployment without one is
+    # misconfigured rather than waiting on a campaign.
+    sway:
+      dq_u_max: [0.4, 0.4]
+      dq_u_settled: [0.04, 0.04]
+      settled_release_factor: 1.5
+      settle_dwell: 2.0
+
     # Which RemoteCtrlStates button the deadman is. 12 is read from the retained
     # stack -- epsilon_crane_behavior_tree's approval gate tests button12, and
     # the TUI maps it to the z key control_architecture.md 6.2 names -- and not

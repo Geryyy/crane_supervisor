@@ -28,11 +28,12 @@ constexpr char kAbsenceIsNotHealth[] =
 
 constexpr char kObserving[] =
   "no fault: the passive joint state is arriving inside its margin and pendulum_state_broadcaster "
-  "reports it usable, the trajectory controller's own state is arriving and no axis is outside "
-  "its tolerance, the inner velocity loop is arriving and reports no fault of its own, the "
+  "reports it usable, neither passive rate is past its sway bound, the trajectory controller's own "
+  "state is arriving and no axis is outside its tolerance, the inner velocity loop is arriving and "
+  "reports no fault of its own, the "
   "operator remote is arriving, its emergency stop is released and nothing is latched, and the "
   "deadman is held. Those are the only inputs this supervisor watches -- every one of them has a "
-  "freshness deadline of its own and none is exempt, but working cell, solver and sway are not "
+  "freshness deadline of its own and none is exempt, but working cell and solver are not "
   "observed yet, inside_working_cell is not computed and carries the value that claims nothing, "
   "and the supervisor holds no stop authority until the hardware stop input is verified. Nor does "
   "this cover the controllers below it: the manual forwarding controller zeroes 0.5 s after its "
@@ -361,6 +362,13 @@ bool validate(const SupervisorConfig & config, std::string & reason)
       return false;
     }
   }
+  // Refused rather than reported, unlike the tracking tolerance above: these
+  // numbers ship with the package, so a deployment without one has been
+  // misconfigured and a supervisor that went on publishing would report
+  // FAULT_NONE for a duty it had quietly stopped performing.
+  if (!validate_sway(config.sway, reason)) {
+    return false;
+  }
   if (config.deadman_button < kFirstButton || config.deadman_button > kLastButton) {
     reason =
       "deadman_button must name one of the twelve booleans of "
@@ -505,19 +513,25 @@ std::vector<TrackingBreach> tracking_breaches(
   return breaches;
 }
 
-SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput & input)
+namespace
+{
+
+/// The cause of one cycle, with the sway already judged.
+/**
+ * The precedence chain, and nothing else. It is split out from `decide()` so
+ * that the settled clause every report ends in is appended in exactly one place:
+ * a clause added at each of the ten `return`s below is a clause the eleventh
+ * would be missing.
+ */
+SupervisorDecision resolve(
+  const SupervisorConfig & config, const SupervisorInput & input,
+  const std::array<Staleness, kInputCount> & staleness, const SwayVerdict & sway)
 {
   SupervisorDecision decision;
   // Mode arbitration is a later issue and this supervisor has verified nothing,
   // so it reports the mode it can defend and no other.
   decision.mode = Mode::Idle;
 
-  // One pass over every input, on the status cycle: `kInputCount` comparisons,
-  // no allocation, and no dependence on a message arriving. A deadline that were
-  // evaluated only in a subscription callback could never fire, because the case
-  // it exists for is the one where no callback runs again
-  // (wiki/control_architecture.md §5.3).
-  const std::array<Staleness, kInputCount> staleness = freshness(config, input);
   const Staleness remote_cause = staleness[index_of(Input::RemoteCtrl)];
 
   const PendulumStateReport & state = input.pendulum_state;
@@ -612,6 +626,21 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
     return decision;
   }
 
+  // §5 row 7, as a typed cause. Below every health cause, because a supervisor
+  // whose own view of the crane is degraded should say that before it says
+  // anything derived from it -- and a degraded estimate cannot reach here at all,
+  // since `judge_sway()` raises no breach off a rate it was told not to trust.
+  // Above tracking, because of the two this is the one with no field of its own:
+  // `tracking_error` is filled on every report whatever `fault` says, so a
+  // tracking excess stays visible in a cycle sway owns, while a swinging load
+  // reported behind a tracking fault would be invisible. It is the same rule
+  // that puts the commissioning code above the interlock.
+  if (!sway.breaches.empty()) {
+    decision.fault = Fault::Sway;
+    decision.message = sway_breach_message(sway.breaches);
+    return decision;
+  }
+
   // §5 row 1, as a typed cause. Per axis and in the tolerance's own unit,
   // because a max over rad/s and m/s decides nothing; the single number on the
   // wire is the indicator and this is the verdict. The decision about what to do
@@ -664,6 +693,43 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
   if (!uncompared.empty()) {
     decision.message += kNoAxisCompared + uncompared;
   }
+  return decision;
+}
+
+}  // namespace
+
+SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput & input)
+{
+  // One pass over every input, on the status cycle: `kInputCount` comparisons,
+  // no allocation, and no dependence on a message arriving. A deadline that were
+  // evaluated only in a subscription callback could never fire, because the case
+  // it exists for is the one where no callback runs again
+  // (wiki/control_architecture.md §5.3).
+  const std::array<Staleness, kInputCount> staleness = freshness(config, input);
+
+  // The one place that decides whether the passive estimate is to be believed,
+  // and it is the same answer the precedence chain reports on: the stream inside
+  // its own deadline *and* the broadcaster marking the sample usable. A second
+  // opinion here is how a rate gets judged against a bound in a cycle whose
+  // report says the estimate was unusable.
+  const bool estimate_trusted =
+    staleness[index_of(Input::PendulumState)] == Staleness::Fresh && input.pendulum_state.valid;
+
+  // Judged before the chain runs, not inside it, for the reason `deadman_held`
+  // and `tracking_error` are filled before any branch returns: the dwell is owed
+  // on every cycle, and one that stopped advancing whenever something more
+  // consequential owned `fault` would restart every time the operator let go of
+  // the deadman.
+  const SwayVerdict sway = judge_sway(
+    config.sway, input.pendulum_state.velocity, estimate_trusted, input.sampled_at, input.sway);
+
+  SupervisorDecision decision = resolve(config, input, staleness, sway);
+  decision.sway = sway.state;
+  // On every report, whatever `fault` says. The predicate has no field of its
+  // own on `crane_msgs/SupervisorStatus`, so this clause is the only thing that
+  // carries it onto the wire -- which is why it is appended here, once, rather
+  // than at each of the branches above.
+  decision.message += settled_clause(config.sway, input.pendulum_state.velocity, sway);
   return decision;
 }
 

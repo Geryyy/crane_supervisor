@@ -14,7 +14,7 @@ find_package(std_srvs REQUIRED)
 # folder inside the node so that the test binary below can link it with no ROS
 # runtime in the process at all, which is what makes every cause reachable one
 # at a time (wiki/implementation/style_guide.md §3, §6).
-add_library(supervisor_core STATIC src/supervisor_core.cpp)
+add_library(supervisor_core STATIC src/supervisor_core.cpp src/sway_monitor.cpp)
 add_library(${PROJECT_NAME}::supervisor_core ALIAS supervisor_core)
 set_target_properties(supervisor_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(supervisor_core PUBLIC cxx_std_17)
@@ -94,6 +94,13 @@ if(BUILD_TESTING)
   # The decision core, offline. No ROS is linked into this binary.
   ament_add_gtest(test_supervisor_core test/test_supervisor_core.cpp)
   target_link_libraries(test_supervisor_core supervisor_core)
+
+  # The sway bound and the settled predicate, on fixed rate sequences: the
+  # crossing, the dwell, the hysteresis and the unknown state, each driven one
+  # cycle at a time with the clock as an argument. No ROS is linked here either,
+  # which is what lets a two-second dwell be asserted in microseconds.
+  ament_add_gtest(test_sway_monitor test/test_sway_monitor.cpp)
+  target_link_libraries(test_sway_monitor supervisor_core)
 
   # The published stream, in process: the node object and an observer in one
   # executor on the isolated domain `ralph/verify.sh` pins. No launch, no

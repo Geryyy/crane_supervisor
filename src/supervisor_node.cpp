@@ -93,6 +93,26 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   config_.deadline(Input::ControllerHealth) = parameters.controller_health_timeout;
   config_.deadman_button = static_cast<int>(parameters.deadman_button);
 
+  // The sway duty's bounds, in the order `PassiveAxis` fixes -- which is also
+  // the order `crane_msgs/PendulumState` publishes its two arrays in, so nothing
+  // on this path reorders anything. Every one of them is a design value and
+  // `src/crane_supervisor_parameters.yaml` says so beside each, with what would
+  // replace it; `validate()` below refuses a deployment that is missing one.
+  // A block that arrived short leaves the slots it did not fill at the zero they
+  // are value-initialised with, and zero is not a bound: the declared
+  // `fixed_size<>` refuses that first, and if it ever did not, `validate()` names
+  // the coordinate rather than this loop reading past the end of a vector.
+  for (std::size_t i = 0; i < kPassiveAxisCount; ++i) {
+    if (i < parameters.sway.dq_u_max.size()) {
+      config_.sway.dq_u_max[i] = parameters.sway.dq_u_max[i];
+    }
+    if (i < parameters.sway.dq_u_settled.size()) {
+      config_.sway.dq_u_settled[i] = parameters.sway.dq_u_settled[i];
+    }
+  }
+  config_.sway.settled_release_factor = parameters.sway.settled_release_factor;
+  config_.sway.settle_dwell = parameters.sway.settle_dwell;
+
   // The six numbers arrive from `crane_control/config/tracking_tolerance.yaml`
   // -- the file's node key is the wildcard on purpose, so the seam clamp, the
   // MPC's constraint margin and this supervisor read the same rows out of the
@@ -224,6 +244,7 @@ SupervisorInput SupervisorNode::observe() const
 {
   SupervisorInput input;
   input.estop_latched = estop_latched_;
+  input.sway = sway_state_;
 
   // One reading of the clock for all of them, so two inputs sampled in the same
   // cycle are aged against the same instant. `now() - header.stamp` is the age
@@ -231,6 +252,11 @@ SupervisorInput SupervisorNode::observe() const
   // here stamps from the control cycle's own time on the same clock, so the two
   // sides agree about what time it is without either saying so on the wire.
   const rclcpp::Time sampled_at = now();
+  // The same reading, in the seconds the ROS-free core measures its dwell in. It
+  // is this node's clock and not a message stamp, deliberately: the dwell is how
+  // long *this supervisor* has been watching a calm crane, and a producer whose
+  // stamps stopped advancing must not be able to complete one.
+  input.sampled_at = sampled_at.seconds();
   const auto age_of = [&sampled_at](const auto & message) {
       return (sampled_at - rclcpp::Time(message->header.stamp)).seconds();
     };
@@ -256,6 +282,12 @@ SupervisorInput SupervisorNode::observe() const
   if (pendulum_state_) {
     input.pendulum_state.valid = pendulum_state_->valid;
     input.pendulum_state.status = pendulum_state_->status;
+    // The rate, in the `[tip, tilt]` order both ends already agree on. Neither
+    // `position` nor `velocity_covariance` is read: the angle carries an
+    // uncalibrated constant offset and the covariance is the identified noise of
+    // the sensor pair rather than a statement about this cycle
+    // (crane_supervisor/sway_monitor.hpp).
+    input.pendulum_state.velocity = pendulum_state_->velocity;
   }
 
   if (remote_ctrl_) {
@@ -308,9 +340,12 @@ SupervisorInput SupervisorNode::observe() const
 void SupervisorNode::update()
 {
   const SupervisorDecision decision = decide(config_, observe());
-  // The latch is the one thing a cycle carries into the next one. `decide()`
-  // raises it; only an acknowledged `/crane/clear_fault` lowers it.
+  // The two things a cycle carries into the next one. `decide()` raises the
+  // latch and only an acknowledged `/crane/clear_fault` lowers it; the sway dwell
+  // is advanced on every cycle whatever the report said, so that a fault
+  // somewhere else does not restart it.
   estop_latched_ = decision.estop_latched;
+  sway_state_ = decision.sway;
 
   crane_msgs::msg::SupervisorStatus status;
   status.header.stamp = now();

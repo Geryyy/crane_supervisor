@@ -33,6 +33,45 @@ const std::vector<std::string> & actuated_joints()
   return joints;
 }
 
+/// The four sway numbers `config/crane_supervisor.yaml` ships.
+/**
+ * Written out here for the same reason the deadlines below are: `SwayBound` is
+ * value-initialised to zero, zero is not a bound and `validate()` refuses one,
+ * so a test of the decision has to say which bounds it is deciding against
+ * exactly as a deployment does. Their derivations, and what would replace each,
+ * are in `src/crane_supervisor_parameters.yaml`; the properties those
+ * derivations claim are asserted in `test_sway_monitor.cpp`.
+ */
+crane_supervisor::SwayBound shipped_sway_bound()
+{
+  crane_supervisor::SwayBound bound;
+  bound.dq_u_max = {{0.4, 0.4}};
+  bound.dq_u_settled = {{0.04, 0.04}};
+  bound.settled_release_factor = 1.5;
+  bound.settle_dwell = 2.0;
+  return bound;
+}
+
+/// The status period of ROS 2 Interfaces §2, as the step a sequence advances by.
+constexpr double kCycle = 1.0 / 20.0;
+
+/// The clock a fixture starts at, s. Epoch-scale rather than zero, because that
+/// is what a node's clock reads and the dwell arithmetic runs on it.
+constexpr double kFirstCycle = 1'700'000'000.0;
+
+/// The part of a report the fault composed, without the settled clause.
+/**
+ * Every report ends in the settled clause, and the clause names both passive
+ * coordinates in rad/s. A test asserting that a *length* axis is not reported in
+ * rad/s therefore has to look at the sentence the fault wrote and not at the
+ * whole string. The seam comes off the core rather than being written out here,
+ * so the two cannot drift apart.
+ */
+std::string without_settled_clause(const std::string & message)
+{
+  return message.substr(0, message.find(crane_supervisor::kSettledClausePrefix));
+}
+
 /// The four shipped freshness deadlines, s, in `Input` order.
 /**
  * Written out here rather than read off a struct default, because there is no
@@ -49,6 +88,7 @@ crane_supervisor::SupervisorConfig with_shipped_deadlines(
   config.deadline(Input::RemoteCtrl) = 0.25;
   config.deadline(Input::ControllerState) = 0.15;
   config.deadline(Input::ControllerHealth) = 0.25;
+  config.sway = shipped_sway_bound();
   return config;
 }
 
@@ -161,9 +201,23 @@ crane_supervisor::SupervisorInput healthy_input()
   }
   input.pendulum_state.valid = true;
   input.pendulum_state.status = "complementary filter on the two bracketing IMUs";
+  // A still crane. The rate is filled because a `PendulumStateReport` that was
+  // never given one carries NaN -- the absence of a measurement -- and a fixture
+  // built on the absence would be asserting about the sway being unknowable
+  // rather than about whatever the test was written for.
+  input.pendulum_state.velocity = {{0.0, 0.0}};
+  input.sampled_at = kFirstCycle;
   input.remote_ctrl = held_remote();
   input.controller_state = tracking_controller();
   input.controller_health = healthy_inner_loop();
+  return input;
+}
+
+/// The same input with both passive rates set.
+crane_supervisor::SupervisorInput swinging(double dq_u)
+{
+  crane_supervisor::SupervisorInput input = healthy_input();
+  input.pendulum_state.velocity = {{dq_u, dq_u}};
   return input;
 }
 
@@ -188,13 +242,15 @@ crane_supervisor::SupervisorInput stale(
   return input;
 }
 
-/// One decision, with the latch carried into the next input the way the node
-/// carries it. The latch is the only thing a cycle hands to its successor.
+/// One decision, with everything a cycle hands to its successor carried the way
+/// the node carries it: the emergency-stop latch, the sway dwell, and the clock.
 crane_supervisor::SupervisorDecision step(
   const crane_supervisor::SupervisorConfig & config, crane_supervisor::SupervisorInput & input)
 {
   const auto decision = crane_supervisor::decide(config, input);
   input.estop_latched = decision.estop_latched;
+  input.sway = decision.sway;
+  input.sampled_at += kCycle;
   return decision;
 }
 
@@ -921,9 +977,13 @@ TEST(SupervisorCore, ALengthAxisIsComparedInItsOwnUnitAndSaysWhichItIs)
 
   const auto decision = crane_supervisor::decide(config, input);
   EXPECT_EQ(decision.fault, crane_supervisor::Fault::Tracking);
-  EXPECT_NE(decision.message.find("q9_left_rail_joint"), std::string::npos) << decision.message;
-  EXPECT_NE(decision.message.find("m/s"), std::string::npos) << decision.message;
-  EXPECT_EQ(decision.message.find("rad/s"), std::string::npos) << decision.message;
+  // The sentence the fault composed, without the settled clause every report
+  // ends in: that clause reports the two passive rates and is in rad/s by
+  // construction, so the mixed-unit assertion is about the tracking half.
+  const std::string tracking = without_settled_clause(decision.message);
+  EXPECT_NE(tracking.find("q9_left_rail_joint"), std::string::npos) << tracking;
+  EXPECT_NE(tracking.find("m/s"), std::string::npos) << tracking;
+  EXPECT_EQ(tracking.find("rad/s"), std::string::npos) << tracking;
 }
 
 TEST(SupervisorCore, AxesArePairedByNameAndTheWorstOffenderIsNamedFirst)
@@ -1229,6 +1289,136 @@ TEST(SupervisorCore, TheStopAndTheStateOutrankTrackingAndTrackingOutranksTheInte
   EXPECT_EQ(crane_supervisor::decide(config, everything).fault, crane_supervisor::Fault::EStop);
 }
 
+TEST(SupervisorCore, APassiveRatePastItsBoundIsATypedCauseThatNamesTheCoordinate)
+{
+  // wiki/control_architecture.md §5 row 7.  Per coordinate and on the *rate*,
+  // because the published angle carries an uncalibrated constant offset that
+  // nothing in this workspace has measured and the rate does not.
+  const auto config = default_config();
+
+  // One hair under the bound is not a fault; one hair over is.
+  auto input = swinging(config.sway.dq_u_max[0]);
+  EXPECT_EQ(crane_supervisor::decide(config, input).fault, crane_supervisor::Fault::None);
+
+  input = healthy_input();
+  input.pendulum_state.velocity = {{0.0, 0.9}};
+  const auto decision = crane_supervisor::decide(config, input);
+  EXPECT_EQ(decision.fault, crane_supervisor::Fault::Sway);
+  // Which of the two coordinates crossed it, and which did not.
+  EXPECT_NE(decision.message.find("theta7_tilt_joint"), std::string::npos) << decision.message;
+  EXPECT_EQ(decision.message.find("theta6_tip_joint"), std::string::npos) << decision.message;
+  EXPECT_NE(decision.message.find("0.9000"), std::string::npos) << decision.message;
+  EXPECT_NE(decision.message.find("0.4000"), std::string::npos) << decision.message;
+  // Nothing was acted on, on this cause least of all: refusing a motion needs an
+  // authority over a mode that this supervisor does not have yet, and damping is
+  // a later slice.
+  EXPECT_NE(decision.message.find("Nothing was stopped"), std::string::npos) << decision.message;
+  // And a rate past the fault bound is certainly not settled.
+  EXPECT_EQ(decision.sway.settled, crane_supervisor::SwaySettled::NotSettled);
+}
+
+TEST(SupervisorCore, ADegradedEstimateIsStateHealthAndNeverSway)
+{
+  // The distinction the whole duty rests on.  A sensor that stopped saying
+  // anything is a different fact from a load that is swinging, and an operator
+  // does different things about them: one is a check of the graph and the other
+  // is a wait.  So a degraded estimate carrying a wild rate is reported as
+  // FAULT_STATE_HEALTH and the predicate goes to unknown, rather than the rate
+  // being taken at face value and reported as a swing.
+  const auto config = default_config();
+
+  auto invalid = swinging(9.0);
+  invalid.pendulum_state.valid = false;
+  invalid.pendulum_state.status = "the upstream IMU on K5 does not report itself healthy";
+  const auto degraded = crane_supervisor::decide(config, invalid);
+  EXPECT_EQ(degraded.fault, crane_supervisor::Fault::StateHealth);
+  EXPECT_EQ(degraded.sway.settled, crane_supervisor::SwaySettled::Unknown);
+  EXPECT_NE(degraded.message.find(invalid.pendulum_state.status), std::string::npos)
+    << degraded.message;
+
+  // The same for every way the stream itself can fail to be fresh.
+  for (const Staleness cause : transport_causes()) {
+    auto absent = stale(config, Input::PendulumState, cause);
+    absent.pendulum_state.velocity = {{9.0, 9.0}};
+    const auto reported = crane_supervisor::decide(config, absent);
+    EXPECT_EQ(reported.fault, crane_supervisor::Fault::StateHealth);
+    EXPECT_EQ(reported.sway.settled, crane_supervisor::SwaySettled::Unknown);
+  }
+}
+
+TEST(SupervisorCore, TheSwayFaultSitsBelowEveryHealthCauseAndAboveTracking)
+{
+  // Precedence, stated once.  Below the health causes because a supervisor whose
+  // own view of the crane is degraded should say that before it says anything
+  // derived from it -- and above tracking because of the two, sway is the one
+  // with no field of its own: `tracking_error` is filled on every report, so a
+  // tracking excess stays visible in a cycle sway owns, while a swinging load
+  // reported behind a tracking fault would be invisible.
+  const auto config = config_with_tolerances();
+
+  auto both_wrong = swinging(0.9);
+  both_wrong.controller_state = with_error("theta1_slewing_joint", 0.0, 1.0);
+  EXPECT_EQ(crane_supervisor::decide(config, both_wrong).fault, crane_supervisor::Fault::Sway);
+  // The tracking measurement is not lost by the ordering.
+  EXPECT_DOUBLE_EQ(crane_supervisor::decide(config, both_wrong).tracking_error, 0.0);
+
+  // Every health cause outranks it, whichever input raised it.
+  auto inner_health = both_wrong;
+  inner_health.controller_health = inner_loop_fault(crane_supervisor::Fault::StateHealth);
+  EXPECT_EQ(
+    crane_supervisor::decide(config, inner_health).fault, crane_supervisor::Fault::StateHealth);
+
+  auto dead_controller = both_wrong;
+  dead_controller.stream(Input::ControllerState).age = 10.0;
+  EXPECT_EQ(
+    crane_supervisor::decide(config, dead_controller).fault, crane_supervisor::Fault::StateHealth);
+
+  // And the commissioning code and the interlock sit below it, because both of
+  // them are conditions that will still be there next cycle.
+  auto uncommissioned = both_wrong;
+  uncommissioned.controller_health = uncommissioned_gripper();
+  uncommissioned.remote_ctrl.deadman_held = false;
+  const auto over = crane_supervisor::decide(config, uncommissioned);
+  EXPECT_EQ(over.fault, crane_supervisor::Fault::Sway);
+  EXPECT_FALSE(over.deadman_held);
+
+  // The stop still outranks everything.
+  auto stopped = both_wrong;
+  stopped.remote_ctrl.em_stop = true;
+  EXPECT_EQ(crane_supervisor::decide(config, stopped).fault, crane_supervisor::Fault::EStop);
+}
+
+TEST(SupervisorCore, TheDwellRunsThroughCyclesThatReportSomethingElseEntirely)
+{
+  // The dwell is judged before the precedence chain and not inside it, for the
+  // reason `deadman_held` and `tracking_error` are filled before any branch
+  // returns.  A dwell that only advanced on the cycles where sway was what went
+  // wrong would restart every time the operator let go of the deadman -- and the
+  // predicate exists precisely so that a grip can be gated on it without the
+  // task layer having to keep its own timer.
+  const auto config = default_config();
+  auto input = healthy_input();
+  input.remote_ctrl.deadman_held = false;
+
+  // Enough cycles to cover the dwell twice over, every one of them reporting the
+  // released deadman rather than anything about the sway.
+  const int cycles = 2 * static_cast<int>(config.sway.settle_dwell / kCycle);
+  crane_supervisor::SwaySettled settled = crane_supervisor::SwaySettled::Unknown;
+  for (int cycle = 0; cycle < cycles; ++cycle) {
+    const auto decision = step(config, input);
+    ASSERT_EQ(decision.fault, crane_supervisor::Fault::Interlock) << cycle;
+    settled = decision.sway.settled;
+  }
+  EXPECT_EQ(settled, crane_supervisor::SwaySettled::Settled);
+
+  // And the crane starting to swing drops it again, in a cycle whose report is
+  // still about the deadman.
+  input.pendulum_state.velocity = {{0.2, 0.0}};
+  const auto moving = step(config, input);
+  EXPECT_EQ(moving.fault, crane_supervisor::Fault::Interlock);
+  EXPECT_EQ(moving.sway.settled, crane_supervisor::SwaySettled::NotSettled);
+}
+
 TEST(SupervisorCore, NothingHereActs)
 {
   // The whole action of this supervisor is to report.  There is no stop, no
@@ -1288,6 +1478,7 @@ std::vector<crane_supervisor::SupervisorInput> every_input()
                     for (const double velocity_error : {0.0, 100.0}) {
                       for (const auto & inner_loop : every_inner_loop_report()) {
                         crane_supervisor::SupervisorInput input;
+                        input.sampled_at = kFirstCycle;
                         for (std::size_t i = 0; i < kInputCount; ++i) {
                           input.streams[i].received = received;
                           input.streams[i].age = age;
@@ -1317,7 +1508,21 @@ std::vector<crane_supervisor::SupervisorInput> every_input()
       }
     }
   }
-  return inputs;
+
+  // The passive rate, applied over the whole set rather than as a twelfth nested
+  // loop. Three values and not two: still, between the settle bound and the
+  // fault bound, and past the fault bound -- which is the reachable space of the
+  // sway duty in a single cycle. The dwell needs a sequence and is swept in
+  // `test_sway_monitor.cpp`, where the clock is an argument.
+  std::vector<crane_supervisor::SupervisorInput> swept;
+  swept.reserve(inputs.size() * 3);
+  for (const double dq_u : {0.0, 0.1, 9.0}) {
+    for (crane_supervisor::SupervisorInput input : inputs) {
+      input.pendulum_state.velocity = {{dq_u, dq_u}};
+      swept.push_back(std::move(input));
+    }
+  }
+  return swept;
 }
 
 }  // namespace
@@ -1371,6 +1576,32 @@ TEST(SupervisorCore, NoInputThatIsNotFreshIsEverReportedAsFaultFree)
   }
 }
 
+TEST(SupervisorCore, TheSettledPredicateIsOnEveryDecisionAndIsNeverSettledWhileUnknowable)
+{
+  // Three states and not two, over the whole reachable input space: an estimate
+  // that is absent, stale or marked unusable makes "settled" unanswerable, and a
+  // grip action gated on a two-valued predicate would descend onto a swinging
+  // block the moment the bracketing IMU stopped answering.
+  for (const auto & config : {default_config(), config_with_tolerances()}) {
+    for (const auto & input : every_input()) {
+      const auto decision = crane_supervisor::decide(config, input);
+      const auto causes = crane_supervisor::freshness(config, input);
+      const bool trusted = causes[index_of(Input::PendulumState)] == Staleness::Fresh &&
+        input.pendulum_state.valid;
+      if (trusted) {
+        EXPECT_NE(decision.sway.settled, crane_supervisor::SwaySettled::Unknown);
+      } else {
+        EXPECT_EQ(decision.sway.settled, crane_supervisor::SwaySettled::Unknown);
+      }
+      // And it is said out loud on every report, whatever `fault` is: the
+      // predicate has no field of its own, so a cycle that dropped the clause
+      // would drop it exactly when a more consequential cause was in the way.
+      EXPECT_NE(decision.message.find(crane_supervisor::kSettledClausePrefix), std::string::npos)
+        << decision.message;
+    }
+  }
+}
+
 TEST(SupervisorCore, NoTrackingFaultIsReachableWithoutATolerance)
 {
   // With no number to compare against, FAULT_TRACKING is not reachable at all --
@@ -1381,16 +1612,18 @@ TEST(SupervisorCore, NoTrackingFaultIsReachableWithoutATolerance)
   }
 }
 
-TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFourAndTheInnerLoopsThree)
+TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheInnerLoopsThree)
 {
   // Every other cause of the §5 table belongs to a later issue.  A supervisor
   // that raised one of them from an input it does not have would be reporting a
   // check it never made.
   //
-  // Two of the seven are not this package's verdicts at all: FAULT_REFERENCE_STALE
+  // Two of the eight are not this package's verdicts at all: FAULT_REFERENCE_STALE
   // and FAULT_NOT_COMMISSIONED are the inner velocity loop's, merged as the loop
-  // numbered them.  Working cell, solver and sway stay unreachable -- nothing on
-  // any of the four inputs can produce them, and neither can this supervisor.
+  // numbered them.  Working cell and solver stay unreachable -- nothing on any of
+  // the four inputs can produce them, and neither can this supervisor.  FAULT_SWAY
+  // is reachable now, and from exactly one place: the passive rate past its own
+  // configured bound.
   for (const auto & config : {default_config(), config_with_tolerances()}) {
     for (const auto & input : every_input()) {
       const auto fault = crane_supervisor::decide(config, input).fault;
@@ -1398,6 +1631,7 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFourAndTheInnerLoopsThree)
         fault == crane_supervisor::Fault::None ||
         fault == crane_supervisor::Fault::StateHealth ||
         fault == crane_supervisor::Fault::Tracking ||
+        fault == crane_supervisor::Fault::Sway ||
         fault == crane_supervisor::Fault::ReferenceStale ||
         fault == crane_supervisor::Fault::EStop ||
         fault == crane_supervisor::Fault::Interlock ||
@@ -1410,6 +1644,14 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFourAndTheInnerLoopsThree)
       {
         EXPECT_EQ(fault, input.controller_health.fault);
         EXPECT_TRUE(input.stream(Input::ControllerHealth).received);
+      }
+      // And FAULT_SWAY is reachable only from a rate this supervisor was
+      // entitled to believe.  A degraded estimate is FAULT_STATE_HEALTH, never
+      // this: a sensor that stopped saying anything is a different fact from a
+      // load that is swinging.
+      if (fault == crane_supervisor::Fault::Sway) {
+        EXPECT_TRUE(input.stream(Input::PendulumState).received);
+        EXPECT_TRUE(input.pendulum_state.valid);
       }
     }
   }

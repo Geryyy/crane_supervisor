@@ -108,6 +108,139 @@ crane_supervisor:
       can move underneath a running stream makes the status unreproducible."
     validation:
       bounds<>: [0.001, 10.0]
+  # The sway duty of wiki/control_architecture.md 5 row 7. Four numbers, and
+  # **every one of them is a design value rather than a measured one** -- each
+  # description below says what it was derived from and what would replace it.
+  #
+  # Two facts fix the scale they all sit on and neither is invented here:
+  #
+  #   * The pendulum's own natural frequency is sqrt(g/l_tool) ~ 2 rad/s -- a
+  #     period of 3.1 s -- the same number issue 016 derived the complementary
+  #     filter's 0.2 rad/s crossover an order below.
+  #   * The published rate's own noise is the identified
+  #     pendulum_state_broadcaster health.velocity_variance of
+  #     [3.0e-5, 2.0e-5] rad^2/s^2, i.e. 0.0055 rad/s on tip and 0.0045 on tilt,
+  #     measured from the four recordings of CLAUDE.md Recorded machine data.
+  #     That is a *floor*: a settle bound below a few of those sigmas is one a
+  #     still crane could never be observed to meet.
+  #
+  # Reading that number here is not the same thing as consulting
+  # velocity_covariance at runtime, which this supervisor deliberately does not
+  # do. The published block is the identified noise of the sensor pair and is
+  # therefore constant while the estimate is trusted; weighting a bound with it
+  # would be a confidence-weighted test whose confidence never moves. Fixing the
+  # floor of a design threshold is what the number is actually good for.
+  #
+  # The test is on the **rate** and not on the angle, for a reason that is not a
+  # preference: the published angle is read out on the nominal hinge axes,
+  # because the calibrated 2-D spline for the real double hinge needs calibration
+  # data this workspace does not carry, so it carries an uncalibrated constant
+  # offset -- and theta7_tilt_joint's limits are not centred on zero either. The
+  # rate is composed from the two gyro readings through the known chain and
+  # inherits none of that (wiki/system.md Measurement).
+  #
+  # One caveat worth knowing before these numbers are trusted on the machine: the
+  # broadcaster's complementary filter subtracts a bias state bounded at
+  # filter.max_gyro_bias = 0.05 rad/s from the rate it publishes, which is
+  # *above* the settle bound below. The measured run-to-run bias of the
+  # differenced pair is 0.0059 rad/s on tip and 0.0014 on tilt, an order under
+  # that bound, so it does not arise today -- but a filter that ever ran its bias
+  # state to the limit could hold the reported rate inside a settle bound the
+  # real rate is outside.
+  sway:
+    dq_u_max:
+      type: double_array
+      default_value: [0.4, 0.4]
+      read_only: true
+      description: "The passive joint rate past which FAULT_SWAY is raised,
+        rad/s, over [tip, tilt] -- the same index order crane_msgs/PendulumState
+        publishes its arrays in. The fault names which of the two coordinates
+        exceeded its own bound, because an operator watching the tool swing
+        along the boom and one watching it swing across it are looking at two
+        different things.
+        **A design value, not a measured one.** It is the peak rate of a swing
+        of about 0.2 rad amplitude at the pendulum's own 2 rad/s -- roughly 11
+        degrees, half a metre of tool travel on a 2.5 m pendulum -- which is a
+        swing worth putting in front of somebody rather than the amplitude at
+        which anything breaks. **What would replace it** is the admissible sway
+        bound of wiki/nomenclature.md 8 (q_sway_max), which the swing envelope
+        of wiki/trajectory_planning.md 4.3 and the virtual working cell of
+        wiki/control_architecture.md 5.1 will fix together at slice 5, converted
+        to a rate through the measured period. Nothing in this workspace has
+        that number yet, and a plausible one written here would be indexed by
+        the same slice that ought to produce it. Read-only: a sway bound an
+        operator can widen from underneath a running stream is not one anybody
+        can reason about."
+      validation:
+        fixed_size<>: [2]
+        element_bounds<>: [0.0, 100.0]
+    dq_u_settled:
+      type: double_array
+      default_value: [0.04, 0.04]
+      read_only: true
+      description: "The passive joint rate at or below which a coordinate counts
+        as calm, rad/s, over [tip, tilt]. Both coordinates have to be calm for
+        the whole dwell below before the settled predicate reads *settled*.
+        Strictly below dq_u_max, which validate() enforces: a settle bound at or
+        above the fault bound would call a crane settled in the same cycle it
+        reported the swing.
+        **A design value, not a measured one**, and it is bracketed from both
+        sides. From above: it is the peak rate of a swing of about 0.02 rad
+        amplitude at 2 rad/s -- roughly 1 degree, some 50 mm of tool travel on a
+        2.5 m pendulum, which is the order of a placement budget. From below: it
+        is about 7 sigma of the identified rate noise on tip and 9 on tilt, so a
+        crane that is genuinely still is observed to be still rather than
+        chattering against its own sensor noise. The two coordinates carry the
+        same number because they are two directions of one pendulum, and the
+        array is per coordinate so that a later identification can split them
+        without a schema change. **What would replace it** is a measurement of
+        what a swing at contact actually costs in placement error -- a recording
+        of a grip approach with the load swinging, which needs the machine and a
+        human, exactly like merge gate (ii-b) and the slice 1b campaign
+        (PRD 14). Read-only, for the reason dq_u_max is."
+      validation:
+        fixed_size<>: [2]
+        element_bounds<>: [0.0, 100.0]
+    settled_release_factor:
+      type: double
+      default_value: 1.5
+      read_only: true
+      description: "How much higher the rate has to climb to leave the settled
+        state than to enter it, as a dimensionless factor on dq_u_settled. The
+        hysteresis half of the anti-chatter rule: the dwell below stops the
+        predicate flickering on the way in, and this stops one noise sample past
+        the bound flickering it on the way out, which would otherwise cost a
+        whole dwell to recover from at 20 Hz. 1.5 puts the release bound at 0.06
+        rad/s, some 11 sigma of the identified rate noise, so a sample crossing
+        it is a load that moved and not a sensor. A design value from that
+        separation; **what would replace it** is the same recording that would
+        replace dq_u_settled, since both are about the same distribution. 1.0
+        disables the hysteresis and leaves the dwell as the only guard, which is
+        a legitimate configuration and is why the lower bound is 1.0 rather than
+        something above it. Read-only, for the reason the bounds are."
+      validation:
+        bounds<>: [1.0, 10.0]
+    settle_dwell:
+      type: double
+      default_value: 2.0
+      read_only: true
+      description: "How long both coordinates have to stay calm before the
+        settled predicate reads *settled*, s. It is not a smoothing constant: it
+        is the window that has to be long enough to have contained a rate peak.
+        A pendulum's rate passes through zero twice a period, so a window shorter
+        than half a period can sit on a turning point and see a swing at its
+        slowest -- at 2 rad/s that half period is pi/2 = 1.57 s, and 2.0 s clears
+        it. At the 20 Hz status rate that is 40 consecutive cycles, which is also
+        what makes the predicate unable to chatter. **A design value**, derived
+        from the sqrt(g/l_tool) ~ 2 rad/s of wiki/control_architecture.md 4.1 and
+        issue 016's filter crossover; **what would replace it** is the period
+        measured on the machine, which is not one number -- l_tool changes with
+        telescope extension and with the tool -- so the honest replacement is the
+        longest period over the working range, from a recording that carries a
+        free swing. The recordings this workspace has were not taken for that.
+        Read-only, for the reason the bounds are."
+      validation:
+        bounds<>: [0.001, 60.0]
   joints:
     type: string_array
     default_value:

@@ -77,7 +77,7 @@ inferred abort §5.0 describes.
 words an operator can act on.  Every report carries a cause (PRD user story 53) —
 a status with `fault != FAULT_NONE` and an empty `message` is a test failure.
 
-Seven of the ten constants are reported here, and two of the seven are not this
+Eight of the ten constants are reported here, and two of the eight are not this
 package's verdicts at all — `FAULT_REFERENCE_STALE` and `FAULT_NOT_COMMISSIONED`
 are the inner velocity loop's, merged as it numbered them.  They are resolved in
 this order:
@@ -89,10 +89,11 @@ this order:
 | `FAULT_STATE_HEALTH` | the trajectory controller's own state has never arrived on `/crane/controller_state`, or it stopped, or its stamp is too far ahead — a controller that stopped publishing is not a crane that is tracking perfectly |
 | `FAULT_STATE_HEALTH` | the inner velocity loop's own health has never arrived on `/crane/velocity_controller/health`, or it stopped, or its stamp is too far ahead — an uncommissioned axis reported to nobody is the state that stream exists to end |
 | `FAULT_STATE_HEALTH`, `FAULT_REFERENCE_STALE` | the inner velocity loop raised one of its own **health** codes, carried through unedited |
+| `FAULT_SWAY` | a passive joint **rate** is past its own configured bound, and the report names which of the two coordinates crossed it |
 | `FAULT_TRACKING` | an actuated axis is outside **its own** velocity-tracking tolerance |
 | `FAULT_NOT_COMMISSIONED` | the inner velocity loop raised the **commissioning** code — an axis has no identified valve map and ran PI only |
 | `FAULT_INTERLOCK` | the remote is arriving, the stop is clear, and the configured deadman button is not held |
-| `FAULT_NONE` | all four streams are arriving inside their margins, the broadcaster reports the sample usable, the inner loop reports nothing wrong with itself, no axis is outside its tolerance, nothing is latched and the deadman is held |
+| `FAULT_NONE` | all four streams are arriving inside their margins, the broadcaster reports the sample usable, neither passive rate is past its sway bound, the inner loop reports nothing wrong with itself, no axis is outside its tolerance, nothing is latched and the deadman is held |
 
 **The order is not arbitrary.**  The stop is first because it is the only one of
 them with no field of its own: a cycle that reported something else instead
@@ -100,7 +101,12 @@ would not report it at all.  The passive state comes before tracking because a
 supervisor whose own view of the crane is stale should say that before it says
 anything derived.  The controller state's freshness is judged immediately before
 the comparison that consumes it, since an error that is not arriving cannot be
-compared to anything.  The **health** codes are reported in preference to the
+compared to anything.  Sway sits below every health cause — a degraded estimate
+cannot reach it at all, by construction — and above tracking, because of the two
+it is the one with no field of its own: `tracking_error` is filled on every
+report whatever `fault` says, so a tracking excess stays visible in a cycle sway
+owns, while a swinging load reported behind a tracking fault would be invisible.
+The **health** codes are reported in preference to the
 **commissioning** code because [[commissioning_prerequisites]] §2 says so and not
 because this package prefers it: a missing calibration will still be missing next
 cycle, while a state that just went stale is the one an operator has to act on
@@ -116,10 +122,10 @@ reading a panel: a supervisor started before `gpio_controller` sits in
 asserted means in practice.
 
 `FAULT_NONE` from this supervisor means *nothing it watches is wrong*, not *the
-machine is safe*, and the `message` on a clear report says so.  Working cell,
-solver, sway and reference are later issues; `mode` is `MODE_IDLE` and nothing
-else until mode arbitration exists, because a supervisor must never report a
-mode it has not confirmed.
+machine is safe*, and the `message` on a clear report says so.  Working cell and
+solver are later issues; `mode` is `MODE_IDLE` and nothing else until mode
+arbitration exists, because a supervisor must never report a mode it has not
+confirmed.
 
 ## Every input has a freshness deadline, and none is exempt
 
@@ -310,6 +316,92 @@ clamp, the MPC's constraint margin and this supervisor read the same six rows ou
 of the same file.  `test/test_no_tolerance_of_its_own.py` asserts that no copy
 lives here, because a copy is how one number becomes three.
 
+## The sway, as a bound and as a predicate
+
+§5 row 7 gives the supervisor one narrow duty about the sway: **refuse to start a
+motion that depends on sway being settled, and report.**  It does not damp — that
+is slice 6 — and it does not stop a motion already running for being swingy.  The
+*refusal* half needs an authority over a mode that this package will not have
+until `/crane/set_mode` exists, so what is here is the report and the signal
+somebody else refuses on.
+
+Two different things come off the passive rate and they are not interchangeable:
+
+| | What it is | Where it goes |
+|---|---|---|
+| the bound | a configured rate per passive coordinate, crossed or not | `FAULT_SWAY`, naming which of `theta6_tip_joint` and `theta7_tilt_joint` crossed it, with the rate and the bound |
+| the predicate | **three-valued** — settled, not settled, unknown — held over a dwell and released through a hysteresis | the clause every report ends in; see the gap below |
+
+**Both are on the rate and neither is on the angle.**  Two independent reasons,
+either of which would be enough on its own.  `pendulum_state_broadcaster` reads
+the two passive coordinates out on the *nominal* hinge axes, because the
+calibrated 2-D spline for the real double hinge needs calibration data this
+workspace does not carry — so the published angle carries an uncalibrated
+constant offset, and `theta7_tilt_joint`'s limits are not centred on zero either.
+The rate is a composition of the two gyro readings through the known chain rather
+than a derivative of the angle, so none of that reaches it.
+
+**`velocity_covariance` is not consulted, deliberately.**  The block is the
+identified noise of the differenced gyro pair — a property of the sensors,
+constant while the estimate is trusted and withdrawn to `-1` where it was never
+identified for the hardware.  Weighting a bound with it would be a
+confidence-weighted test whose confidence never moves.  What the number *is* good
+for is fixing the floor a design threshold has to clear, and that use is in
+`src/crane_supervisor_parameters.yaml` as a derivation rather than as a runtime
+read.  `test_sway_monitor.cpp` asserts the shipped settle bound clears it.
+
+### Three states, and the third one is the point
+
+An estimate that is absent, stale or marked unusable makes "settled"
+**unknowable**, and unknowable must not read as settled: a grip action gated on a
+two-valued predicate would descend onto a swinging block the moment the
+bracketing IMU stopped answering.  So the predicate has three values, and a
+degraded estimate produces `Unknown` *and* `FAULT_STATE_HEALTH` — never
+`FAULT_SWAY`.  A sensor that stopped saying anything is a different fact from a
+load that is swinging, and an operator does different things about them.
+
+The predicate is decided **before** the precedence chain runs, the way
+`deadman_held` and `tracking_error` are filled before any branch returns.  A
+dwell that only advanced on the cycles where sway was what went wrong would
+restart every time the operator let go of the deadman.
+
+### It does not chatter, and that costs two mechanisms
+
+- a **dwell** of 2.0 s on the way in — 40 consecutive status cycles.  It is not a
+  smoothing constant: a pendulum's rate passes through zero twice a period, so a
+  window shorter than the 1.57 s half period can sit on a turning point and see a
+  swing at its slowest.
+- a **hysteresis** on the way out — the release bound is 1.5× the settle bound, so
+  one noise sample past the bound does not cost a whole dwell at 20 Hz.
+
+### The gap: the predicate has no field of its own
+
+`crane_msgs/SupervisorStatus` carries `mode`, `fault`, `tracking_error`,
+`inside_working_cell`, `deadman_held` and `message`, and none of them is a
+three-valued sway predicate.  **`crane_msgs` is frozen**, and PRD §15's amendment
+rule makes a *field add* a slice of its own that has to name every consumer;
+`crane_msgs` is also outside this issue's scope, and no message package already in
+this node's dependency whitelist carries a stamped tri-state.  So what the
+predicate rides on today is the `message` string, in a clause every report ends
+in and whose prefix is a constant (`kSettledClausePrefix`) rather than a literal
+somebody greps for.
+
+The `fault` field is **not** an alternative and was rejected rather than
+overlooked: it carries one cause per cycle in a fixed precedence, so a cycle
+reporting `FAULT_ESTOP` says nothing about the sway, and "no `FAULT_SWAY`" would
+read as "settled" — which is exactly the two-valued defect the three states exist
+to prevent.
+
+**What closes it** is one additive amendment, which is *not* a field add and
+therefore not a slice: a new `crane_msgs/SwaySettled` message
+(`std_msgs/Header header`, `uint8 SETTLED_UNKNOWN=0`/`SETTLED_NO=1`/`SETTLED_YES=2`,
+`uint8 settled`, `float64[2] velocity`, `string message`) published on
+`/crane/sway_settled` at the status rate, with the ROS 2 Interfaces §4 row in the
+same commit.  The core is already shaped for it: `SwaySettled` is the enum,
+`SupervisorDecision::sway` is the value, and the adapter change is a second
+publisher and four assignments.  It needs the `crane_msgs` repo, which this
+issue's `repos:` does not carry.
+
 ## The inner loop's fault, carried and not re-derived
 
 `crane_velocity_controller` computes a `SupervisorStatus` fault code on every one
@@ -363,14 +455,25 @@ an input and reported on every status, whatever `fault` says.
 
 ## Configuration
 
-Five read-only parameters are shipped in `config/crane_supervisor.yaml`:
+Nine read-only parameters are shipped in `config/crane_supervisor.yaml`:
 `pendulum_state_timeout`, `remote_ctrl_timeout`, `controller_state_timeout`,
-`controller_health_timeout` and
+`controller_health_timeout`, the four under `sway`, and
 `deadman_button`.  The first four are the freshness deadlines of the four
 `Input`s, one each, and they are the only place those numbers exist — the core's
 array has no default, so a deadline that is not configured is a node that does
 not start.  Their names are the ones `crane_bringup` already passes; they read
 `timeout` where the core reads `deadline`, and the two mean the same thing.
+
+`sway.dq_u_max`, `sway.dq_u_settled`, `sway.settled_release_factor` and
+`sway.settle_dwell` are the sway duty's bounds, and **every one of them is a
+design value rather than a measured one**.  The file says so beside each number,
+gives the derivation, and names what would replace it — the same discipline
+`tracking_tolerance.yaml` and the broadcaster's `health.max_measurement_age`
+already follow.  Unlike the tracking tolerance they are *refused* when absent
+rather than reported: they ship with the package, so a deployment without one has
+been misconfigured rather than left waiting on a human campaign, and a supervisor
+that quietly stopped judging the sway would report `FAULT_NONE` for a duty it was
+not performing.
 `joints` is declared with the six actuated joints of ROS 2
 Interfaces §3.2 as its default and is not restated in the shipped file — a
 deployment that wrote the list out again could only get it wrong.

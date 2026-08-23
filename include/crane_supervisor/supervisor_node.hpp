@@ -191,6 +191,15 @@ private:
   /// The emergency-stop latch, carried from one decision into the next. Raised
   /// by `decide()`, lowered only by an acknowledged `/crane/clear_fault`.
   bool estop_latched_{false};
+  /// The sway dwell, carried from one decision into the next the same way.
+  /**
+   * The second and last piece of history this node holds. It is a plain member
+   * for the reason the latch is: everything here runs in one node with the
+   * default callback group, so the subscriptions, the status timer and the
+   * service are mutually exclusive on the single-threaded executor
+   * `crane_supervisor_main.cpp` spins.
+   */
+  SwayState sway_state_;
   /// What the last published report said, so a transition is logged once
   /// instead of the same line twenty times a second.
   Fault reported_fault_{Fault::None};

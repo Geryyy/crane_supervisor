@@ -142,6 +142,30 @@
 // `tracking_error` as a measurement -- the same way the velocity controller's
 // seam clamp goes transparent and warns.
 //
+// # The sway duty, and why it is a rate and a predicate
+//
+// §5 row 7 gives the supervisor one narrow duty about the sway: **refuse to
+// start a motion that depends on sway being settled, and report**. It does not
+// damp -- that is slice 6 -- and it does not stop a motion already running for
+// being swingy. The refusal half needs an authority over a mode that this
+// package does not have yet, so what lands here is the report and the signal
+// somebody else refuses on.
+//
+// Two things come off the passive rate and they are not the same thing:
+//
+//   the bound      `FAULT_SWAY`, raised per coordinate against a configured
+//                  rate, naming which of the two exceeded it.
+//   the predicate  three-valued -- settled, not settled, unknown -- held over a
+//                  dwell and released through a hysteresis, so that one rate
+//                  crossing does not chatter the signal at 20 Hz.
+//
+// **A degraded estimate is neither.** It raises `FAULT_STATE_HEALTH` through the
+// paths above, and it leaves the predicate `Unknown`: a sensor that stopped
+// saying anything is a different fact from a load that is swinging, and an
+// operator does different things about them. Everything about why the test is on
+// the rate, and why `velocity_covariance` is not consulted, is in
+// `sway_monitor.hpp`.
+//
 // The remote carries the emergency stop and the operator deadman, and what this
 // package does with them is **diagnosis and recovery, not protection**
 // (§6.1). The stop chain is hardware and PLC and acts whether or not this
@@ -177,6 +201,8 @@
 #include <limits>
 #include <string>
 #include <vector>
+
+#include "crane_supervisor/sway_monitor.hpp"
 
 namespace crane_supervisor
 {
@@ -449,6 +475,17 @@ struct SupervisorConfig
    */
   std::vector<AxisTolerance> tracking_tolerance;
 
+  /// The bounds the sway duty of wiki/control_architecture.md §5 row 7 is
+  /// decided against, and the dwell its predicate is held over.
+  /**
+   * Unlike `tracking_tolerance`, every number here is shipped with the package,
+   * so a `SupervisorConfig` that has none is a misconfiguration rather than a
+   * deployment waiting on a human campaign -- `validate()` refuses it. They are
+   * **design** values and the file that carries them says so, beside what would
+   * replace each.
+   */
+  SwayBound sway;
+
   /// Which `epsilon_crane_msgs/RemoteCtrlStates` button is the deadman, 1..12.
   /**
    * Read from the retained stack, not chosen here and not inferred from the
@@ -514,6 +551,22 @@ struct PendulumStateReport
   /// `crane_msgs/PendulumState.status`, verbatim. The broadcaster's account of
   /// why, carried rather than restated.
   std::string status;
+  /// `crane_msgs/PendulumState.velocity`, rad/s, `[tip, tilt]`.
+  /**
+   * The rate and not the angle, and not the covariance either. The angle is read
+   * out on the nominal hinge axes and carries an uncalibrated constant offset
+   * that nothing in this workspace has measured; the rate is composed from the
+   * two gyro readings and does not. `velocity_covariance` is the identified
+   * noise of the differenced pair rather than a running statement about this
+   * cycle, so weighting a bound with it would be a confidence-weighted test
+   * whose confidence never moves -- `sway_monitor.hpp` says the whole of it.
+   *
+   * NaN until a message fills it, which is the absence of a measurement rather
+   * than a measurement of zero: a rate that is not a number leaves the settled
+   * predicate `Unknown`.
+   */
+  std::array<double, kPassiveAxisCount> velocity{
+    {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()}};
 };
 
 /// What `/crane/remote_ctrl_states` said this cycle.
@@ -617,6 +670,25 @@ struct SupervisorInput
    */
   bool estop_latched{false};
 
+  /// The sway dwell as the previous cycle left it.
+  /**
+   * Threaded through for the same reason the latch is: the core is a pure
+   * function, so the one piece of history the settled predicate needs is carried
+   * rather than held. Writing two members reaches any point of the dwell that a
+   * test wants, instead of replaying forty cycles to get there.
+   */
+  SwayState sway;
+
+  /// The instant this observation was taken, on the node's own clock, s.
+  /**
+   * Read once per cycle and used for one thing: how long the current run of calm
+   * cycles has lasted. It is deliberately *not* what `StreamReport::age` is
+   * derived from at this level -- the ages arrive already differenced, so a core
+   * test can write an age without owning a clock -- and a value that is not
+   * finite leaves the predicate `Unknown` rather than completing a dwell.
+   */
+  double sampled_at{std::numeric_limits<double>::quiet_NaN()};
+
   /// The transport half of one input.
   [[nodiscard]] StreamReport & stream(Input input) noexcept {return streams[index_of(input)];}
 
@@ -660,6 +732,23 @@ struct SupervisorDecision
   /// The emergency-stop latch as this cycle leaves it. The node carries it into
   /// the next call, and `/crane/clear_fault` is the only thing that lowers it.
   bool estop_latched{false};
+  /// The settled predicate, and the dwell as this cycle leaves it.
+  /**
+   * `sway.settled` is the three-valued answer the task layer gates a grip action
+   * on instead of on a timeout, and the node carries the whole struct into the
+   * next call the way it carries the latch.
+   *
+   * **It is decided before any branch of `decide()` returns**, for the reason
+   * `deadman_held` and `tracking_error` are filled before any branch returns: it
+   * is owed on every cycle and not only on the ones where sway is what went
+   * wrong. A dwell that stopped advancing whenever a more consequential cause
+   * owned `fault` would restart every time the operator let go of the deadman.
+   *
+   * It has no field of its own on `crane_msgs/SupervisorStatus`, so what carries
+   * it onto the wire today is `message` -- see the README, which names the
+   * amendment that would fix that and why it is not in this issue's scope.
+   */
+  SwayState sway;
   /// Why, in words an operator can act on. Never empty (PRD user story 53).
   std::string message;
 };
@@ -688,6 +777,11 @@ struct ClearFaultOutcome
  * down for a number that only one of its duties needs. A missing *deadline* is
  * the opposite: it is the one thing that would make an input silently exempt
  * from §5.3.
+ *
+ * A missing **sway bound** is refused, and the difference from the tolerance is
+ * not a preference: the sway numbers are shipped with this package, so a
+ * deployment without one has been misconfigured rather than left waiting on a
+ * human campaign. `validate_sway()` composes the reason.
  */
 [[nodiscard]] bool validate(const SupervisorConfig & config, std::string & reason);
 

@@ -458,6 +458,33 @@ protected:
   }
 };
 
+/// The same node, with the settle dwell shortened to something a stream test can
+/// hold continuously.
+/**
+ * The shipped dwell is 2.0 s -- above the half period of the pendulum, which is
+ * the point of it -- and reaching `settled` through this fixture means keeping
+ * `/crane/pendulum_state` fresh for that whole time on a machine running
+ * parallel colcon jobs.  One scheduling hiccup longer than `kTestTimeout` makes
+ * the estimate stale, which correctly resets the dwell, and the test would fail
+ * for a reason that is not the contract.
+ *
+ * So the *margin* is moved rather than the clock, exactly as
+ * `crane_control`'s `pendulum_stale_margin.yaml` does for the same problem one
+ * layer down.  What the shipped 2.0 s is derived from, and that it clears the
+ * pendulum's half period, is asserted in `test_sway_monitor.cpp`, where the
+ * dwell is an argument and no wall clock is involved at all.
+ */
+class StatusStreamWithShortDwell : public StatusStream
+{
+protected:
+  rclcpp::NodeOptions node_options() const override
+  {
+    rclcpp::NodeOptions options = StatusStream::node_options();
+    options.append_parameter_override("sway.settle_dwell", 0.3);
+    return options;
+  }
+};
+
 }  // namespace
 
 TEST_F(StatusStream, TheGraphEndpointIsTheContractOneCraneMsgsAsserts)
@@ -680,6 +707,113 @@ TEST_F(StatusStream, ThePendulumStateIsCarriedEndToEnd)
   ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_STATE_HEALTH, degraded));
   EXPECT_NE(received_.back().message.find(degraded.status), std::string::npos)
     << received_.back().message;
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStream, ASwingingLoadReachesTheStreamAsATypedCauseThatNamesTheCoordinate)
+{
+  // wiki/control_architecture.md §5 row 7, from the estimate to the panel. The
+  // bound is on the passive *rate* -- the published angle is read out on the
+  // nominal hinge axes and carries an uncalibrated constant offset that nothing
+  // here has measured, and the rate is composed from the two gyro readings and
+  // does not.
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state()))
+    << received_.back().message;
+
+  PendulumState swinging = trusted_state();
+  // The tilt coordinate, past the shipped 0.4 rad/s bound; the tip coordinate
+  // still. Both of them at once would pass whether or not the report can tell
+  // them apart.
+  swinging.velocity[1] = 0.9;
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_SWAY, swinging)) << received_.back().message;
+
+  const std::string & message = received_.back().message;
+  EXPECT_NE(message.find("theta7_tilt_joint"), std::string::npos) << message;
+  EXPECT_EQ(message.find("theta6_tip_joint"), std::string::npos) << message;
+  EXPECT_NE(message.find("0.9000"), std::string::npos) << message;
+  EXPECT_NE(message.find("0.4000"), std::string::npos) << message;
+  // Nothing was acted on, and the report says so: the refusal half of §5 row 7
+  // needs an authority over a mode this supervisor does not have yet.
+  EXPECT_NE(message.find("Nothing was stopped"), std::string::npos) << message;
+
+  // And a degraded estimate carrying the very same rate is FAULT_STATE_HEALTH
+  // and not FAULT_SWAY: a sensor that stopped saying anything is a different
+  // fact from a load that is swinging.
+  PendulumState degraded = swinging;
+  degraded.valid = false;
+  degraded.status = "not to be trusted: the upstream IMU on K5 stopped refreshing";
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_STATE_HEALTH, degraded))
+    << received_.back().message;
+  EXPECT_NE(received_.back().message.find(degraded.status), std::string::npos)
+    << received_.back().message;
+
+  // The load stops swinging and the fault clears itself, with no acknowledgement:
+  // sway is not a latched cause.
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state()))
+    << received_.back().message;
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStreamWithShortDwell, TheSettledPredicateIsOnEveryReportAndPassesThroughAllThreeStates)
+{
+  // The predicate the task layer gates a grip action on instead of on a timeout.
+  // It has no field of its own on `crane_msgs/SupervisorStatus` -- the message is
+  // frozen and widening it is a slice of its own (PRD §15) -- so what carries it
+  // today is the clause every report ends in, and this is the whole path from
+  // the estimate to that clause.
+  //
+  // Before anything arrives at all it is *unknowable* and says so. That is the
+  // state the whole three-valued design exists for: a two-valued predicate would
+  // have to call a supervisor that has never seen an estimate either settled or
+  // unsettled, and one of those two answers descends onto a swinging block.
+  ASSERT_TRUE(spin_until([this]() {return !received_.empty();}));
+  EXPECT_NE(
+    received_.front().message.find(crane_supervisor::kSettledClausePrefix), std::string::npos)
+    << received_.front().message;
+  EXPECT_NE(received_.front().message.find("not known"), std::string::npos)
+    << received_.front().message;
+  // That report is the latched stop of §6.1, since nothing was arriving -- which
+  // is the point: the predicate is on a report whose fault is about something
+  // else entirely, and it had to be, because it has no field of its own.
+  EXPECT_EQ(received_.front().fault, SupervisorStatus::FAULT_ESTOP);
+
+  // The remote comes back and the latch is acknowledged, so that what follows is
+  // about the sway rather than about the stop.
+  const auto cleared = acknowledge(trusted_state(), held_remote());
+  ASSERT_NE(cleared, nullptr);
+  EXPECT_TRUE(cleared->success) << cleared->message;
+
+  // A still crane, held long enough for the dwell: settled.
+  ASSERT_TRUE(
+    spin_until(
+      [this]() {
+        return !received_.empty() &&
+        received_.back().message.find("Sway: settled") != std::string::npos;
+      },
+      [this]() {publish(trusted_state(), held_remote());}))
+    << received_.back().message;
+  // Which is a statement about the sway and not about the fault: the report it
+  // arrived on is a clear one, and the two are separate answers.
+  EXPECT_EQ(received_.back().fault, SupervisorStatus::FAULT_NONE) << received_.back().message;
+
+  // The estimate goes bad while the crane is demonstrably still. `settled` does
+  // not survive it, and it does not become `not settled` either -- it becomes
+  // unknowable, which is a third thing.
+  PendulumState degraded = trusted_state();
+  degraded.valid = false;
+  degraded.status = "not to be trusted: no filter state";
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_STATE_HEALTH, degraded))
+    << received_.back().message;
+  EXPECT_NE(received_.back().message.find("Sway: not known"), std::string::npos)
+    << received_.back().message;
+
+  // And every report carried the clause, whatever its fault was.
+  for (const SupervisorStatus & status : received_) {
+    EXPECT_NE(status.message.find(crane_supervisor::kSettledClausePrefix), std::string::npos)
+      << status.message;
+  }
 
   expect_contract_of_every_report();
 }

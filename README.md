@@ -121,6 +121,73 @@ solver, sway and reference are later issues; `mode` is `MODE_IDLE` and nothing
 else until mode arbitration exists, because a supervisor must never report a
 mode it has not confirmed.
 
+## Every input has a freshness deadline, and none is exempt
+
+§5.3 names the failure mode this stack is most exposed to: not a wrong value, an
+**absent** one.  No input may simply stop arriving without a defined
+consequence, and this supervisor is the only element that sees every input that
+reaches it by topic — so it is where the rule is enforced for those.
+
+A rule enforced by four hand-written checks is a rule that lapses the first time
+somebody adds a fifth subscription, so the policy is a shape rather than a
+checklist:
+
+- `Input` in `supervisor_core.hpp` is the **registry**.  `kInputCount` comes off
+  the enum rather than sitting beside it.
+- `kInputPolicies` has one row per enumerator — a `static_assert` refuses a table
+  that is shorter, longer or out of order — carrying the topic, the type, the
+  producer, what is lost while the input is missing, the `SupervisorStatus`
+  constant its absence raises, and whether that fault latches.
+- `SupervisorConfig::freshness_deadline` and `SupervisorInput::streams` are both
+  sized by `kInputCount`, so a new input gets a slot in each for free.
+- **There is no default deadline.**  The array is value-initialised to zero,
+  `validate()` refuses a zero, and the node throws out of its constructor.  An
+  input added with no margin is a node that refuses to start, never an input
+  nobody watches.
+- Every subscription is created by one helper that takes an `Input`, so one that
+  named no input — and therefore had no deadline — cannot be written; the topic
+  comes off the policy row rather than off the call site; and the constructor
+  refuses to finish while any enumerator is left unsubscribed.
+- `test/test_every_input_has_a_deadline.py` asserts the shape statically:
+  `create_subscription` appears exactly once in the package, every enumerator is
+  subscribed *and* has a row *and* is assigned a deadline out of a parameter, in
+  that order, and no contract name is written down twice.
+
+The deadlines are **per input**, not one number: `/crane/pendulum_state` comes
+off the manager's 100 Hz cycle and `/crane/remote_ctrl_states` is a 20 Hz
+contract, so an age that is healthy on one is a dead publisher on the other.
+The numbers and the derivation of each are in
+`src/crane_supervisor_parameters.yaml`, once.
+
+The sweep is `kInputCount` comparisons on the **status timer**, and that is the
+point rather than an optimisation: a deadline evaluated in a subscription
+callback could never fire, because the case it exists for is the one where no
+callback runs again.
+
+### Which of the three causes fired
+
+§5.3's "Stale state" now has three causes, and they are different in kind: the
+producer's **health flag**, the measurement **age**, and a sample that stopped
+**refreshing** behind a header that keeps moving.  What this supervisor can see
+of them is not symmetric, and the report says which fired:
+
+| Cause | Where it is measured | How it reads here |
+|---|---|---|
+| age | here, from `header.stamp` against this input's deadline | `never connected`, `stopped arriving`, or `stamped ahead of this clock` — three reports, because "the publisher never came up" and "the publisher died" are different things to chase |
+| health flag | the producer | `valid == false`, and the producer's own `status` string carried through unedited |
+| refresh | the producer | inside that same string.  There is **no topic-level version of it here on purpose**: `pendulum_state_broadcaster` can ask whether seven doubles moved because differenced-gyro noise is thirty times the quantiser, while a supervisor asking the same of `RemoteCtrlStates` would be asking whether twelve booleans moved, and an operator holding a button produces bit-identical payloads for minutes |
+
+**Recovery is symmetric.**  An input that starts arriving again inside its
+deadline clears its own fault with no acknowledgement.  The emergency stop is
+the single exception, and `InputPolicy::latches` is where that asymmetry is
+written down rather than implied.
+
+**What this does not cover, and says so.**  §6.3's controller-side timeouts are
+still ad hoc — the manual forwarding controller zeroes 0.5 s after its own input
+stops and the proportional controller never times out at all — and none of that
+is this supervisor's to fix in this slice.  The clear report names the gap
+instead of leaving `FAULT_NONE` to imply it was closed.
+
 ## The stop chain, consumed in one direction only
 
 Three rules, each §6.1's or §6.2's rather than this package's:
@@ -179,10 +246,9 @@ read-only, because which button stops the machine is not a runtime adjustment.
 
 **Absence is not health.**  §5.3 allows no input to stop arriving without a
 defined consequence, so an input that never arrived and one that stopped are both
-faults rather than a quiet `FAULT_NONE`.  The general staleness policy — per
-input, per consequence — is a later issue; what is owed here is that none of the
-four inputs this package carries can be silently missing, and that the stop
-signal's absence is read as asserted rather than merely reported.
+faults rather than a quiet `FAULT_NONE` — and the stop signal's absence is read
+as asserted rather than merely reported.  How that is enforced for every input
+rather than for the ones somebody remembered is the section above.
 
 **The broadcaster's own cause is carried through, not restated.**
 `pendulum_state_broadcaster` separates six causes behind `valid == false` and
@@ -280,11 +346,10 @@ different messages on the wire, and nothing on the path from the loop to
 second switch either — an axis can run PI only on `fake` with no fault raised, and
 this supervisor still reports `FAULT_NONE`.
 
-Staleness of this stream is the one half of the general policy that could not
-wait: "no message yet" must not read as a healthy, commissioned inner loop, so a
+Staleness of this stream is judged by the same policy as every other input's:
+"no message yet" must not read as a healthy, commissioned inner loop, so a
 report that never arrived, one that stopped and one whose stamp cannot be placed
 in time are all `FAULT_STATE_HEALTH` with their own account of which they are.
-The rest joins the policy of §5.3 in a later issue.
 
 ## What is not computed
 
@@ -301,7 +366,12 @@ an input and reported on every status, whatever `fault` says.
 Five read-only parameters are shipped in `config/crane_supervisor.yaml`:
 `pendulum_state_timeout`, `remote_ctrl_timeout`, `controller_state_timeout`,
 `controller_health_timeout` and
-`deadman_button`.  `joints` is declared with the six actuated joints of ROS 2
+`deadman_button`.  The first four are the freshness deadlines of the four
+`Input`s, one each, and they are the only place those numbers exist — the core's
+array has no default, so a deadline that is not configured is a node that does
+not start.  Their names are the ones `crane_bringup` already passes; they read
+`timeout` where the core reads `deadline`, and the two mean the same thing.
+`joints` is declared with the six actuated joints of ROS 2
 Interfaces §3.2 as its default and is not restated in the shipped file — a
 deployment that wrote the list out again could only get it wrong.
 `tracking_tolerance` is declared and deliberately left unset, for the reason

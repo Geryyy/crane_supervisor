@@ -17,6 +17,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -434,6 +435,29 @@ protected:
   }
 };
 
+/// The same node, with a different freshness deadline on every input.
+/**
+ * The fixture above gives all four the same number, which is exactly what a node
+ * that routed two parameters into one input's slot would look like from the
+ * outside: every input would go stale at the same age, which is the one global
+ * number the policy of §5.3 exists not to be.  So each of the four gets a value
+ * of its own here, and the test below reads them back out of the registry.
+ */
+class StatusStreamWithDistinctDeadlines : public StatusStream
+{
+protected:
+  rclcpp::NodeOptions node_options() const override
+  {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(
+      {rclcpp::Parameter("pendulum_state_timeout", 0.11),
+        rclcpp::Parameter("remote_ctrl_timeout", 0.22),
+        rclcpp::Parameter("controller_state_timeout", 0.33),
+        rclcpp::Parameter("controller_health_timeout", 0.44)});
+    return options;
+  }
+};
+
 }  // namespace
 
 TEST_F(StatusStream, TheGraphEndpointIsTheContractOneCraneMsgsAsserts)
@@ -797,6 +821,73 @@ TEST_F(StatusStream, WithNoToleranceFileNoTrackingFaultIsRaisedAndTheNodeSaysSo)
   for (const SupervisorStatus & status : received_) {
     EXPECT_NE(status.fault, SupervisorStatus::FAULT_TRACKING) << status.message;
   }
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStreamWithDistinctDeadlines, EveryInputsDeadlineComesFromItsOwnParameter)
+{
+  // The second acceptance criterion of issue 023: the deadlines are per input
+  // and configured, not one number.  Four different values go in as four
+  // parameters and each has to land in its own slot of the registry -- a node
+  // that routed two of them into one input would leave that input judged by
+  // somebody else's margin, which is invisible from the outside for as long as
+  // both streams stay healthy.
+  const auto & config = supervisor_->config();
+  EXPECT_DOUBLE_EQ(config.deadline(crane_supervisor::Input::PendulumState), 0.11);
+  EXPECT_DOUBLE_EQ(config.deadline(crane_supervisor::Input::RemoteCtrl), 0.22);
+  EXPECT_DOUBLE_EQ(config.deadline(crane_supervisor::Input::ControllerState), 0.33);
+  EXPECT_DOUBLE_EQ(config.deadline(crane_supervisor::Input::ControllerHealth), 0.44);
+
+  // And every input has one: the node would not have been constructed otherwise.
+  std::string reason;
+  EXPECT_TRUE(crane_supervisor::validate(config, reason)) << reason;
+  for (std::size_t i = 0; i < crane_supervisor::kInputCount; ++i) {
+    EXPECT_GT(config.freshness_deadline[i], 0.0)
+      << crane_supervisor::kInputPolicies[i].topic;
+  }
+}
+
+TEST_F(StatusStream, AMarginOutsideItsBoundsIsRefusedBeforeTheNodePublishesAnything)
+{
+  // A deadline of zero would report every sample of that input stale, and one
+  // that is not a number would report none of them -- which is the input being
+  // exempt from §5.3 by arithmetic rather than by omission.  Neither reaches
+  // `decide()`: the declared bounds refuse it, and the node throws out of its
+  // constructor before it has a publisher at all.
+  rclcpp::NodeOptions refused;
+  refused.parameter_overrides({rclcpp::Parameter("controller_health_timeout", 0.0)});
+  EXPECT_THROW(
+    std::make_shared<crane_supervisor::SupervisorNode>(refused), std::exception);
+}
+
+TEST_F(StatusStream, ADeadlineFiresWithNoMessageArrivingAtAllToNoticeIt)
+{
+  // The fifth acceptance criterion of issue 023.  The freshness sweep runs on
+  // the status timer and in no subscription callback, because a deadline
+  // evaluated only where a message arrives could never fire on the stream that
+  // stopped -- and that is the only stream it exists for.
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
+    << received_.back().message;
+  const std::size_t before = received_.size();
+
+  // Nothing is published from here on: not one message, on any of the four
+  // inputs.  The report has to change anyway.
+  ASSERT_TRUE(
+    spin_until([this]() {return received_.back().fault != SupervisorStatus::FAULT_NONE;}))
+    << received_.back().message;
+  EXPECT_GT(received_.size(), before);
+  // The remote is what is reported, because absence of the stop signal outranks
+  // everything else this supervisor watches (§6.1) -- and it says which of the
+  // staleness causes fired rather than only that something is stale.
+  EXPECT_EQ(received_.back().fault, SupervisorStatus::FAULT_ESTOP);
+  EXPECT_NE(received_.back().message.find("stopped arriving"), std::string::npos)
+    << received_.back().message;
+  EXPECT_NE(received_.back().message.find("Staleness cause"), std::string::npos)
+    << received_.back().message;
+  EXPECT_NE(
+    received_.back().message.find(crane_supervisor::kRemoteCtrlStatesTopic), std::string::npos)
+    << received_.back().message;
 
   expect_contract_of_every_report();
 }

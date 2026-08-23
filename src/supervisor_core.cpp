@@ -1,6 +1,7 @@
 #include "crane_supervisor/supervisor_core.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -12,95 +13,38 @@ namespace crane_supervisor
 namespace
 {
 
-// The fixed halves of the four messages, as literals. Each one names the cause,
-// the observation behind it and the thing an operator is supposed to do next --
-// wiki/control_architecture.md §5.0's whole point is that the task layer and the
-// panel branch on information rather than on an inferred abort, and a cause with
-// no account of itself is the inference again with extra steps.
-constexpr char kNothingArrived[] =
-  "state health: no crane_msgs/PendulumState has arrived on /crane/pendulum_state since this "
-  "supervisor started. Absence is not health -- an input that never arrived is reported as a "
-  "fault rather than left at FAULT_NONE -- so the passive joint state counts as unavailable. "
-  "Check that pendulum_state_broadcaster is loaded and active on the controller manager.";
-
-constexpr char kStoppedArriving[] =
-  "state health: the passive joint state stopped arriving. The newest crane_msgs/PendulumState "
-  "on /crane/pendulum_state is ";
-
-constexpr char kStoppedArrivingTail[] =
-  " s old, past the configured margin of ";
-
-constexpr char kStoppedArrivingAdvice[] =
-  " s. A publisher that died must not be indistinguishable from a healthy one: check the "
-  "controller manager's cycle and pendulum_state_broadcaster before trusting anything that "
-  "closes on the passive state.";
-
-constexpr char kStampAhead[] =
-  "state health: the age of the passive joint state cannot be judged. The newest "
-  "crane_msgs/PendulumState on /crane/pendulum_state is stamped ";
-
-constexpr char kStampAheadTail[] =
-  " s in this supervisor's future, further ahead than the configured margin of ";
-
-constexpr char kStampAheadAdvice[] =
-  " s. Synchronise the clock of the host publishing it with this one; until then no staleness "
-  "answer about that stream means anything.";
-
-constexpr char kMarkedUnusable[] =
-  "state health: the passive joint state arrived in time and pendulum_state_broadcaster marks "
-  "it unusable. Its own account of the cause, unedited: ";
-
+// The parts of a staleness report that do not depend on which input it is
+// about. Everything that does comes off that input's `InputPolicy` row, so a
+// fifth input gets a report by being described once rather than by having three
+// more messages written for it -- which is how the four this package already
+// carries came to be judged by four copies of the same three comparisons.
 constexpr char kNoStatusGiven[] =
-  "(the broadcaster set no status string, which is itself a defect -- "
-  "crane_msgs/PendulumState carries the cause in that field)";
+  "(the producer set no status string, which is itself a defect -- the message carries the cause "
+  "in that field)";
+
+constexpr char kAbsenceIsNotHealth[] =
+  " Absence is not health: wiki/control_architecture.md 5.3 allows no input to stop arriving "
+  "without a defined consequence, so this is reported as a fault rather than left at FAULT_NONE. ";
 
 constexpr char kObserving[] =
   "no fault: the passive joint state is arriving inside its margin and pendulum_state_broadcaster "
   "reports it usable, the trajectory controller's own state is arriving and no axis is outside "
   "its tolerance, the inner velocity loop is arriving and reports no fault of its own, the "
   "operator remote is arriving, its emergency stop is released and nothing is latched, and the "
-  "deadman is held. Those are the only inputs this supervisor watches -- working cell, solver "
-  "and sway are not observed yet, inside_working_cell is not computed and carries the value that "
-  "claims nothing, and the supervisor holds no stop authority until the hardware stop input is "
-  "verified. Read FAULT_NONE as 'nothing this supervisor watches is wrong', not as 'the machine "
-  "is safe'.";
+  "deadman is held. Those are the only inputs this supervisor watches -- every one of them has a "
+  "freshness deadline of its own and none is exempt, but working cell, solver and sway are not "
+  "observed yet, inside_working_cell is not computed and carries the value that claims nothing, "
+  "and the supervisor holds no stop authority until the hardware stop input is verified. Nor does "
+  "this cover the controllers below it: the manual forwarding controller zeroes 0.5 s after its "
+  "own input stops and the proportional controller never times out at all, so their staleness "
+  "handling stays ad hoc and no report on this stream says anything about it "
+  "(wiki/control_architecture.md 6.3). Read FAULT_NONE as 'nothing this supervisor watches is "
+  "wrong', not as 'the machine is safe'.";
 
-// The trajectory controller's own state publication, and the tracking duty of
-// wiki/control_architecture.md §5 row 1 that is decided from it. Three of these
-// are §5.3's rule applied to a third input -- a controller that stopped
-// publishing its error is not a crane that is tracking perfectly -- and the
-// fourth is the typed cause §5.0 exists to produce.
-constexpr char kControllerStateNeverArrived[] =
-  "state health: no control_msgs/JointTrajectoryControllerState has arrived on "
-  "/crane/controller_state since this supervisor started, so the tracking error is not being "
-  "measured at all and tracking_error carries 0.0 as the absence of a measurement rather than as "
-  "perfect tracking. Check that the trajectory controller is loaded and active on the controller "
-  "manager and that its private controller_state output reaches the contract name.";
-
-constexpr char kControllerStateStoppedArriving[] =
-  "state health: the trajectory controller stopped publishing its own state, so the tracking "
-  "error is no longer measured. The newest control_msgs/JointTrajectoryControllerState on "
-  "/crane/controller_state is ";
-
-constexpr char kControllerStateStoppedArrivingTail[] =
-  " s old, past the configured margin of ";
-
-constexpr char kControllerStateStoppedArrivingAdvice[] =
-  " s. A controller that died must not look like one that is tracking perfectly, so this is a "
-  "fault and not a tracking_error of zero: check the controller manager's cycle and whether the "
-  "trajectory controller is still active.";
-
-constexpr char kControllerStateStampAhead[] =
-  "state health: the age of the trajectory controller's state cannot be judged. The newest "
-  "control_msgs/JointTrajectoryControllerState on /crane/controller_state is stamped ";
-
-constexpr char kControllerStateStampAheadTail[] =
-  " s in this supervisor's future, further ahead than the configured margin of ";
-
-constexpr char kControllerStateStampAheadAdvice[] =
-  " s. Synchronise the clock of the host publishing it with this one; until then a tracking error "
-  "measured a moment ago and one measured a minute ago are indistinguishable.";
-
+// The tracking duty of wiki/control_architecture.md §5 row 1, decided from the
+// trajectory controller's own state publication. The typed cause §5.0 exists to
+// produce, in place of the stall inferred from a deliberately tight goal
+// tolerance.
 constexpr char kTrackingExceeded[] =
   "tracking: the velocity-tracking tolerance is exceeded on ";
 
@@ -129,43 +73,10 @@ constexpr char kNoVelocityErrorReported[] =
   "effort command interface; a profile that gives it neither leaves the field empty, and an empty "
   "field must not be read as a zero error.";
 
-// The inner velocity loop's own report. Three of these are §5.3's rule applied
-// to a fourth input, and the rest are the loop's three codes carried through
-// rather than restated: the controller computes them from the state interfaces
-// it claims itself and from the identified map of the tool it is driving, and
-// nothing above the controller manager can see either.
-constexpr char kControllerHealthNeverArrived[] =
-  "state health: no crane_msgs/VelocityControllerHealth has arrived on "
-  "/crane/velocity_controller/health since this supervisor started, so the inner velocity loop's "
-  "verdict on itself is not being read at all. Absence is not health -- an input that never "
-  "arrived is reported as a fault rather than left at FAULT_NONE -- and in particular a "
-  "commissioning prerequisite the controller is reporting would be reaching nobody, which is the "
-  "state the whole stream exists to end. Check that crane_velocity_controller is loaded and "
-  "active on the controller manager.";
-
-constexpr char kControllerHealthStoppedArriving[] =
-  "state health: the inner velocity loop stopped reporting its own health. The newest "
-  "crane_msgs/VelocityControllerHealth on /crane/velocity_controller/health is ";
-
-constexpr char kControllerHealthStoppedArrivingTail[] =
-  " s old, past the configured margin of ";
-
-constexpr char kControllerHealthStoppedArrivingAdvice[] =
-  " s. A controller that stopped publishing must not be indistinguishable from one that is "
-  "healthy and commissioned: check the controller manager's cycle and whether "
-  "crane_velocity_controller is still active.";
-
-constexpr char kControllerHealthStampAhead[] =
-  "state health: the age of the inner velocity loop's health report cannot be judged. The newest "
-  "crane_msgs/VelocityControllerHealth on /crane/velocity_controller/health is stamped ";
-
-constexpr char kControllerHealthStampAheadTail[] =
-  " s in this supervisor's future, further ahead than the configured margin of ";
-
-constexpr char kControllerHealthStampAheadAdvice[] =
-  " s. Synchronise the clock of the host publishing it with this one; until then a fault the "
-  "inner loop raised a moment ago and one it raised a minute ago are indistinguishable.";
-
+// The inner velocity loop's own codes, carried through rather than restated:
+// the controller computes them from the state interfaces it claims itself and
+// from the identified map of the tool it is driving, and nothing above the
+// controller manager can see either.
 constexpr char kInnerLoopStateHealth[] =
   "state health: the inner velocity loop reports a measurement of its own as stale or degraded. "
   "It judges that per cycle from the state interfaces it claims itself -- the joint position and "
@@ -178,8 +89,9 @@ constexpr char kInnerLoopReferenceStale[] =
   "reference: the inner velocity loop reports that the horizon it was executing has run out and "
   "nothing replaced it, so its velocity command is on the ramp to zero rather than following "
   "anything (wiki/control_architecture.md 3.3, 5.3). Every measurement is fine and this is not a "
-  "state-health fault: the producer is gone. The motion is failed rather than held, and a silent "
-  "hold must not look like success.";
+  "state-health fault: the producer is gone. It is a separate constant for that reason -- an "
+  "expired reference and a stale state are two different things to chase -- and the motion is "
+  "failed rather than held, because a silent hold must not look like success.";
 
 constexpr char kInnerLoopUnexpectedFault[] =
   "state health: the inner velocity loop reported a fault code it is not supposed to be able to "
@@ -228,37 +140,6 @@ constexpr char kDiagnosisNotProtection[] =
   "acts whether or not this software is running, and nothing here stopped, ramped or deactivated "
   "anything.";
 
-constexpr char kStopSignalNeverArrived[] =
-  "emergency stop: no epsilon_crane_msgs/RemoteCtrlStates has arrived on /crane/remote_ctrl_states "
-  "since this supervisor started, and absence of the stop signal is treated as asserted rather "
-  "than as released. A dead GPIO reader, a crashed driver and a released button must not look "
-  "alike. Check that gpio_controller is loaded and active on the controller manager and that its "
-  "remote_ctrl_states output reaches the contract name.";
-
-constexpr char kStopSignalStoppedArriving[] =
-  "emergency stop: the operator remote stopped arriving, which is treated as asserted rather than "
-  "as released. The newest epsilon_crane_msgs/RemoteCtrlStates on /crane/remote_ctrl_states is ";
-
-constexpr char kStopSignalStoppedArrivingTail[] =
-  " s old, past the configured margin of ";
-
-constexpr char kStopSignalStoppedArrivingAdvice[] =
-  " s. A reader that died must not be indistinguishable from a released button, so this is the "
-  "stop and not an interlock: check gpio_controller and the transport before trusting either the "
-  "stop or the deadman.";
-
-constexpr char kStopSignalStampAhead[] =
-  "emergency stop: the age of the operator remote cannot be judged, which is treated as asserted "
-  "rather than as released. The newest epsilon_crane_msgs/RemoteCtrlStates on "
-  "/crane/remote_ctrl_states is stamped ";
-
-constexpr char kStopSignalStampAheadTail[] =
-  " s in this supervisor's future, further ahead than the configured margin of ";
-
-constexpr char kStopSignalStampAheadAdvice[] =
-  " s. Synchronise the clock of the host publishing it with this one; until then a stale stop "
-  "signal and a fresh one are indistinguishable, and the safe reading of the two is asserted.";
-
 constexpr char kStopAsserted[] =
   "emergency stop: em_stop is asserted on /crane/remote_ctrl_states. The machine has been stopped "
   "by the chain below this stack; the supervisor latches the fault so that the software comes back "
@@ -268,7 +149,9 @@ constexpr char kStopAsserted[] =
 constexpr char kStopLatched[] =
   "emergency stop, latched: em_stop is no longer asserted and /crane/remote_ctrl_states is "
   "arriving again, but the stop has not been acknowledged, so it survives the signal returning to "
-  "released. Acknowledge it on /crane/clear_fault when the machine is where you expect it to be.";
+  "released. This is the one latched cause on this stream -- every other input clears its own "
+  "fault the moment it arrives again inside its deadline. Acknowledge it on /crane/clear_fault "
+  "when the machine is where you expect it to be.";
 
 constexpr char kDeadmanReleased[] =
   "interlock: the operator deadman -- button ";
@@ -343,32 +226,19 @@ const char * angular_or_linear(const std::string & joint, bool per_second)
   return angular ? "rad" : "m";
 }
 
-/// What a stream is doing, with never-started separated from stopped.
-/**
- * The same three absences the passive state is judged by, named once so the
- * trajectory controller's state is judged the same way rather than by a second
- * copy of the same three comparisons.
- */
-enum class StreamState
+/// How a report about one fault opens, so an operator reads the constant in
+/// words before reading the observation behind it.
+const char * fault_head(Fault fault)
 {
-  NeverArrived,
-  StoppedArriving,
-  StampAhead,
-  Arriving,
-};
-
-StreamState stream_state(double timeout, bool received, double age)
-{
-  if (!received) {
-    return StreamState::NeverArrived;
+  switch (fault) {
+    case Fault::EStop:
+      return "emergency stop: ";
+    case Fault::StateHealth:
+      return "state health: ";
+    default:
+      break;
   }
-  if (age > timeout) {
-    return StreamState::StoppedArriving;
-  }
-  if (age < -timeout) {
-    return StreamState::StampAhead;
-  }
-  return StreamState::Arriving;
+  return "fault: ";
 }
 
 /// `a`, `a and b`, `a, b and c` -- a list an operator reads as a sentence.
@@ -384,67 +254,26 @@ std::string joined(const std::vector<std::string> & items)
   return text;
 }
 
-/// What the stop signal is doing, with absence separated from assertion.
+/// The account of the emergency stop, whichever of its causes holds.
 /**
- * Four of the five are §6.1's "treat absence as asserted" and only `Released`
- * is not, so the enum is the place where a dead reader, a crashed driver, a
- * clock fault, an asserted stop and a released one stop being interchangeable.
- */
-enum class StopSignal
-{
-  NeverArrived,
-  StoppedArriving,
-  StampAhead,
-  Asserted,
-  Released,
-};
-
-StopSignal stop_signal(const SupervisorConfig & config, const RemoteCtrlReport & remote)
-{
-  if (!remote.received) {
-    return StopSignal::NeverArrived;
-  }
-  if (remote.age > config.remote_ctrl_timeout) {
-    return StopSignal::StoppedArriving;
-  }
-  if (remote.age < -config.remote_ctrl_timeout) {
-    return StopSignal::StampAhead;
-  }
-  if (remote.em_stop) {
-    return StopSignal::Asserted;
-  }
-  return StopSignal::Released;
-}
-
-/// True when the newest sample is one whose booleans mean anything.
-bool signal_is_arriving(StopSignal signal)
-{
-  return signal == StopSignal::Asserted || signal == StopSignal::Released;
-}
-
-/// The account of one stop condition, in the operator's terms.
-/**
- * `Released` reaches this only through the latch, which is the case where the
+ * The absences go through the same generator every other input's do, because
+ * §6.1's rule that a dead reader and a released button must not look alike is
+ * §5.3's rule with a different constant on it. What is added here is the
+ * sentence that must be on every one of them: this is diagnosis, not protection.
+ *
+ * `Fresh` reaches this only through the latch, which is the case where the
  * condition is gone and the acknowledgement is what is still owed.
  */
 std::string stop_message(
-  const SupervisorConfig & config, StopSignal signal, const RemoteCtrlReport & remote)
+  const SupervisorConfig & config, const SupervisorInput & input, Staleness cause)
 {
-  switch (signal) {
-    case StopSignal::NeverArrived:
-      return std::string(kStopSignalNeverArrived) + kDiagnosisNotProtection;
-    case StopSignal::StoppedArriving:
-      return kStopSignalStoppedArriving + seconds_text(remote.age) +
-             kStopSignalStoppedArrivingTail + seconds_text(config.remote_ctrl_timeout) +
-             kStopSignalStoppedArrivingAdvice + kDiagnosisNotProtection;
-    case StopSignal::StampAhead:
-      return kStopSignalStampAhead + seconds_text(-remote.age) + kStopSignalStampAheadTail +
-             seconds_text(config.remote_ctrl_timeout) + kStopSignalStampAheadAdvice +
-             kDiagnosisNotProtection;
-    case StopSignal::Asserted:
-      return std::string(kStopAsserted) + kDiagnosisNotProtection;
-    case StopSignal::Released:
-      break;
+  if (cause != Staleness::Fresh) {
+    return staleness_message(
+      config, Input::RemoteCtrl, cause, input.stream(Input::RemoteCtrl), {}) +
+           kDiagnosisNotProtection;
+  }
+  if (input.remote_ctrl.em_stop) {
+    return std::string(kStopAsserted) + kDiagnosisNotProtection;
   }
   return std::string(kStopLatched) + kDiagnosisNotProtection;
 }
@@ -503,35 +332,25 @@ std::string breach_text(const TrackingBreach & breach)
 
 bool validate(const SupervisorConfig & config, std::string & reason)
 {
-  if (!std::isfinite(config.pendulum_state_timeout) || config.pendulum_state_timeout <= 0.0) {
-    reason =
-      "pendulum_state_timeout must be a finite positive number of seconds; a margin of zero or "
-      "less would report every sample stale and a margin that is not a number would report none "
-      "of them";
-    return false;
-  }
-  if (!std::isfinite(config.remote_ctrl_timeout) || config.remote_ctrl_timeout <= 0.0) {
-    reason =
-      "remote_ctrl_timeout must be a finite positive number of seconds; a margin of zero or less "
-      "would hold the emergency stop asserted against a healthy remote, and one that is not a "
-      "number would report a dead reader as a released button";
-    return false;
-  }
-  if (!std::isfinite(config.controller_state_timeout) || config.controller_state_timeout <= 0.0) {
-    reason =
-      "controller_state_timeout must be a finite positive number of seconds; a margin of zero or "
-      "less would report the trajectory controller dead on every cycle, and one that is not a "
-      "number would let a controller that stopped publishing pass for a crane that is tracking "
-      "perfectly";
-    return false;
-  }
-  if (!std::isfinite(config.controller_health_timeout) || config.controller_health_timeout <= 0.0) {
-    reason =
-      "controller_health_timeout must be a finite positive number of seconds; a margin of zero or "
-      "less would report the inner velocity loop dead on every cycle, and one that is not a "
-      "number would let an inner loop that stopped publishing pass for one that is healthy and "
-      "commissioned";
-    return false;
+  // Over `Input` rather than over a list written here, so that an input added to
+  // the enum is checked without this function being touched -- and, until
+  // somebody gives it a margin, refused. A deadline that were merely *absent*
+  // would make that input exempt from §5.3, which is the one failure a warning
+  // could not catch, because there would be nothing to warn about.
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    const InputPolicy & policy = kInputPolicies[i];
+    const double deadline = config.freshness_deadline[i];
+    if (!std::isfinite(deadline) || deadline <= 0.0) {
+      reason = std::string("the freshness deadline of ") + policy.label + " (" + policy.type +
+        " on " + policy.topic + ") is " + seconds_text(deadline) +
+        " s, and a deadline is a finite positive number of seconds: zero or less would report "
+        "every sample of it stale, and one that is not a number would report none of them, which "
+        "would leave that input with no defined consequence for stopping at all "
+        "(wiki/control_architecture.md 5.3). Every input this supervisor holds has a deadline and "
+        "none is exempt; the numbers and their derivations are in "
+        "src/crane_supervisor_parameters.yaml.";
+      return false;
+    }
   }
   for (const AxisTolerance & axis : config.tracking_tolerance) {
     if (axis.joint.empty()) {
@@ -550,6 +369,84 @@ bool validate(const SupervisorConfig & config, std::string & reason)
     return false;
   }
   return true;
+}
+
+Staleness freshness_of(double deadline, const StreamReport & stream) noexcept
+{
+  if (!stream.received) {
+    return Staleness::NeverArrived;
+  }
+  if (stream.age > deadline) {
+    return Staleness::StoppedArriving;
+  }
+  if (stream.age < -deadline) {
+    return Staleness::StampAhead;
+  }
+  return Staleness::Fresh;
+}
+
+std::array<Staleness, kInputCount> freshness(
+  const SupervisorConfig & config, const SupervisorInput & input) noexcept
+{
+  std::array<Staleness, kInputCount> causes{};
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    causes[i] = freshness_of(config.freshness_deadline[i], input.streams[i]);
+  }
+  return causes;
+}
+
+std::string staleness_message(
+  const SupervisorConfig & config, Input input, Staleness cause, const StreamReport & stream,
+  const std::string & carried)
+{
+  const InputPolicy & policy = policy_of(input);
+  const std::string deadline = seconds_text(config.deadline(input));
+  std::string text = fault_head(policy.fault);
+
+  switch (cause) {
+    case Staleness::NeverArrived:
+      text += std::string("no ") + policy.type + " has arrived on " + policy.topic +
+        " since this supervisor started. Staleness cause: age -- and there is no sample to age, "
+        "because this input never connected. An input that never came up and one that was "
+        "arriving and died are both faults and are not the same fault to chase. " +
+        policy.consequence + kAbsenceIsNotHealth + policy.advice;
+      break;
+    case Staleness::StoppedArriving:
+      text += std::string(policy.label) + " " + policy.stopped +
+        ". Staleness cause: age -- the newest " + policy.type + " on " + policy.topic + " is " +
+        seconds_text(stream.age) + " s old, past this input's freshness deadline of " + deadline +
+        " s. It was arriving before, which is not the same fault as an input that never "
+        "connected. " + policy.consequence + " " + policy.advice;
+      break;
+    case Staleness::StampAhead:
+      text += std::string("the age of ") + policy.label +
+        " cannot be judged. Staleness cause: age -- the newest " + policy.type + " on " +
+        policy.topic + " is stamped " + seconds_text(-stream.age) +
+        " s in this supervisor's future, further ahead than this input's freshness deadline of " +
+        deadline +
+        " s, so its age is not a measurement of anything. Synchronise the clock of the host "
+        "publishing it with this one; until then no staleness answer about that stream means "
+        "anything (PRD user story 59). " + policy.consequence;
+      break;
+    case Staleness::ProducerUnhealthy:
+      text += std::string(policy.label) + " arrived inside its freshness deadline of " + deadline +
+        " s and " + policy.producer +
+        " marks it unusable. Staleness cause: the producer's own health flag, which is the one "
+        "cause of the three this supervisor cannot measure off a topic. " + policy.producer +
+        " separates the flag, a sample that stopped refreshing behind a header that keeps moving, "
+        "and the measurement age, and says which in its own status string, so the string is "
+        "carried here unedited rather than restated: " +
+        (carried.empty() ? std::string(kNoStatusGiven) : carried);
+      break;
+    case Staleness::Fresh:
+      text += std::string(policy.label) + " is arriving inside its freshness deadline of " +
+        deadline +
+        " s and a staleness report was composed for it anyway. That is a defect in this "
+        "supervisor rather than in the stream, and it is reported as one rather than left as a "
+        "fault with no cause behind it.";
+      break;
+  }
+  return text;
 }
 
 bool is_tolerance(double dq_a) noexcept
@@ -615,22 +512,24 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
   // so it reports the mode it can defend and no other.
   decision.mode = Mode::Idle;
 
+  // One pass over every input, on the status cycle: `kInputCount` comparisons,
+  // no allocation, and no dependence on a message arriving. A deadline that were
+  // evaluated only in a subscription callback could never fire, because the case
+  // it exists for is the one where no callback runs again
+  // (wiki/control_architecture.md §5.3).
+  const std::array<Staleness, kInputCount> staleness = freshness(config, input);
+  const Staleness remote_cause = staleness[index_of(Input::RemoteCtrl)];
+
   const PendulumStateReport & state = input.pendulum_state;
-  const RemoteCtrlReport & remote = input.remote_ctrl;
   const ControllerStateReport & controller = input.controller_state;
   const ControllerHealthReport & inner_loop = input.controller_health;
-  const StopSignal signal = stop_signal(config, remote);
-  const StreamState tracking_stream =
-    stream_state(config.controller_state_timeout, controller.received, controller.age);
-  const StreamState inner_loop_stream =
-    stream_state(config.controller_health_timeout, inner_loop.received, inner_loop.age);
 
   // Filled before any branch returns, for the same reason `deadman_held` is: it
   // is a field of its own on every report, so the largest deviation on the crane
   // stays visible in the cycles where a more consequential cause owns `fault`.
   // Zero while the stream is not arriving -- and that case is itself a fault
   // below, so the zero is never the only thing said about it.
-  if (tracking_stream == StreamState::Arriving) {
+  if (staleness[index_of(Input::ControllerState)] == Staleness::Fresh) {
     decision.tracking_error = max_position_error(controller);
   }
 
@@ -639,19 +538,22 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
   // reason the interlock can sit below state health below: a released deadman
   // stays visible in this field even in a cycle whose `fault` is something else,
   // where a state-health fault that lost the field would be invisible.
-  decision.deadman_held = signal_is_arriving(signal) && remote.deadman_held;
+  decision.deadman_held = remote_cause == Staleness::Fresh && input.remote_ctrl.deadman_held;
 
   // §6.1: asserted latches, and absence is asserted. The latch is raised here
-  // and lowered in exactly one place -- an acknowledged `/crane/clear_fault`.
-  decision.estop_latched = input.estop_latched || signal != StopSignal::Released;
+  // and lowered in exactly one place -- an acknowledged `/crane/clear_fault` --
+  // and it is the only input whose fault does not clear itself, which is what
+  // `InputPolicy::latches` records.
+  decision.estop_latched =
+    input.estop_latched || remote_cause != Staleness::Fresh || input.remote_ctrl.em_stop;
 
   // The stop outranks everything else this supervisor watches, and it has to:
   // it is the only cause here with no field of its own, so a cycle that reported
   // something else instead would not report it at all. A stale passive state is
   // a defect in a stream; a stop is the machine having been stopped.
   if (decision.estop_latched) {
-    decision.fault = Fault::EStop;
-    decision.message = stop_message(config, signal, remote);
+    decision.fault = policy_of(Input::RemoteCtrl).fault;
+    decision.message = stop_message(config, input, remote_cause);
     return decision;
   }
 
@@ -660,83 +562,41 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
   // input that is not there leaves nothing to judge, one whose age is unknowable
   // leaves numbers nobody can place in time, and one that arrived leaves numbers
   // the estimator has already had its say about.
-  if (!state.received) {
-    decision.fault = Fault::StateHealth;
-    decision.message = kNothingArrived;
+  if (staleness[index_of(Input::PendulumState)] != Staleness::Fresh) {
+    decision.fault = policy_of(Input::PendulumState).fault;
+    decision.message = staleness_message(
+      config, Input::PendulumState, staleness[index_of(Input::PendulumState)],
+      input.stream(Input::PendulumState), {});
     return decision;
   }
 
-  if (state.age > config.pendulum_state_timeout) {
-    decision.fault = Fault::StateHealth;
-    decision.message = kStoppedArriving + seconds_text(state.age) + kStoppedArrivingTail +
-      seconds_text(config.pendulum_state_timeout) + kStoppedArrivingAdvice;
-    return decision;
-  }
-
-  if (state.age < -config.pendulum_state_timeout) {
-    decision.fault = Fault::StateHealth;
-    decision.message = kStampAhead + seconds_text(-state.age) + kStampAheadTail +
-      seconds_text(config.pendulum_state_timeout) + kStampAheadAdvice;
-    return decision;
-  }
-
+  // The one cause of the three this supervisor cannot measure off a topic: the
+  // producer's own flag. Its account is carried through rather than restated,
+  // because the broadcaster separates six causes behind that flag -- the sample
+  // that stopped refreshing among them -- and restating it here would flatten a
+  // distinction the estimator went to some trouble to make.
   if (!state.valid) {
-    decision.fault = Fault::StateHealth;
-    decision.message = kMarkedUnusable + (state.status.empty() ? kNoStatusGiven : state.status);
+    decision.fault = policy_of(Input::PendulumState).fault;
+    decision.message = staleness_message(
+      config, Input::PendulumState, Staleness::ProducerUnhealthy,
+      input.stream(Input::PendulumState), state.status);
     return decision;
   }
 
-  // The freshness of the input the tracking comparison consumes, judged before
-  // the comparison and not after it: §5.3 allows no input to stop arriving
-  // without a defined consequence, and the consequence here is that the error
-  // is unmeasured rather than zero.
-  switch (tracking_stream) {
-    case StreamState::NeverArrived:
-      decision.fault = Fault::StateHealth;
-      decision.message = kControllerStateNeverArrived;
+  // The two remaining inputs, judged before anything derived from them is:
+  // §5.3 allows no input to stop arriving without a defined consequence, and
+  // here the consequences are that the tracking error is unmeasured rather than
+  // zero, and that the inner loop's verdict on itself is unread rather than
+  // clear. Both are swept in a loop over the registry, so a fifth input judged
+  // by the same rule needs no fifth branch.
+  for (const Input stream_input : {Input::ControllerState, Input::ControllerHealth}) {
+    const Staleness cause = staleness[index_of(stream_input)];
+    if (cause != Staleness::Fresh) {
+      decision.fault = policy_of(stream_input).fault;
+      decision.message =
+        staleness_message(config, stream_input, cause, input.stream(stream_input), {});
       return decision;
-    case StreamState::StoppedArriving:
-      decision.fault = Fault::StateHealth;
-      decision.message = kControllerStateStoppedArriving + seconds_text(controller.age) +
-        kControllerStateStoppedArrivingTail + seconds_text(config.controller_state_timeout) +
-        kControllerStateStoppedArrivingAdvice;
-      return decision;
-    case StreamState::StampAhead:
-      decision.fault = Fault::StateHealth;
-      decision.message = kControllerStateStampAhead + seconds_text(-controller.age) +
-        kControllerStateStampAheadTail + seconds_text(config.controller_state_timeout) +
-        kControllerStateStampAheadAdvice;
-      return decision;
-    case StreamState::Arriving:
-      break;
-  }
-
-  // The fourth input's own freshness, judged the same way the other three are.
-  // §5.3 allows no input to stop arriving without a defined consequence, and the
-  // consequence here is that the inner loop's verdict is *unread* rather than
-  // clear -- an uncommissioned axis reported to nobody is the state this stream
-  // exists to end, so a stream that is not arriving must not read as one that is
-  // saying nothing is wrong. The general staleness policy is a later issue; this
-  // is the half of it that cannot wait.
-  switch (inner_loop_stream) {
-    case StreamState::NeverArrived:
-      decision.fault = Fault::StateHealth;
-      decision.message = kControllerHealthNeverArrived;
-      return decision;
-    case StreamState::StoppedArriving:
-      decision.fault = Fault::StateHealth;
-      decision.message = kControllerHealthStoppedArriving + seconds_text(inner_loop.age) +
-        kControllerHealthStoppedArrivingTail + seconds_text(config.controller_health_timeout) +
-        kControllerHealthStoppedArrivingAdvice;
-      return decision;
-    case StreamState::StampAhead:
-      decision.fault = Fault::StateHealth;
-      decision.message = kControllerHealthStampAhead + seconds_text(-inner_loop.age) +
-        kControllerHealthStampAheadTail + seconds_text(config.controller_health_timeout) +
-        kControllerHealthStampAheadAdvice;
-      return decision;
-    case StreamState::Arriving:
-      break;
+    }
   }
 
   // The inner loop's *health* codes, merged as the loop numbered them. Above
@@ -817,16 +677,17 @@ ClearFaultOutcome clear_fault(const SupervisorConfig & config, const SupervisorI
     return outcome;
   }
 
-  // Judged from the same view of the same signal `decide()` uses, so that the
-  // acknowledgement and the next status cycle cannot disagree about whether the
-  // condition is still there.
-  const StopSignal signal = stop_signal(config, input.remote_ctrl);
-  if (signal == StopSignal::Asserted) {
+  // Judged from the same view of the same signal `decide()` uses, and against
+  // the same deadline, so that the acknowledgement and the next status cycle
+  // cannot disagree about whether the condition is still there.
+  const Staleness cause =
+    freshness_of(config.deadline(Input::RemoteCtrl), input.stream(Input::RemoteCtrl));
+  if (cause == Staleness::Fresh && input.remote_ctrl.em_stop) {
     outcome.cleared = false;
     outcome.message = kClearRefusedAsserted;
     return outcome;
   }
-  if (signal != StopSignal::Released) {
+  if (cause != Staleness::Fresh) {
     outcome.cleared = false;
     outcome.message = kClearRefusedAbsent;
     return outcome;

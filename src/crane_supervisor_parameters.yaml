@@ -1,34 +1,56 @@
+# The freshness deadlines of wiki/control_architecture.md 5.3, one per input.
+#
+# **This file is where the numbers live, and it is the only place they live.**
+# `SupervisorConfig::freshness_deadline` is an array sized by the `Input`
+# registry and value-initialised to zero, and zero is not a deadline: an input
+# that was never given one fails validate() and the node throws rather than
+# publishing a status about a stream nobody is watching. A plausible struct
+# default beside these four would be exactly how an input nobody configured goes
+# on being judged by a number nobody chose.
+#
+# They are per input and not one global number because the inputs do not go
+# stale at the same age: two come off the manager's 100 Hz cycle and two are
+# 20 Hz contracts, so the healthy worst-case age of one is not the healthy
+# worst-case age of another. None of them is a safety timing requirement -- by
+# the time the remote's deadline expires the hardware chain has long since acted
+# -- and what each number trades is a false alarm against how far the diagnosis
+# lags the event.
 crane_supervisor:
   pendulum_state_timeout:
     type: double
     default_value: 0.15
     read_only: true
-    description: "Longest age of the newest crane_msgs/PendulumState on
-      /crane/pendulum_state that still counts as arriving, s. Past it the
-      supervisor reports FAULT_STATE_HEALTH: wiki/control_architecture.md 5.3
-      allows no input to stop arriving without a defined consequence, and this
-      margin is what turns 'stopped' into that consequence for the one input
-      this slice carries. Derived, not measured, and deliberately loose --
-      100 Hz publication sampled at 20 Hz makes a healthy sample up to 60 ms old
-      when it is read, and the worst control-cycle gap in the recorded machine
-      data is a further 50.4 ms, so 150 ms clears a healthy stack without
-      hiding a dead publisher for a human-perceptible time. The general
-      staleness policy of 5.3 -- per input, per consequence -- is a later issue
-      and will want a tighter number than this one. Read-only: the fault this
-      margin decides is the only thing the tracer proves, and a margin an
-      operator can move underneath a running stream makes the status
-      unreproducible."
+    description: "Freshness deadline of Input::PendulumState: the longest age of
+      the newest crane_msgs/PendulumState on /crane/pendulum_state that still
+      counts as arriving, s. Past it the supervisor reports FAULT_STATE_HEALTH
+      and says which of the staleness causes fired:
+      wiki/control_architecture.md 5.3 allows no input to stop arriving without
+      a defined consequence, and this deadline is what turns 'stopped' into that
+      consequence for this input. Derived, not measured, and deliberately loose
+      -- 100 Hz publication sampled at 20 Hz makes a healthy sample up to 60 ms
+      old when it is read, and the worst control-cycle gap in the recorded
+      machine data is a further 50.4 ms, so 150 ms clears a healthy stack
+      without hiding a dead publisher for a human-perceptible time. It is a
+      topic-level margin and is not the broadcaster's own
+      health.max_measurement_age of 60 ms, which asks a different question one
+      layer down. Read-only: a margin an operator can move underneath a running
+      stream makes the status unreproducible."
     validation:
       bounds<>: [0.001, 10.0]
   remote_ctrl_timeout:
     type: double
     default_value: 0.25
     read_only: true
-    description: "Longest age of the newest epsilon_crane_msgs/RemoteCtrlStates
+    description: "Freshness deadline of Input::RemoteCtrl: the longest age of the
+      newest epsilon_crane_msgs/RemoteCtrlStates
       on /crane/remote_ctrl_states that still counts as arriving, s. Past it the
       signal is absent, and wiki/control_architecture.md 5.3 and 6.1 read absence
       of the stop signal as asserted rather than as released: a dead GPIO reader,
-      a crashed driver and a released button must not look alike. Derived --
+      a crashed driver and a released button must not look alike. It is the one
+      input whose fault latches -- 6.1 asks the software to come back in a
+      defined state, so /crane/clear_fault is what lowers it, while every other
+      input clears its own fault as soon as it arrives again inside this
+      margin. Derived --
       the topic is a 20 Hz contract sampled here at 20 Hz, so a healthy sample is
       up to 50 ms of publication period plus 50 ms of status period old when it
       is read, and the worst control-cycle gap in the recorded machine data adds
@@ -45,7 +67,8 @@ crane_supervisor:
     type: double
     default_value: 0.15
     read_only: true
-    description: "Longest age of the newest
+    description: "Freshness deadline of Input::ControllerState: the longest age
+      of the newest
       control_msgs/JointTrajectoryControllerState on /crane/controller_state that
       still counts as arriving, s. Past it the supervisor reports
       FAULT_STATE_HEALTH and says the tracking error is unmeasured, because a
@@ -65,7 +88,8 @@ crane_supervisor:
     type: double
     default_value: 0.25
     read_only: true
-    description: "Longest age of the newest crane_msgs/VelocityControllerHealth
+    description: "Freshness deadline of Input::ControllerHealth: the longest age
+      of the newest crane_msgs/VelocityControllerHealth
       on /crane/velocity_controller/health that still counts as arriving, s. Past
       it the supervisor reports FAULT_STATE_HEALTH and says the inner velocity
       loop's verdict on itself is unread rather than clear: a controller that
@@ -79,8 +103,7 @@ crane_supervisor:
       20 Hz, so a healthy sample is up to 50 ms of publication period plus 50 ms
       of status period old when it is read and the worst control-cycle gap in the
       recorded machine data adds a further 50.4 ms. 250 ms clears the resulting
-      150 ms. Only 'arriving' against 'stopped' is decided here; the general
-      staleness policy of 5.3 is a later issue and this stream joins it there.
+      150 ms.
       Read-only, for the reason the other three margins are: a margin an operator
       can move underneath a running stream makes the status unreproducible."
     validation:

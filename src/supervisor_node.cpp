@@ -1,8 +1,10 @@
 #include "crane_supervisor/supervisor_node.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -15,16 +17,31 @@ namespace crane_supervisor
 namespace
 {
 
-/// The QoS of every streamed contract this node touches.
-/**
- * Reliable, depth 1, volatile -- ROS 2 Interfaces §1 sets the category by the
- * consumer, and both of these are state a controller acts on. It is the same
- * profile `crane_msgs`' own ROS contract test asserts on both topics, so the
- * two agree by construction rather than by inspection.
- */
-rclcpp::QoS contract_qos()
+/// Seconds as text, to the millisecond, for the one line logged at startup.
+std::string seconds_text(double seconds)
 {
-  return rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile();
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "%.3f", seconds);
+  return std::string(buffer);
+}
+
+/// Every input and the deadline it is judged against, as one sentence.
+/**
+ * Built from the registry rather than written out, so the line an operator finds
+ * in the log names the inputs the node actually holds -- including one added
+ * after this line was written.
+ */
+std::string deadline_summary(const SupervisorConfig & config)
+{
+  std::string text;
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    if (i > 0) {
+      text += (i + 1 == kInputCount) ? " and " : ", ";
+    }
+    text += std::string(kInputPolicies[i].topic) + " within " +
+      seconds_text(config.freshness_deadline[i]) + " s";
+  }
+  return text;
 }
 
 }  // namespace
@@ -63,10 +80,17 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
 {
   const ParamListener listener(this);
   const auto parameters = listener.get_params();
-  config_.pendulum_state_timeout = parameters.pendulum_state_timeout;
-  config_.remote_ctrl_timeout = parameters.remote_ctrl_timeout;
-  config_.controller_state_timeout = parameters.controller_state_timeout;
-  config_.controller_health_timeout = parameters.controller_health_timeout;
+
+  // One margin onto the input it belongs to. This is the one hand-written
+  // mapping in the freshness path and it is guarded from both sides: an input
+  // added to `Input` with no line here keeps the zero its slot is
+  // value-initialised with, `validate()` refuses a deadline of zero, and the
+  // node throws below rather than publishing a status about a stream nobody is
+  // watching (wiki/control_architecture.md §5.3).
+  config_.deadline(Input::PendulumState) = parameters.pendulum_state_timeout;
+  config_.deadline(Input::RemoteCtrl) = parameters.remote_ctrl_timeout;
+  config_.deadline(Input::ControllerState) = parameters.controller_state_timeout;
+  config_.deadline(Input::ControllerHealth) = parameters.controller_health_timeout;
   config_.deadman_button = static_cast<int>(parameters.deadman_button);
 
   // The six numbers arrive from `crane_control/config/tracking_tolerance.yaml`
@@ -87,7 +111,8 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   // declared bounds. The core is checked against its own rule anyway: it is the
   // ROS-free half, it is what a later configuration path will be checked
   // against, and a margin that reached `decide()` unchecked would be a silent
-  // failure of exactly the kind Style Guide §4 exists to stop.
+  // failure of exactly the kind Style Guide §4 exists to stop. It is also what
+  // refuses an input that was given no deadline at all.
   std::string reason;
   if (!validate(config_, reason)) {
     throw std::runtime_error("crane_supervisor: " + reason);
@@ -106,14 +131,17 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   status_publisher_ =
     create_publisher<crane_msgs::msg::SupervisorStatus>(kStatusTopic, contract_qos());
 
-  pendulum_state_subscription_ = create_subscription<crane_msgs::msg::PendulumState>(
-    kPendulumStateTopic, contract_qos(),
+  // Every subscription below goes through `subscribe()` and names its `Input`,
+  // which is what gives it a freshness deadline and a policy row to be reported
+  // from. None of them takes a topic name of its own.
+  pendulum_state_subscription_ = subscribe<crane_msgs::msg::PendulumState>(
+    Input::PendulumState,
     [this](crane_msgs::msg::PendulumState::ConstSharedPtr message) {
       pendulum_state_ = std::move(message);
     });
 
-  remote_ctrl_subscription_ = create_subscription<epsilon_crane_msgs::msg::RemoteCtrlStates>(
-    kRemoteCtrlStatesTopic, contract_qos(),
+  remote_ctrl_subscription_ = subscribe<epsilon_crane_msgs::msg::RemoteCtrlStates>(
+    Input::RemoteCtrl,
     [this](epsilon_crane_msgs::msg::RemoteCtrlStates::ConstSharedPtr message) {
       remote_ctrl_ = std::move(message);
     });
@@ -121,9 +149,8 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   // The third input, and the one that makes the tracking duty of §5 row 1 a
   // typed cause. The controller that computes the error is the one that
   // publishes it, so nothing is re-derived here from `/joint_states`.
-  controller_state_subscription_ =
-    create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
-    kControllerStateTopic, contract_qos(),
+  controller_state_subscription_ = subscribe<control_msgs::msg::JointTrajectoryControllerState>(
+    Input::ControllerState,
     [this](control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr message) {
       controller_state_ = std::move(message);
     });
@@ -133,12 +160,26 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   // valve map for is known to the inner velocity loop alone. It computes the
   // fault every cycle and publishes it at the rate of the consumers, of which
   // this node is one.
-  controller_health_subscription_ =
-    create_subscription<crane_msgs::msg::VelocityControllerHealth>(
-    kControllerHealthTopic, contract_qos(),
+  controller_health_subscription_ = subscribe<crane_msgs::msg::VelocityControllerHealth>(
+    Input::ControllerHealth,
     [this](crane_msgs::msg::VelocityControllerHealth::ConstSharedPtr message) {
       controller_health_ = std::move(message);
     });
+
+  // The other half of the structural guard. `validate()` refuses an input with
+  // no deadline; this refuses one with no subscription, which would otherwise be
+  // reported as never having arrived for the lifetime of the process -- a defect
+  // in this node dressed up as a fault in the graph.
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    if (!claimed_[i]) {
+      throw std::runtime_error(
+        std::string("crane_supervisor: ") + kInputPolicies[i].label + " (" +
+        kInputPolicies[i].topic +
+        ") is an input of this supervisor with no subscription behind it. Every enumerator of "
+        "Input is subscribed through subscribe(), or the node does not start: an input nobody "
+        "reads would be reported as never having arrived for ever.");
+    }
+  }
 
   // The acknowledgement of ROS 2 Interfaces §5, and the only thing in this
   // package a caller can ask for. It lowers a latch and does nothing else: it
@@ -162,17 +203,21 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
       RCLCPP_INFO(get_logger(), "%s: %s", kClearFaultService, outcome.message.c_str());
     });
 
+  // The freshness sweep runs from here and from nowhere else. A deadline
+  // evaluated in a subscription callback could not fire on the stream that
+  // stopped, which is the only stream it exists for.
   status_timer_ = create_wall_timer(status_period(), [this]() {update();});
 
   RCLCPP_INFO(
     get_logger(),
-    "crane_supervisor: publishing %s at %.1f Hz. It observes %s, %s -- button %d of it is the "
-    "deadman -- %s and %s, serves %s, and does nothing else. It holds no stop authority: the "
-    "hardware stop input is an unverified commissioning prerequisite, so the package has no path "
-    "to a motion command by construction, and what it does with the emergency stop is diagnosis "
-    "and recovery rather than protection.",
-    kStatusTopic, kStatusRate, kPendulumStateTopic, kRemoteCtrlStatesTopic,
-    config_.deadman_button, kControllerStateTopic, kControllerHealthTopic, kClearFaultService);
+    "crane_supervisor: publishing %s at %.1f Hz. Every input it holds has a freshness deadline of "
+    "its own and none is exempt -- %s -- and an input that stops arriving is reported as a fault "
+    "rather than left at FAULT_NONE. Button %d of the remote is the deadman. It serves %s and "
+    "does nothing else. It holds no stop authority: the hardware stop input is an unverified "
+    "commissioning prerequisite, so the package has no path to a motion command by construction, "
+    "and what it does with the emergency stop is diagnosis and recovery rather than protection.",
+    kStatusTopic, kStatusRate, deadline_summary(config_).c_str(), config_.deadman_button,
+    kClearFaultService);
 }
 
 SupervisorInput SupervisorNode::observe() const
@@ -180,33 +225,46 @@ SupervisorInput SupervisorNode::observe() const
   SupervisorInput input;
   input.estop_latched = estop_latched_;
 
+  // One reading of the clock for all of them, so two inputs sampled in the same
+  // cycle are aged against the same instant. `now() - header.stamp` is the age
+  // the publisher of that header intends a consumer to compute: every producer
+  // here stamps from the control cycle's own time on the same clock, so the two
+  // sides agree about what time it is without either saying so on the wire.
+  const rclcpp::Time sampled_at = now();
+  const auto age_of = [&sampled_at](const auto & message) {
+      return (sampled_at - rclcpp::Time(message->header.stamp)).seconds();
+    };
+
+  // The transport half of every input, in one loop over the registry, so no
+  // input is aged by a rule of its own. An input added to `Input` without a row
+  // here reads as never having arrived -- a standing fault, which is the safe
+  // direction for the omission to fail in, and the constructor's claim check
+  // catches the omission that produces it.
+  const std::array<bool, kInputCount> arrived{{
+    static_cast<bool>(pendulum_state_), static_cast<bool>(remote_ctrl_),
+    static_cast<bool>(controller_state_), static_cast<bool>(controller_health_)}};
+  const std::array<double, kInputCount> age{{
+    pendulum_state_ ? age_of(pendulum_state_) : 0.0,
+    remote_ctrl_ ? age_of(remote_ctrl_) : 0.0,
+    controller_state_ ? age_of(controller_state_) : 0.0,
+    controller_health_ ? age_of(controller_health_) : 0.0}};
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    input.streams[i].received = arrived[i];
+    input.streams[i].age = age[i];
+  }
+
   if (pendulum_state_) {
-    input.pendulum_state.received = true;
     input.pendulum_state.valid = pendulum_state_->valid;
     input.pendulum_state.status = pendulum_state_->status;
-    // `now() - header.stamp` is the age the publisher of that header intends a
-    // consumer to compute: pendulum_state_broadcaster measures its own
-    // staleness on the same clock it stamps with, so the two agree about what
-    // time it is without either of them saying so on the wire.
-    input.pendulum_state.age = (now() - rclcpp::Time(pendulum_state_->header.stamp)).seconds();
   }
 
   if (remote_ctrl_) {
-    input.remote_ctrl.received = true;
     input.remote_ctrl.deadman_held = deadman_of(*remote_ctrl_, config_.deadman_button);
     input.remote_ctrl.em_stop = remote_ctrl_->em_stop;
-    // gpio_controller stamps the message from the control cycle's own time, so
-    // the age is measured the same way as the passive state's and means the
-    // same thing.
-    input.remote_ctrl.age = (now() - rclcpp::Time(remote_ctrl_->header.stamp)).seconds();
   }
 
   if (controller_state_) {
     const auto & message = *controller_state_;
-    input.controller_state.received = true;
-    // The trajectory controller stamps its state with the control cycle's own
-    // time, the same clock the other two inputs are aged against.
-    input.controller_state.age = (now() - rclcpp::Time(message.header.stamp)).seconds();
     input.controller_state.axes.reserve(message.joint_names.size());
     for (std::size_t i = 0; i < message.joint_names.size(); ++i) {
       AxisError axis;
@@ -228,10 +286,6 @@ SupervisorInput SupervisorNode::observe() const
 
   if (controller_health_) {
     const auto & message = *controller_health_;
-    input.controller_health.received = true;
-    // The controller stamps the report with the control cycle's own time, the
-    // same clock the other three inputs are aged against.
-    input.controller_health.age = (now() - rclcpp::Time(message.header.stamp)).seconds();
     // A cast and not a lookup table: the message and the core's enum share one
     // numbering, and `test_contract.cpp` asserts every pair of them. A value
     // outside the ten constants stays what the controller sent rather than being

@@ -119,6 +119,13 @@ if(BUILD_TESTING)
   # The other absence that is a feature: this package keeps no copy of the one
   # tracking tolerance, so the file that owns it cannot be disagreed with.
   ament_add_pytest_test(test_no_tolerance_of_its_own test/test_no_tolerance_of_its_own.py)
+
+  # The freshness policy, as a shape rather than as a checklist: one
+  # `create_subscription` in the package, one policy row and one configured
+  # deadline per enumerator of `Input`, and no default margin for an input
+  # nobody configured (wiki/control_architecture.md §5.3).
+  ament_add_pytest_test(
+    test_every_input_has_a_deadline test/test_every_input_has_a_deadline.py)
 endif()
 
 ament_package()

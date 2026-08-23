@@ -19,17 +19,31 @@
 // one-directional, so what arrives here is consumed and reported and never acted
 // on.
 //
+// **Every subscription this node holds goes through `subscribe()`, which takes
+// an `Input`.** That is where §5.3's rule -- no input may stop arriving without
+// a defined consequence -- stops being a checklist. A subscription that named no
+// input could not be written; the topic comes off that input's policy row rather
+// than off the call site; the input's freshness deadline has to be configured or
+// `validate()` refuses the node; and the constructor refuses to finish while any
+// enumerator of `Input` is left without a subscription behind it. Adding a fifth
+// input is therefore four compile-or-start-time failures, not four things to
+// remember.
+//
 // Everything below runs in one node with the default callback group, so the
 // subscriptions, the status timer and the `/crane/clear_fault` service are
 // mutually exclusive on any executor. The latch is a plain member for exactly
 // that reason, and `crane_supervisor_main.cpp` spins the single-threaded
-// executor that makes it true.
+// executor that makes it true. The freshness sweep is on the timer and not in
+// the callbacks, deliberately: a deadline evaluated only where a message arrives
+// could not fire on the stream that stopped.
 
 #ifndef CRANE_SUPERVISOR__SUPERVISOR_NODE_HPP_
 #define CRANE_SUPERVISOR__SUPERVISOR_NODE_HPP_
 
+#include <array>
 #include <chrono>
 #include <cstdint>
+#include <utility>
 
 #include <memory>
 
@@ -53,42 +67,41 @@ namespace crane_supervisor
  * nothing above may rely on a remapping.
  */
 inline constexpr char kStatusTopic[] = "/crane/supervisor/status";
-inline constexpr char kPendulumStateTopic[] = "/crane/pendulum_state";
-inline constexpr char kRemoteCtrlStatesTopic[] = "/crane/remote_ctrl_states";
 inline constexpr char kClearFaultService[] = "/crane/clear_fault";
 inline constexpr double kStatusRate = 20.0;
 
-/// Where the trajectory controller's own state publication is read from.
+/// The four input contract names, off the policy rows that already carry them.
 /**
- * The trajectory controller publishes it on its *private* `~/controller_state`,
- * which resolves under whatever the deployment named that controller
- * (`trajectory_controller_a2b` in the FOLLOW profile). §1 forbids relying on
- * that: cross-node contracts are absolute and live under `/crane/...`, and a
- * subscriber that reached into another node's namespace would break the first
- * time a second trajectory controller was loaded.
+ * Aliases and not second copies: an input's topic is written once, in
+ * `kInputPolicies`, beside the deadline it is judged against and the fault its
+ * absence raises. A name that lived here as well could be changed in one place
+ * and not the other, and the stream a report names would stop being the stream
+ * the node subscribes to.
  *
- * So this node subscribes to the contract name and to nothing else, exactly as
- * it does for the remote -- whose producer, `gpio_controller`, likewise
- * publishes on a private name. Lining the two up is a remap and belongs to
- * whoever composes the profile. ROS 2 Interfaces §4 does not yet carry a row for
- * this stream; the name follows §1's rule and the row is owed.
+ * Two of the four have producers that do not publish on the contract name --
+ * the retained `gpio_controller` and the trajectory controller both publish on
+ * a *private* name that resolves under whatever the profile called them. §1
+ * forbids relying on that, so this node subscribes to the contract name and to
+ * nothing else, and lining the two up is a remap that belongs to whoever
+ * composes the profile.
  */
-inline constexpr char kControllerStateTopic[] = "/crane/controller_state";
+inline constexpr const char * kPendulumStateTopic = policy_of(Input::PendulumState).topic;
+inline constexpr const char * kRemoteCtrlStatesTopic = policy_of(Input::RemoteCtrl).topic;
+inline constexpr const char * kControllerStateTopic = policy_of(Input::ControllerState).topic;
+inline constexpr const char * kControllerHealthTopic = policy_of(Input::ControllerHealth).topic;
 
-/// Where the inner velocity loop's own health is read from.
+/// The QoS of every streamed contract this node touches.
 /**
- * A contract name of ROS 2 Interfaces §4 and, unlike the two above, one whose
- * producer already publishes on it: `crane_velocity_controller` creates the
- * publisher with this absolute name itself, so no profile has to remap anything
- * for this input to arrive.
- *
- * It is the one input this supervisor could not possibly re-derive. Which axes
- * the active tool has an identified valve map for is not in `/joint_states`, not
- * in the trajectory controller's state and not anywhere else on the graph — the
- * controller is the only element that knows, which is why the fault stays where
- * it is computed and travels as a message.
+ * Reliable, depth 1, volatile -- ROS 2 Interfaces §1 sets the category by the
+ * consumer, and all of these are state a controller or a panel acts on. It is
+ * the same profile `crane_msgs`' own ROS contract test asserts, so the two agree
+ * by construction rather than by inspection. One function and not one per
+ * endpoint, so an input cannot arrive on a quietly different profile.
  */
-inline constexpr char kControllerHealthTopic[] = "/crane/velocity_controller/health";
+[[nodiscard]] inline rclcpp::QoS contract_qos()
+{
+  return rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile();
+}
 
 /// The configured deadman, out of the twelve booleans the message carries.
 /**
@@ -122,15 +135,41 @@ private:
   /// the same number.
   static std::chrono::nanoseconds status_period();
 
+  /// The one place a subscription is created in this package.
+  /**
+   * It takes an `Input`, so a subscription with no freshness deadline behind it
+   * cannot be written: the enumerator is what indexes the deadline
+   * `validate()` insists on and the policy row the report is composed from. The
+   * topic comes off that row rather than off the call site, and the call marks
+   * the input claimed, so the constructor can refuse to finish while any input
+   * is left unsubscribed.
+   */
+  template<typename MessageT, typename CallbackT>
+  typename rclcpp::Subscription<MessageT>::SharedPtr subscribe(Input input, CallbackT && callback)
+  {
+    claimed_[index_of(input)] = true;
+    return create_subscription<MessageT>(
+      policy_of(input).topic, contract_qos(), std::forward<CallbackT>(callback));
+  }
+
   /// What one cycle observed, from what the node is holding right now.
   /**
    * Shared by the status timer and the acknowledgement, so the two judge the
    * emergency stop from the same sample rather than from two reads a callback
    * apart.
+   *
+   * The transport half of every input -- whether anything has arrived and how
+   * old the newest one is -- is filled in a loop over the registry, from one
+   * reading of the clock, so no input can be aged by a rule of its own.
    */
   [[nodiscard]] SupervisorInput observe() const;
 
   SupervisorConfig config_;
+  /// Which inputs a subscription was created for, indexed by `Input`. Checked
+  /// once, at construction: an enumerator with no subscription behind it is an
+  /// input the freshness sweep would report as never having arrived, for ever,
+  /// which is a defect in this node dressed up as a fault in the graph.
+  std::array<bool, kInputCount> claimed_{};
   /// The newest message on `/crane/pendulum_state`, or null before the first
   /// one. Held rather than consumed: the tracer's whole point is that the gap
   /// between the newest sample and now is itself a signal.

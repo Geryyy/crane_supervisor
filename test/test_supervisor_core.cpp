@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <string>
@@ -13,6 +15,12 @@
 
 namespace
 {
+
+using crane_supervisor::Input;
+using crane_supervisor::Staleness;
+using crane_supervisor::kInputCount;
+using crane_supervisor::index_of;
+using crane_supervisor::policy_of;
 
 /// The six actuated joints of ROS 2 Interfaces §3.2, in configuration order.
 /// Four `theta*` angles and two `q*` lengths -- the split that makes the max in
@@ -25,6 +33,25 @@ const std::vector<std::string> & actuated_joints()
   return joints;
 }
 
+/// The four shipped freshness deadlines, s, in `Input` order.
+/**
+ * Written out here rather than read off a struct default, because there is no
+ * struct default: the numbers and the derivation of each live once, in
+ * `src/crane_supervisor_parameters.yaml`, and a `SupervisorConfig` that was
+ * handed none is one `validate()` refuses. That is the point -- an input with no
+ * deadline is a node that does not start -- so a test of the decision has to say
+ * which margins it is deciding against, exactly as a deployment does.
+ */
+crane_supervisor::SupervisorConfig with_shipped_deadlines(
+  crane_supervisor::SupervisorConfig config)
+{
+  config.deadline(Input::PendulumState) = 0.15;
+  config.deadline(Input::RemoteCtrl) = 0.25;
+  config.deadline(Input::ControllerState) = 0.15;
+  config.deadline(Input::ControllerHealth) = 0.25;
+  return config;
+}
+
 /// The configuration a deployment actually gets today: no tolerance loaded.
 crane_supervisor::SupervisorConfig default_config()
 {
@@ -34,7 +61,7 @@ crane_supervisor::SupervisorConfig default_config()
     // deployment that was never handed the tolerance file is honestly in.
     config.tracking_tolerance.push_back(crane_supervisor::AxisTolerance{joint});
   }
-  return config;
+  return with_shipped_deadlines(config);
 }
 
 /// The same configuration with the six numbers a human has not measured yet.
@@ -50,15 +77,13 @@ crane_supervisor::SupervisorConfig config_with_tolerances()
     config.tracking_tolerance.push_back(crane_supervisor::AxisTolerance{joint, dq_a});
     dq_a += 0.01;
   }
-  return config;
+  return with_shipped_deadlines(config);
 }
 
 /// A trajectory controller tracking exactly, reporting all six axes.
 crane_supervisor::ControllerStateReport tracking_controller()
 {
   crane_supervisor::ControllerStateReport report;
-  report.received = true;
-  report.age = 0.01;
   for (const std::string & joint : actuated_joints()) {
     crane_supervisor::AxisError axis;
     axis.joint = joint;
@@ -82,30 +107,19 @@ crane_supervisor::ControllerStateReport with_error(
   return report;
 }
 
-/// A remote that is arriving, with the stop released and the deadman held.
+/// A remote with the stop released and the deadman held.
 crane_supervisor::RemoteCtrlReport held_remote()
 {
   crane_supervisor::RemoteCtrlReport remote;
-  remote.received = true;
   remote.deadman_held = true;
   remote.em_stop = false;
-  remote.age = 0.01;
   return remote;
 }
 
-/// The inner velocity loop arriving, in time, with nothing to report.
-/**
- * Deliberately not a default-constructed `ControllerHealthReport`: that one has
- * never arrived, and §5.3's rule is that an input which is not arriving is a
- * fault rather than a quiet FAULT_NONE. A fixture that wants a healthy stack has
- * to say that this stream is arriving, exactly as it already has to for the
- * other three.
- */
+/// The inner velocity loop with nothing to report.
 crane_supervisor::ControllerHealthReport healthy_inner_loop()
 {
   crane_supervisor::ControllerHealthReport inner_loop;
-  inner_loop.received = true;
-  inner_loop.age = 0.01;
   inner_loop.fault = crane_supervisor::Fault::None;
   return inner_loop;
 }
@@ -131,16 +145,46 @@ crane_supervisor::ControllerHealthReport inner_loop_fault(crane_supervisor::Faul
 
 /// All four inputs arriving, in time, trusted, with the operator holding the
 /// button and the inner loop reporting nothing wrong with itself.
+/**
+ * The arriving half is set over the whole registry rather than input by input,
+ * deliberately: a fixture that named its four streams by hand would leave a
+ * fifth input default-constructed -- which is to say never arrived -- and every
+ * test below would then be asserting about that fifth input's absence instead of
+ * about what it was written for.
+ */
 crane_supervisor::SupervisorInput healthy_input()
 {
   crane_supervisor::SupervisorInput input;
-  input.pendulum_state.received = true;
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    input.streams[i].received = true;
+    input.streams[i].age = 0.01;
+  }
   input.pendulum_state.valid = true;
-  input.pendulum_state.age = 0.01;
   input.pendulum_state.status = "complementary filter on the two bracketing IMUs";
   input.remote_ctrl = held_remote();
   input.controller_state = tracking_controller();
   input.controller_health = healthy_inner_loop();
+  return input;
+}
+
+/// The same input with one named stream made stale in one named way.
+crane_supervisor::SupervisorInput stale(
+  const crane_supervisor::SupervisorConfig & config, Input which, Staleness cause)
+{
+  crane_supervisor::SupervisorInput input = healthy_input();
+  switch (cause) {
+    case Staleness::NeverArrived:
+      input.stream(which).received = false;
+      break;
+    case Staleness::StoppedArriving:
+      input.stream(which).age = 10.0 * config.deadline(which) + 1.0;
+      break;
+    case Staleness::StampAhead:
+      input.stream(which).age = -10.0 * config.deadline(which) - 1.0;
+      break;
+    default:
+      break;
+  }
   return input;
 }
 
@@ -154,48 +198,229 @@ crane_supervisor::SupervisorDecision step(
   return decision;
 }
 
+/// The three ways a stream can fail to be fresh from the transport alone.
+const std::array<Staleness, 3> & transport_causes()
+{
+  static const std::array<Staleness, 3> causes{
+    Staleness::NeverArrived, Staleness::StoppedArriving, Staleness::StampAhead};
+  return causes;
+}
+
 }  // namespace
 
-TEST(SupervisorCore, RejectsAMarginThatCannotSeparateArrivingFromStopped)
+TEST(SupervisorCore, EveryInputHasADeadlineAndNoneIsExempt)
 {
+  // The first acceptance criterion of issue 023, and the reason the deadlines
+  // live in an array `Input` sizes rather than in four named doubles: an input
+  // added to the enum and given no margin has a slot value-initialised to zero,
+  // and zero is not a deadline.  So the node refuses to start rather than
+  // publishing a status about a stream nobody is watching -- the guard is
+  // structural, and this loop is over the registry rather than over a list.
   std::string reason;
-  crane_supervisor::SupervisorConfig config;
+  EXPECT_TRUE(crane_supervisor::validate(default_config(), reason)) << reason;
 
-  config.pendulum_state_timeout = 0.0;
-  EXPECT_FALSE(crane_supervisor::validate(config, reason));
+  // A `SupervisorConfig` nobody handed a margin to is refused outright, which is
+  // what makes "no default deadline" a rule and not a comment.
+  EXPECT_FALSE(crane_supervisor::validate(crane_supervisor::SupervisorConfig{}, reason));
   EXPECT_FALSE(reason.empty());
 
-  config.pendulum_state_timeout = -1.0;
-  EXPECT_FALSE(crane_supervisor::validate(config, reason));
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    const Input which = static_cast<Input>(i);
+    for (const double refused : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN()}) {
+      crane_supervisor::SupervisorConfig config = default_config();
+      config.deadline(which) = refused;
+      EXPECT_FALSE(crane_supervisor::validate(config, reason)) << policy_of(which).topic;
+      // And it says which input, because "a margin is wrong" is not something an
+      // operator or an integrator can act on and "this topic has none" is.
+      EXPECT_NE(reason.find(policy_of(which).topic), std::string::npos) << reason;
+    }
+  }
+}
 
-  config.pendulum_state_timeout = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_FALSE(crane_supervisor::validate(config, reason));
+TEST(SupervisorCore, TheRegistryIsTheOneListAndItsRowsMatchTheirInputs)
+{
+  // The table is what makes a report name its own stream, so a row sitting at
+  // the wrong index would report the wrong topic for the wrong input.  A
+  // `static_assert` in the header refuses that at compile time; this asserts the
+  // properties a compiler cannot -- that no two inputs share a topic and that
+  // every row is filled in.
+  EXPECT_EQ(crane_supervisor::kInputPolicies.size(), kInputCount);
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    const crane_supervisor::InputPolicy & policy = crane_supervisor::kInputPolicies[i];
+    EXPECT_EQ(index_of(policy.input), i);
+    EXPECT_NE(std::string(policy.topic), "");
+    EXPECT_NE(std::string(policy.type), "");
+    EXPECT_NE(std::string(policy.label), "");
+    EXPECT_NE(std::string(policy.consequence), "");
+    EXPECT_NE(std::string(policy.advice), "");
+    for (std::size_t j = i + 1; j < kInputCount; ++j) {
+      EXPECT_NE(std::string(policy.topic), crane_supervisor::kInputPolicies[j].topic);
+    }
+  }
+}
 
-  config = crane_supervisor::SupervisorConfig{};
-  config.remote_ctrl_timeout = 0.0;
-  EXPECT_FALSE(crane_supervisor::validate(config, reason));
-  EXPECT_FALSE(reason.empty());
+TEST(SupervisorCore, EveryInputIsSweptAndReportsItsOwnInputAndItsOwnCause)
+{
+  // wiki/control_architecture.md §5.3, over the registry rather than over the
+  // four inputs somebody remembered: every input that stops arriving ends in the
+  // fault its policy row names, and the message says which input it was about
+  // and which staleness cause fired.  An input added to `Input` is swept by this
+  // loop the day it is added, and fails here until `decide()` consults it.
+  const auto config = default_config();
 
-  config.remote_ctrl_timeout = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_FALSE(crane_supervisor::validate(config, reason));
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    const Input which = static_cast<Input>(i);
+    std::vector<std::string> messages;
 
-  config = crane_supervisor::SupervisorConfig{};
-  config.controller_state_timeout = 0.0;
-  EXPECT_FALSE(crane_supervisor::validate(config, reason));
-  EXPECT_FALSE(reason.empty());
+    for (const Staleness cause : transport_causes()) {
+      const auto decision = crane_supervisor::decide(config, stale(config, which, cause));
+      EXPECT_EQ(decision.fault, policy_of(which).fault) << policy_of(which).topic;
+      EXPECT_NE(decision.fault, crane_supervisor::Fault::None) << policy_of(which).topic;
+      // Which input.
+      EXPECT_NE(decision.message.find(policy_of(which).topic), std::string::npos)
+        << decision.message;
+      EXPECT_NE(decision.message.find(policy_of(which).type), std::string::npos)
+        << decision.message;
+      // Which cause.
+      EXPECT_NE(decision.message.find("Staleness cause"), std::string::npos) << decision.message;
+      messages.push_back(decision.message);
+    }
 
-  config.controller_state_timeout = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_FALSE(crane_supervisor::validate(config, reason));
+    // An input that never arrived and one that stopped arriving are both faults
+    // and are not the same fault to chase: "never connected" sends an integrator
+    // after a launch file and "died" sends them after a process.
+    for (std::size_t a = 0; a < messages.size(); ++a) {
+      for (std::size_t b = a + 1; b < messages.size(); ++b) {
+        EXPECT_NE(messages[a], messages[b]) << policy_of(which).topic << ": " << messages[a];
+      }
+    }
+  }
+}
 
-  config = crane_supervisor::SupervisorConfig{};
-  config.controller_health_timeout = 0.0;
-  EXPECT_FALSE(crane_supervisor::validate(config, reason));
-  EXPECT_FALSE(reason.empty());
+TEST(SupervisorCore, TheDeadlinesArePerInputAndNotOneNumber)
+{
+  // §5.3's margins are properties of the streams they judge: the passive state
+  // comes off the manager's 100 Hz cycle and the remote is a 20 Hz contract, so
+  // an age that is healthy on one is a dead publisher on the other.  A single
+  // global margin would report the fast stream late or the slow one falsely, and
+  // this asserts the two are actually judged apart.
+  auto config = default_config();
+  config.deadline(Input::PendulumState) = 0.05;
+  config.deadline(Input::RemoteCtrl) = 1.0;
 
-  config.controller_health_timeout = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_FALSE(crane_supervisor::validate(config, reason));
+  auto input = healthy_input();
+  input.stream(Input::PendulumState).age = 0.3;
+  input.stream(Input::RemoteCtrl).age = 0.3;
 
-  EXPECT_TRUE(crane_supervisor::validate(default_config(), reason));
+  // The same age, the same cycle: stale on one input and fresh on the other.
+  const auto causes = crane_supervisor::freshness(config, input);
+  EXPECT_EQ(causes[index_of(Input::PendulumState)], Staleness::StoppedArriving);
+  EXPECT_EQ(causes[index_of(Input::RemoteCtrl)], Staleness::Fresh);
+
+  const auto decision = crane_supervisor::decide(config, input);
+  EXPECT_EQ(decision.fault, crane_supervisor::Fault::StateHealth);
+  EXPECT_NE(decision.message.find("0.050"), std::string::npos) << decision.message;
+}
+
+TEST(SupervisorCore, TheFreshnessSweepIsTotalBoundedAndNeedsNoMessageToNoticeAStop)
+{
+  // The sweep answers for every input on every call, from the state of the
+  // input struct alone: no history, no counters, nothing that has to be fed by a
+  // message arriving.  That is what makes a deadline able to fire on the one
+  // stream it exists for -- the one where no callback will ever run again.
+  const auto config = default_config();
+  const auto input = stale(config, Input::ControllerHealth, Staleness::StoppedArriving);
+
+  const auto first = crane_supervisor::freshness(config, input);
+  const auto second = crane_supervisor::freshness(config, input);
+  EXPECT_EQ(first, second);
+  EXPECT_EQ(first.size(), kInputCount);
+  EXPECT_EQ(first[index_of(Input::ControllerHealth)], Staleness::StoppedArriving);
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    if (i != index_of(Input::ControllerHealth)) {
+      EXPECT_EQ(first[i], Staleness::Fresh) << crane_supervisor::kInputPolicies[i].topic;
+    }
+  }
+
+  // The margin is symmetric and closed: exactly a deadline's worth of age is
+  // still arriving, on both sides of now, so ordinary clock jitter between two
+  // hosts is not a fault.
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    const Input which = static_cast<Input>(i);
+    EXPECT_EQ(
+      crane_supervisor::freshness_of(config.deadline(which), {true, config.deadline(which)}),
+      Staleness::Fresh) << policy_of(which).topic;
+    EXPECT_EQ(
+      crane_supervisor::freshness_of(config.deadline(which), {true, -config.deadline(which)}),
+      Staleness::Fresh) << policy_of(which).topic;
+    EXPECT_EQ(
+      crane_supervisor::freshness_of(config.deadline(which), {false, 0.0}),
+      Staleness::NeverArrived) << policy_of(which).topic;
+  }
+}
+
+TEST(SupervisorCore, EveryInputRecoversOnItsOwnExceptTheOneThatLatches)
+{
+  // §5.3's rule is symmetric: an input that starts arriving again inside its
+  // deadline clears its own fault, with no acknowledgement.  The emergency stop
+  // is the single exception and `InputPolicy::latches` is where that is written
+  // down -- §6.1 asks for the software to come back in a defined state, so the
+  // stop survives the signal returning and only `/crane/clear_fault` lowers it.
+  const auto config = default_config();
+
+  for (std::size_t i = 0; i < kInputCount; ++i) {
+    const Input which = static_cast<Input>(i);
+    for (const Staleness cause : transport_causes()) {
+      auto input = stale(config, which, cause);
+      ASSERT_EQ(step(config, input).fault, policy_of(which).fault) << policy_of(which).topic;
+
+      // The stream comes back, inside its deadline.
+      input.stream(which) = crane_supervisor::StreamReport{true, 0.01};
+      const auto recovered = step(config, input);
+
+      if (policy_of(which).latches) {
+        EXPECT_EQ(recovered.fault, policy_of(which).fault) << policy_of(which).topic;
+        EXPECT_TRUE(recovered.estop_latched);
+        const auto cleared = crane_supervisor::clear_fault(config, input);
+        EXPECT_TRUE(cleared.cleared) << cleared.message;
+        input.estop_latched = false;
+        EXPECT_EQ(step(config, input).fault, crane_supervisor::Fault::None);
+      } else {
+        EXPECT_EQ(recovered.fault, crane_supervisor::Fault::None)
+          << policy_of(which).topic << ": " << recovered.message;
+      }
+    }
+  }
+}
+
+TEST(SupervisorCore, TheThreeConstantsStayDistinctRatherThanCollapsingIntoOne)
+{
+  // PRD user story 52 and the third acceptance criterion of issue 023.  A stale
+  // state, an expired reference and an absent stop are three different things to
+  // do next, so they are three constants -- collapsing them into one is the
+  // defect the policy exists to prevent, and it is the kind of defect that is
+  // invisible until an operator is standing in front of the panel.
+  const auto config = default_config();
+
+  const auto state = crane_supervisor::decide(
+    config, stale(config, Input::PendulumState, Staleness::StoppedArriving));
+  EXPECT_EQ(state.fault, crane_supervisor::Fault::StateHealth);
+
+  auto reference_input = healthy_input();
+  reference_input.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
+  const auto reference = crane_supervisor::decide(config, reference_input);
+  EXPECT_EQ(reference.fault, crane_supervisor::Fault::ReferenceStale);
+
+  const auto stop = crane_supervisor::decide(
+    config, stale(config, Input::RemoteCtrl, Staleness::NeverArrived));
+  EXPECT_EQ(stop.fault, crane_supervisor::Fault::EStop);
+
+  EXPECT_NE(state.fault, reference.fault);
+  EXPECT_NE(state.fault, stop.fault);
+  EXPECT_NE(reference.fault, stop.fault);
+  EXPECT_NE(state.message, reference.message);
+  EXPECT_NE(state.message, stop.message);
+  EXPECT_NE(reference.message, stop.message);
 }
 
 TEST(SupervisorCore, AMissingToleranceIsReportedRatherThanRefused)
@@ -203,7 +428,8 @@ TEST(SupervisorCore, AMissingToleranceIsReportedRatherThanRefused)
   // The number does not exist yet and is human-owned.  A supervisor that
   // refused to start over it would withhold the emergency stop, the state
   // health and the interlock to report one duty it cannot perform, so the
-  // absence is a warning at configuration and not a validation failure.
+  // absence is a warning at configuration and not a validation failure.  A
+  // missing *deadline* is the opposite and is refused -- see the first test.
   std::string reason;
   EXPECT_TRUE(crane_supervisor::validate(default_config(), reason));
   EXPECT_TRUE(crane_supervisor::validate(config_with_tolerances(), reason));
@@ -260,7 +486,7 @@ TEST(SupervisorCore, RejectsADeadmanButtonTheMessageDoesNotHave)
   // released forever -- which would raise FAULT_INTERLOCK for a reason that has
   // nothing to do with the operator.
   std::string reason;
-  crane_supervisor::SupervisorConfig config;
+  crane_supervisor::SupervisorConfig config = default_config();
 
   config.deadman_button = 0;
   EXPECT_FALSE(crane_supervisor::validate(config, reason));
@@ -290,10 +516,11 @@ TEST(SupervisorCore, AbsenceIsNotHealthBeforeTheFirstMessage)
   // defined consequence, and "has not started arriving" is the same absence.
   // The remote is healthy here so that the passive state is what is being
   // judged; with nothing arriving at all the stop of §6.1 owns the report.
-  crane_supervisor::SupervisorInput input;
-  input.remote_ctrl = held_remote();
+  const auto config = default_config();
+  auto input = healthy_input();
+  input.stream(Input::PendulumState).received = false;
 
-  const auto decision = crane_supervisor::decide(default_config(), input);
+  const auto decision = crane_supervisor::decide(config, input);
   EXPECT_EQ(decision.fault, crane_supervisor::Fault::StateHealth);
   EXPECT_NE(decision.fault, crane_supervisor::Fault::None);
   EXPECT_FALSE(decision.message.empty());
@@ -304,11 +531,11 @@ TEST(SupervisorCore, AbsenceIsNotHealthAfterTheStreamStops)
   const auto config = default_config();
   auto input = healthy_input();
 
-  // One margin's worth of age is still arriving; a hair past it is not.
-  input.pendulum_state.age = config.pendulum_state_timeout;
+  // One deadline's worth of age is still arriving; a hair past it is not.
+  input.stream(Input::PendulumState).age = config.deadline(Input::PendulumState);
   EXPECT_EQ(crane_supervisor::decide(config, input).fault, crane_supervisor::Fault::None);
 
-  input.pendulum_state.age = 0.42;
+  input.stream(Input::PendulumState).age = 0.42;
   const auto stopped = crane_supervisor::decide(config, input);
   EXPECT_EQ(stopped.fault, crane_supervisor::Fault::StateHealth);
 
@@ -316,6 +543,7 @@ TEST(SupervisorCore, AbsenceIsNotHealthAfterTheStreamStops)
   // crossing without knowing what was crossed by how much.
   EXPECT_NE(stopped.message.find("0.420"), std::string::npos) << stopped.message;
   EXPECT_NE(stopped.message.find("0.150"), std::string::npos) << stopped.message;
+  EXPECT_NE(stopped.message.find("stopped arriving"), std::string::npos) << stopped.message;
 }
 
 TEST(SupervisorCore, AStampAheadOfTheClockIsAFaultRatherThanAFreshSample)
@@ -327,30 +555,36 @@ TEST(SupervisorCore, AStampAheadOfTheClockIsAFaultRatherThanAFreshSample)
   const auto config = default_config();
   auto input = healthy_input();
 
-  input.pendulum_state.age = -config.pendulum_state_timeout;
+  input.stream(Input::PendulumState).age = -config.deadline(Input::PendulumState);
   EXPECT_EQ(crane_supervisor::decide(config, input).fault, crane_supervisor::Fault::None);
 
-  input.pendulum_state.age = -2.0 * config.pendulum_state_timeout;
+  input.stream(Input::PendulumState).age = -2.0 * config.deadline(Input::PendulumState);
   const auto ahead = crane_supervisor::decide(config, input);
   EXPECT_EQ(ahead.fault, crane_supervisor::Fault::StateHealth);
   EXPECT_NE(ahead.message.find("future"), std::string::npos) << ahead.message;
 }
 
-TEST(SupervisorCore, AnInvalidStateCarriesTheBroadcastersOwnCauseThrough)
+TEST(SupervisorCore, TheProducersOwnFlagIsTheThirdCauseAndItsAccountIsCarriedThrough)
 {
-  // The estimator distinguishes six causes behind `valid == false` and says
-  // which in `status`.  Restating it here would flatten that distinction, so
-  // the string is carried verbatim.
+  // The three causes §5.3 now lists are the flag, the age and the sample that
+  // stopped refreshing behind a header that keeps moving.  The age is the one
+  // this supervisor measures itself; the other two are the broadcaster's, and
+  // they arrive here behind `valid == false` with the broadcaster's own account
+  // of which one fired.  Restating it would flatten a distinction the estimator
+  // went to some trouble to make.
   auto input = healthy_input();
   input.pendulum_state.valid = false;
   input.pendulum_state.status =
-    "no estimate: the upstream IMU on K5 is missing or unreadable. Both covariance blocks are "
-    "not estimated (-1)";
+    "not to be trusted: the upstream IMU on K5 answered with the same seven values for 10 cycles";
 
   const auto decision = crane_supervisor::decide(default_config(), input);
   EXPECT_EQ(decision.fault, crane_supervisor::Fault::StateHealth);
   EXPECT_NE(decision.message.find(input.pendulum_state.status), std::string::npos)
     << decision.message;
+  // And it says which of the three fired, and that this one is not measured
+  // here: a supervisor cannot ask whether twelve booleans moved.
+  EXPECT_NE(decision.message.find("health flag"), std::string::npos) << decision.message;
+  EXPECT_NE(decision.message.find("refreshing"), std::string::npos) << decision.message;
 }
 
 TEST(SupervisorCore, AnInvalidStateWithNoStatusStillReportsACause)
@@ -373,7 +607,7 @@ TEST(SupervisorCore, AbsenceOutranksInvalidity)
   const auto config = default_config();
   auto input = healthy_input();
   input.pendulum_state.valid = false;
-  input.pendulum_state.age = 10.0;
+  input.stream(Input::PendulumState).age = 10.0;
 
   const auto decision = crane_supervisor::decide(config, input);
   EXPECT_NE(decision.message.find("stopped arriving"), std::string::npos) << decision.message;
@@ -388,6 +622,10 @@ TEST(SupervisorCore, AHealthyTracerClearsTheFaultAndStillSaysWhatIsNotWatched)
   // about the machine, and the report says so rather than letting a panel read
   // it as one.
   EXPECT_NE(decision.message.find("only input"), std::string::npos) << decision.message;
+  // Including the gap it does *not* close: §6.3's controller-side timeouts are
+  // still ad hoc, and the supervisor reporting that honestly is the correct
+  // interim answer rather than papering over it.
+  EXPECT_NE(decision.message.find("never times out"), std::string::npos) << decision.message;
 }
 
 TEST(SupervisorCore, AReleasedDeadmanIsAnInterlockAndIsCheckedEveryCycle)
@@ -433,7 +671,7 @@ TEST(SupervisorCore, TheDeadmanIsReportedOnEveryDecisionWhateverTheFaultIs)
 
   // ... and it is false whenever the remote is not arriving, because a button
   // nobody reported is not a button somebody is holding.
-  input.remote_ctrl.received = false;
+  input.stream(Input::RemoteCtrl).received = false;
   EXPECT_FALSE(crane_supervisor::decide(config, input).deadman_held);
 }
 
@@ -466,32 +704,25 @@ TEST(SupervisorCore, AbsenceOfTheStopSignalIsAssertedAndTheThreeDoNotLookAlike)
   // button raises the interlock; and no two of the four say the same thing.
   const auto config = default_config();
 
-  crane_supervisor::SupervisorInput never_arrived = healthy_input();
-  never_arrived.remote_ctrl.received = false;
-
-  crane_supervisor::SupervisorInput stopped_arriving = healthy_input();
-  stopped_arriving.remote_ctrl.age = 10.0;
-
-  crane_supervisor::SupervisorInput stamp_ahead = healthy_input();
-  stamp_ahead.remote_ctrl.age = -10.0;
-
-  crane_supervisor::SupervisorInput asserted = healthy_input();
-  asserted.remote_ctrl.em_stop = true;
-
-  crane_supervisor::SupervisorInput released_button = healthy_input();
-  released_button.remote_ctrl.deadman_held = false;
-
   std::vector<std::string> messages;
-  for (const auto & input :
-    {never_arrived, stopped_arriving, stamp_ahead, asserted})
-  {
-    const auto decision = crane_supervisor::decide(config, input);
+  for (const Staleness cause : transport_causes()) {
+    const auto decision = crane_supervisor::decide(config, stale(config, Input::RemoteCtrl, cause));
     EXPECT_EQ(decision.fault, crane_supervisor::Fault::EStop);
     EXPECT_TRUE(decision.estop_latched);
     EXPECT_FALSE(decision.message.empty());
+    // Every one of them says it is diagnosis and not the protection.
+    EXPECT_NE(decision.message.find("not protection"), std::string::npos) << decision.message;
     messages.push_back(decision.message);
   }
 
+  crane_supervisor::SupervisorInput asserted = healthy_input();
+  asserted.remote_ctrl.em_stop = true;
+  const auto stopped = crane_supervisor::decide(config, asserted);
+  EXPECT_EQ(stopped.fault, crane_supervisor::Fault::EStop);
+  messages.push_back(stopped.message);
+
+  crane_supervisor::SupervisorInput released_button = healthy_input();
+  released_button.remote_ctrl.deadman_held = false;
   const auto released = crane_supervisor::decide(config, released_button);
   EXPECT_EQ(released.fault, crane_supervisor::Fault::Interlock);
   EXPECT_FALSE(released.estop_latched);
@@ -502,14 +733,6 @@ TEST(SupervisorCore, AbsenceOfTheStopSignalIsAssertedAndTheThreeDoNotLookAlike)
       EXPECT_NE(messages[i], messages[j]) << i << " and " << j << ": " << messages[i];
     }
   }
-
-  // A margin's worth of age is still arriving, on both sides of now, exactly as
-  // the passive state's margin is read.
-  crane_supervisor::SupervisorInput inside = healthy_input();
-  inside.remote_ctrl.age = config.remote_ctrl_timeout;
-  EXPECT_EQ(crane_supervisor::decide(config, inside).fault, crane_supervisor::Fault::None);
-  inside.remote_ctrl.age = -config.remote_ctrl_timeout;
-  EXPECT_EQ(crane_supervisor::decide(config, inside).fault, crane_supervisor::Fault::None);
 }
 
 TEST(SupervisorCore, TheStopOutranksTheOtherTwoCausesAndTheInterlockOutranksNothing)
@@ -521,14 +744,14 @@ TEST(SupervisorCore, TheStopOutranksTheOtherTwoCausesAndTheInterlockOutranksNoth
   const auto config = default_config();
 
   crane_supervisor::SupervisorInput everything_wrong = healthy_input();
-  everything_wrong.pendulum_state.received = false;
+  everything_wrong.stream(Input::PendulumState).received = false;
   everything_wrong.remote_ctrl.em_stop = true;
   everything_wrong.remote_ctrl.deadman_held = false;
   EXPECT_EQ(crane_supervisor::decide(config, everything_wrong).fault,
     crane_supervisor::Fault::EStop);
 
   crane_supervisor::SupervisorInput state_and_interlock = healthy_input();
-  state_and_interlock.pendulum_state.received = false;
+  state_and_interlock.stream(Input::PendulumState).received = false;
   state_and_interlock.remote_ctrl.deadman_held = false;
   const auto decision = crane_supervisor::decide(config, state_and_interlock);
   EXPECT_EQ(decision.fault, crane_supervisor::Fault::StateHealth);
@@ -547,7 +770,7 @@ TEST(SupervisorCore, ClearingIsRefusedWithAnExplanationWhileTheConditionHolds)
   EXPECT_NE(refused.message.find("still asserted"), std::string::npos) << refused.message;
 
   crane_supervisor::SupervisorInput absent = healthy_input();
-  absent.remote_ctrl.received = false;
+  absent.stream(Input::RemoteCtrl).received = false;
   absent.estop_latched = true;
   const auto refused_absent = crane_supervisor::clear_fault(config, absent);
   EXPECT_FALSE(refused_absent.cleared);
@@ -636,9 +859,9 @@ TEST(SupervisorCore, TheReportedErrorIsCarriedWhateverTheFaultIs)
 
 TEST(SupervisorCore, WithNoToleranceNoTrackingFaultIsRaisedAndTheReportSaysSo)
 {
-  // The whole point of the fourth acceptance criterion: an axis that is wildly
-  // out raises no FAULT_TRACKING when nobody has measured what "out" means, and
-  // the clear report does not get to imply a check that was never made.
+  // An axis that is wildly out raises no FAULT_TRACKING when nobody has measured
+  // what "out" means, and the clear report does not get to imply a check that
+  // was never made.
   const auto config = default_config();
   auto input = healthy_input();
   input.controller_state = with_error("theta2_boom_joint", 5.0, 5.0);
@@ -714,8 +937,6 @@ TEST(SupervisorCore, AxesArePairedByNameAndTheWorstOffenderIsNamedFirst)
   // Reversed order, and two axes out: theta1 by 3x its 0.01 tolerance,
   // theta8_rotator_joint by 2x its 0.05 one.
   crane_supervisor::ControllerStateReport reversed;
-  reversed.received = true;
-  reversed.age = 0.01;
   for (auto it = actuated_joints().rbegin(); it != actuated_joints().rend(); ++it) {
     crane_supervisor::AxisError axis;
     axis.joint = *it;
@@ -776,18 +997,14 @@ TEST(SupervisorCore, AControllerThatStoppedPublishingIsNotACraneTrackingPerfectl
   // say the same thing.
   const auto config = default_config();
 
-  auto never = healthy_input();
-  never.controller_state = crane_supervisor::ControllerStateReport{};
-
-  auto stopped = healthy_input();
+  auto stopped = stale(config, Input::ControllerState, Staleness::StoppedArriving);
   stopped.controller_state = with_error("theta1_slewing_joint", 0.9, 0.0);
-  stopped.controller_state.age = 10.0;
-
-  auto ahead = healthy_input();
-  ahead.controller_state.age = -10.0;
 
   std::vector<std::string> messages;
-  for (const auto & input : {never, stopped, ahead}) {
+  for (const auto & input :
+    {stale(config, Input::ControllerState, Staleness::NeverArrived), stopped,
+      stale(config, Input::ControllerState, Staleness::StampAhead)})
+  {
     const auto decision = crane_supervisor::decide(config, input);
     EXPECT_EQ(decision.fault, crane_supervisor::Fault::StateHealth);
     // The error the last sample carried is not republished as if it were
@@ -799,16 +1016,8 @@ TEST(SupervisorCore, AControllerThatStoppedPublishingIsNotACraneTrackingPerfectl
   EXPECT_NE(messages[0], messages[1]);
   EXPECT_NE(messages[1], messages[2]);
   EXPECT_NE(messages[0], messages[2]);
-  EXPECT_NE(messages[1].find("10.000"), std::string::npos) << messages[1];
+  EXPECT_NE(messages[1].find("stopped publishing its own state"), std::string::npos) << messages[1];
   EXPECT_NE(messages[2].find("future"), std::string::npos) << messages[2];
-
-  // A margin's worth of age is still arriving, on both sides of now, exactly as
-  // the other two inputs are read.
-  auto inside = healthy_input();
-  inside.controller_state.age = config.controller_state_timeout;
-  EXPECT_EQ(crane_supervisor::decide(config, inside).fault, crane_supervisor::Fault::None);
-  inside.controller_state.age = -config.controller_state_timeout;
-  EXPECT_EQ(crane_supervisor::decide(config, inside).fault, crane_supervisor::Fault::None);
 }
 
 TEST(SupervisorCore, AnInnerLoopThatStoppedReportingIsNotAnInnerLoopWithNothingToReport)
@@ -819,18 +1028,14 @@ TEST(SupervisorCore, AnInnerLoopThatStoppedReportingIsNotAnInnerLoopWithNothingT
   // must not read as a loop that is saying nothing is wrong.
   const auto config = default_config();
 
-  auto never = healthy_input();
-  never.controller_health = crane_supervisor::ControllerHealthReport{};
-
-  auto stopped = healthy_input();
+  auto stopped = stale(config, Input::ControllerHealth, Staleness::StoppedArriving);
   stopped.controller_health = uncommissioned_gripper();
-  stopped.controller_health.age = 10.0;
-
-  auto ahead = healthy_input();
-  ahead.controller_health.age = -10.0;
 
   std::vector<std::string> messages;
-  for (const auto & input : {never, stopped, ahead}) {
+  for (const auto & input :
+    {stale(config, Input::ControllerHealth, Staleness::NeverArrived), stopped,
+      stale(config, Input::ControllerHealth, Staleness::StampAhead)})
+  {
     const auto decision = crane_supervisor::decide(config, input);
     EXPECT_EQ(decision.fault, crane_supervisor::Fault::StateHealth);
     EXPECT_FALSE(decision.message.empty());
@@ -842,16 +1047,9 @@ TEST(SupervisorCore, AnInnerLoopThatStoppedReportingIsNotAnInnerLoopWithNothingT
   // The stale report's own code is not republished as if it were current: what
   // is reported is that nobody knows, not what the loop last said.
   EXPECT_EQ(messages[1].find("not commissioned"), std::string::npos) << messages[1];
-  EXPECT_NE(messages[1].find("10.000"), std::string::npos) << messages[1];
+  EXPECT_NE(messages[1].find("stopped reporting its own health"), std::string::npos)
+    << messages[1];
   EXPECT_NE(messages[2].find("future"), std::string::npos) << messages[2];
-
-  // A margin's worth of age is still arriving, on both sides of now, exactly as
-  // the other three inputs are read.
-  auto inside = healthy_input();
-  inside.controller_health.age = config.controller_health_timeout;
-  EXPECT_EQ(crane_supervisor::decide(config, inside).fault, crane_supervisor::Fault::None);
-  inside.controller_health.age = -config.controller_health_timeout;
-  EXPECT_EQ(crane_supervisor::decide(config, inside).fault, crane_supervisor::Fault::None);
 }
 
 TEST(SupervisorCore, TheInnerLoopsOwnCodesAreCarriedRatherThanTranslated)
@@ -946,7 +1144,7 @@ TEST(SupervisorCore, TheHealthCodeIsReportedInPreferenceToTheCommissioningCode)
     << against_state.message;
 
   auto dead_controller = only_commissioning;
-  dead_controller.controller_state.age = 10.0;
+  dead_controller.stream(Input::ControllerState).age = 10.0;
   EXPECT_EQ(
     crane_supervisor::decide(config, dead_controller).fault, crane_supervisor::Fault::StateHealth);
 
@@ -1023,7 +1221,7 @@ TEST(SupervisorCore, TheStopAndTheStateOutrankTrackingAndTrackingOutranksTheInte
   everything.remote_ctrl.deadman_held = false;
   EXPECT_EQ(crane_supervisor::decide(config, everything).fault, crane_supervisor::Fault::Tracking);
 
-  everything.pendulum_state.received = false;
+  everything.stream(Input::PendulumState).received = false;
   EXPECT_EQ(
     crane_supervisor::decide(config, everything).fault, crane_supervisor::Fault::StateHealth);
 
@@ -1054,17 +1252,13 @@ TEST(SupervisorCore, NothingHereActs)
   EXPECT_NE(decision.message.find("not protection"), std::string::npos) << decision.message;
 }
 
-/// Every shape the fourth input can arrive in, absence included.
-/**
- * The three codes the loop can raise plus the clear one, and the report that
- * never came at all. The commissioning one carries a named axis, because the
- * branch that reports it reads the names and the one that reports a defect in
- * the report is asserted where it can be told apart from this.
- */
+namespace
+{
+
+/// Every shape the fourth input's payload can arrive in.
 std::vector<crane_supervisor::ControllerHealthReport> every_inner_loop_report()
 {
   std::vector<crane_supervisor::ControllerHealthReport> reports{
-    crane_supervisor::ControllerHealthReport{},
     healthy_inner_loop(),
     inner_loop_fault(crane_supervisor::Fault::StateHealth),
     inner_loop_fault(crane_supervisor::Fault::ReferenceStale),
@@ -1075,9 +1269,9 @@ std::vector<crane_supervisor::ControllerHealthReport> every_inner_loop_report()
 /// The whole reachable input space of this slice, one struct per combination.
 /**
  * Swept rather than enumerated by hand, because the cases that go wrong are the
- * ones nobody thought to name. The tolerance list is a parameter of the sweep
- * too: with tolerances and without are two different decision surfaces, and both
- * are reachable from a deployment.
+ * ones nobody thought to name. The transport half is swept over the registry --
+ * every input arriving or not, at every age -- so an input added to `Input` is
+ * swept the day it is added rather than the day somebody remembers it.
  */
 std::vector<crane_supervisor::SupervisorInput> every_input()
 {
@@ -1094,24 +1288,23 @@ std::vector<crane_supervisor::SupervisorInput> every_input()
                     for (const double velocity_error : {0.0, 100.0}) {
                       for (const auto & inner_loop : every_inner_loop_report()) {
                         crane_supervisor::SupervisorInput input;
-                        input.pendulum_state.received = received;
+                        for (std::size_t i = 0; i < kInputCount; ++i) {
+                          input.streams[i].received = received;
+                          input.streams[i].age = age;
+                        }
+                        input.stream(Input::RemoteCtrl).received = remote_received;
+                        input.stream(Input::ControllerState).received = controller_received;
                         input.pendulum_state.valid = valid;
-                        input.pendulum_state.age = age;
                         input.pendulum_state.status = status;
-                        input.remote_ctrl.received = remote_received;
                         input.remote_ctrl.em_stop = em_stop;
                         input.remote_ctrl.deadman_held = deadman;
-                        input.remote_ctrl.age = age;
                         input.estop_latched = latched;
                         input.controller_state = tracking_controller();
-                        input.controller_state.received = controller_received;
-                        input.controller_state.age = age;
                         for (auto & axis : input.controller_state.axes) {
                           axis.velocity_error = velocity_error;
                           axis.position_error = velocity_error;
                         }
                         input.controller_health = inner_loop;
-                        input.controller_health.age = age;
                         inputs.push_back(input);
                       }
                     }
@@ -1126,6 +1319,8 @@ std::vector<crane_supervisor::SupervisorInput> every_input()
   }
   return inputs;
 }
+
+}  // namespace
 
 TEST(SupervisorCore, EveryReachableDecisionCarriesACause)
 {
@@ -1145,7 +1340,7 @@ TEST(SupervisorCore, EveryReachableDecisionCarriesACause)
       // The tracking error is a measurement of what arrived, and it is zero in
       // exactly the case where nothing usable did.
       if (decision.tracking_error != 0.0) {
-        EXPECT_TRUE(input.controller_state.received);
+        EXPECT_TRUE(input.stream(Input::ControllerState).received);
       }
       // A latch is never lowered by a status cycle, whatever else it decides.
       if (input.estop_latched) {
@@ -1158,11 +1353,28 @@ TEST(SupervisorCore, EveryReachableDecisionCarriesACause)
   }
 }
 
+TEST(SupervisorCore, NoInputThatIsNotFreshIsEverReportedAsFaultFree)
+{
+  // §5.3's rule, over the whole reachable input space: an input outside its own
+  // deadline never ends in FAULT_NONE, whichever input it is and however healthy
+  // everything else is.  This is the assertion that would fail first if a fifth
+  // subscription were added and left out of the precedence chain.
+  for (const auto & config : {default_config(), config_with_tolerances()}) {
+    for (const auto & input : every_input()) {
+      const auto causes = crane_supervisor::freshness(config, input);
+      const bool any_stale = std::any_of(
+        causes.begin(), causes.end(), [](Staleness cause) {return cause != Staleness::Fresh;});
+      if (any_stale) {
+        EXPECT_NE(crane_supervisor::decide(config, input).fault, crane_supervisor::Fault::None);
+      }
+    }
+  }
+}
+
 TEST(SupervisorCore, NoTrackingFaultIsReachableWithoutATolerance)
 {
-  // The fourth acceptance criterion, over the whole input space rather than
-  // over one case: with no number to compare against, FAULT_TRACKING is not
-  // reachable at all -- however far out any axis is.
+  // With no number to compare against, FAULT_TRACKING is not reachable at all --
+  // however far out any axis is.
   const auto config = default_config();
   for (const auto & input : every_input()) {
     EXPECT_NE(crane_supervisor::decide(config, input).fault, crane_supervisor::Fault::Tracking);
@@ -1197,7 +1409,7 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFourAndTheInnerLoopsThree)
         fault == crane_supervisor::Fault::NotCommissioned)
       {
         EXPECT_EQ(fault, input.controller_health.fault);
-        EXPECT_TRUE(input.controller_health.received);
+        EXPECT_TRUE(input.stream(Input::ControllerHealth).received);
       }
     }
   }

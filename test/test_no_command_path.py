@@ -212,19 +212,26 @@ def test_the_package_publishes_one_stream_and_only_reads_its_inputs():
     nothing here may publish on a topic named for a controller.
     """
     code, literals = _code_and_literals()
-    publishers, subscriptions, services = [], [], []
+    publishers, subscriptions, subscribed, services = [], [], [], []
     for _path, body in code:
         publishers += re.findall(r"create_publisher<([A-Za-z0-9_:]+)>", body)
         subscriptions += re.findall(r"create_subscription<([A-Za-z0-9_:]+)>", body)
+        subscribed += re.findall(r"subscribe<([A-Za-z0-9_:]+)>\(\s*Input::", body)
         services += re.findall(r"create_service<([A-Za-z0-9_:]+)>", body)
 
     assert publishers == ["crane_msgs::msg::SupervisorStatus"], publishers
-    assert subscriptions == [
+    # `create_subscription` is called in exactly one place: the `subscribe()`
+    # helper that every input goes through, which takes an `Input` and therefore
+    # a freshness deadline (`test_every_input_has_a_deadline.py` asserts the
+    # registry side of that).  What stays pinned here is the set of message
+    # *types* this node consumes, because a command path would have to change it.
+    assert subscriptions == ["MessageT"], subscriptions
+    assert subscribed == [
         "crane_msgs::msg::PendulumState",
         "epsilon_crane_msgs::msg::RemoteCtrlStates",
         "control_msgs::msg::JointTrajectoryControllerState",
         "crane_msgs::msg::VelocityControllerHealth",
-    ], subscriptions
+    ], subscribed
     assert services == PERMITTED_SERVICE_TYPES, services
 
     # A literal that is nothing but a ROS name is one this package uses; a ROS

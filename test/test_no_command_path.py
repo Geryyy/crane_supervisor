@@ -27,12 +27,20 @@ PACKAGE_XML = PACKAGE_ROOT / "package.xml"
 
 NON_SOURCE_DIRECTORIES = {".git", "__pycache__", "build", "install", "log"}
 
-# The two contract names of ROS 2 Interfaces 4 this package may know: the status
-# stream it owns, and the one input slice 3 carries end to end.  Any other ROS
-# name in the sources is a reach this slice does not have.
+# The contract names of ROS 2 Interfaces 4 and 5 this package may know: the
+# status stream it owns, the two inputs it carries end to end, and the one
+# acknowledgement it serves.  Any other ROS name in the sources is a reach this
+# package does not have.
 STATUS_TOPIC = "/crane/supervisor/status"
 PENDULUM_STATE_TOPIC = "/crane/pendulum_state"
-PERMITTED_ROS_NAMES = {STATUS_TOPIC, PENDULUM_STATE_TOPIC}
+REMOTE_CTRL_STATES_TOPIC = "/crane/remote_ctrl_states"
+CLEAR_FAULT_SERVICE = "/crane/clear_fault"
+PERMITTED_ROS_NAMES = {
+    STATUS_TOPIC,
+    PENDULUM_STATE_TOPIC,
+    REMOTE_CTRL_STATES_TOPIC,
+    CLEAR_FAULT_SERVICE,
+}
 
 # A ROS name standing on its own, and a ROS name quoted inside a sentence.  The
 # second is needed because the status messages name the topic they are about,
@@ -46,10 +54,13 @@ CRANE_NAME = re.compile(r"/crane/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*")
 FORBIDDEN_ROS_NAMES = ("/controller_manager", "/joint_states", "/cbs/")
 
 # Every way this package could reach the machine, by the name it would have to
-# use to do it.  `create_client` and `create_service` are on the list not
-# because a service commands anything but because `/crane/set_mode` and
-# `/crane/clear_fault` are a later issue, and a mode this supervisor has not
-# arbitrated is a mode it must not accept.
+# use to do it.  `create_client` stays on the list: a client is how a status node
+# starts calling other people's services, and this one calls nobody.
+# `create_service` came off it when `/crane/clear_fault` landed -- the reason it
+# was ever there was that the service was a later issue, and this is that issue.
+# What replaces the blanket ban is narrower and stricter: the test below names
+# the one service this package may serve and the one type it may serve it with,
+# so `/crane/set_mode`, which is still a later issue, cannot arrive unnoticed.
 FORBIDDEN_IDENTIFIERS = (
     "controller_manager",
     "SwitchController",
@@ -67,9 +78,14 @@ FORBIDDEN_IDENTIFIERS = (
     "JointJog",
     "Twist",
     "create_client",
-    "create_service",
     "create_generic_publisher",
 )
+
+# The one service this package serves, and the only type it may serve it with.
+# `std_srvs/Trigger` takes no arguments at all, which is what makes it safe to
+# expose from a node with no authority: there is nothing in the request for a
+# caller to ask this supervisor to do.
+PERMITTED_SERVICE_TYPES = ["std_srvs::srv::Trigger"]
 
 # What the package is allowed to build against.  A dependency is the cheapest
 # way to grow a reach, so the manifest is a whitelist and not a blacklist.
@@ -79,8 +95,10 @@ PERMITTED_DEPENDENCIES = {
     "ament_cmake_pytest",
     "crane_model",
     "crane_msgs",
+    "epsilon_crane_msgs",
     "generate_parameter_library",
     "rclcpp",
+    "std_srvs",
 }
 
 DEPENDENCY_TAGS = {
@@ -168,21 +186,27 @@ def test_no_source_reaches_a_controller_or_a_command_interface():
             assert identifier not in body, f"{path.name}: {identifier}"
 
 
-def test_the_package_publishes_one_stream_and_subscribes_to_one_input():
-    """One publisher, one subscription, and both on the contract names.
+def test_the_package_publishes_one_stream_and_only_reads_its_inputs():
+    """One publisher, two subscriptions, one service, all on the contract names.
 
     A second publisher is how a status node becomes a command node: the topic
     would be new, the QoS would be new, and nothing else about the package would
-    look different.
+    look different.  A subscription and a `Trigger` server are the two shapes
+    that cannot become that, which is why they are the two this package has.
     """
     code, literals = _code_and_literals()
-    publishers, subscriptions = [], []
+    publishers, subscriptions, services = [], [], []
     for _path, body in code:
         publishers += re.findall(r"create_publisher<([A-Za-z0-9_:]+)>", body)
         subscriptions += re.findall(r"create_subscription<([A-Za-z0-9_:]+)>", body)
+        services += re.findall(r"create_service<([A-Za-z0-9_:]+)>", body)
 
     assert publishers == ["crane_msgs::msg::SupervisorStatus"], publishers
-    assert subscriptions == ["crane_msgs::msg::PendulumState"], subscriptions
+    assert subscriptions == [
+        "crane_msgs::msg::PendulumState",
+        "epsilon_crane_msgs::msg::RemoteCtrlStates",
+    ], subscriptions
+    assert services == PERMITTED_SERVICE_TYPES, services
 
     # A literal that is nothing but a ROS name is one this package uses; a ROS
     # name inside a sentence is one it tells an operator about.  Both are held

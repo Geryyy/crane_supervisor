@@ -20,3 +20,49 @@ crane_supervisor:
       unreproducible."
     validation:
       bounds<>: [0.001, 10.0]
+  remote_ctrl_timeout:
+    type: double
+    default_value: 0.25
+    read_only: true
+    description: "Longest age of the newest epsilon_crane_msgs/RemoteCtrlStates
+      on /crane/remote_ctrl_states that still counts as arriving, s. Past it the
+      signal is absent, and wiki/control_architecture.md 5.3 and 6.1 read absence
+      of the stop signal as asserted rather than as released: a dead GPIO reader,
+      a crashed driver and a released button must not look alike. Derived --
+      the topic is a 20 Hz contract sampled here at 20 Hz, so a healthy sample is
+      up to 50 ms of publication period plus 50 ms of status period old when it
+      is read, and the worst control-cycle gap in the recorded machine data adds
+      a further 50.4 ms; 250 ms clears that 150 ms without letting a dead reader
+      pass for a held button for longer than a quarter second. It is not a safety
+      timing requirement: the hardware chain has already stopped the machine by
+      the time this margin expires, and what the number trades is a false alarm
+      against how far the diagnosis lags the event. Read-only, for the same
+      reason the other margin is: a stop that an operator can widen from
+      underneath a running stream is not one anybody can reason about."
+    validation:
+      bounds<>: [0.001, 10.0]
+  deadman_button:
+    type: int
+    default_value: 12
+    read_only: true
+    description: "Which of the twelve booleans of
+      epsilon_crane_msgs/RemoteCtrlStates is the operator deadman of
+      wiki/control_architecture.md 6.2. The default is read from the retained
+      stack, not inferred from the number: epsilon_crane_behavior_tree's approval
+      gate returns msg.button12 in
+      src/plugins/condition/check_user_approval.cpp and in
+      include/epsilon_crane_behavior_tree/plugins/decorator/get_user_approval.hpp,
+      whose comment says 'RemoteCtrlStates::button12 has to be pressed and held';
+      the manual-control TUI defines KEYCODE_BUTTON12 as 0x7A -- the z key -- in
+      timber_crane_manual_control/timber_crane_tui/src/remote_ctrl.cpp, which is
+      the key 6.2 names as the simulated deadman; and the simulation's remote
+      publisher sets button12 to approve in
+      epsilon_crane_bringup_sim/test/remote_ctrl_publisher.cpp. gpio_controller
+      copies the twelve booleans off the state interfaces in order and names none
+      of them the deadman, so it fixes the wire index and the approval gate fixes
+      the meaning. Configuration rather than a constant because it is a property
+      of a remote's wiring, which the architecture does not own; read-only
+      because changing which button stops the machine underneath a running
+      supervisor is not a runtime adjustment."
+    validation:
+      bounds<>: [1, 12]

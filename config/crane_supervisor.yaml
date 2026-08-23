@@ -1,12 +1,12 @@
 # The `crane_supervisor` node of ROS 2 Interfaces 2, as the `fake` and
 # `hardware` profiles of crane_bringup compose it.
 #
-# One parameter, because everything else about this node is a contract rather
-# than a setting: the topic names of ROS 2 Interfaces 4 and the 20 Hz status
-# rate of ROS 2 Interfaces 2 are constants in the source, so a deployment cannot
-# rename or re-rate a stream the task layer and the operator panel subscribe to.
-# What is left is the one number that is a property of a rig rather than of the
-# architecture.
+# Three parameters, because everything else about this node is a contract rather
+# than a setting: the topic and service names of ROS 2 Interfaces 4 and 5 and the
+# 20 Hz status rate of ROS 2 Interfaces 2 are constants in the source, so a
+# deployment cannot rename or re-rate a stream the task layer and the operator
+# panel subscribe to. What is left is what is a property of a rig rather than of
+# the architecture: two margins and the wiring of one remote.
 crane_supervisor:
   ros__parameters:
     # Seconds. See src/crane_supervisor_parameters.yaml for the derivation and
@@ -14,3 +14,13 @@ crane_supervisor:
     # "stopped"; the general staleness policy of control_architecture.md 5.3 is
     # a later issue.
     pendulum_state_timeout: 0.15
+    # Seconds. Past this the operator remote counts as absent, and absence of
+    # the stop signal is asserted rather than released (control_architecture.md
+    # 5.3, 6.1). Not a safety timing requirement -- the hardware and PLC chain
+    # has already acted; this margin only decides how fast the software says so.
+    remote_ctrl_timeout: 0.25
+    # Which RemoteCtrlStates button the deadman is. 12 is read from the retained
+    # stack -- epsilon_crane_behavior_tree's approval gate tests button12, and
+    # the TUI maps it to the z key control_architecture.md 6.2 names -- and not
+    # inferred from the number. See src/crane_supervisor_parameters.yaml.
+    deadman_button: 12

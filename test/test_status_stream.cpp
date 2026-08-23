@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <vector>
@@ -22,13 +23,17 @@
 #include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
 #include "crane_supervisor/supervisor_node.hpp"
+#include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "std_srvs/srv/trigger.hpp"
 
 namespace
 {
 
 using crane_msgs::msg::PendulumState;
 using crane_msgs::msg::SupervisorStatus;
+using epsilon_crane_msgs::msg::RemoteCtrlStates;
+using std_srvs::srv::Trigger;
 
 /// Shorter than the shipped margin so that "the stream stopped" is reachable
 /// inside a test budget.  It is an override of the declared parameter, not a
@@ -70,7 +75,9 @@ protected:
   void SetUp() override
   {
     rclcpp::NodeOptions options;
-    options.parameter_overrides({rclcpp::Parameter("pendulum_state_timeout", kTestTimeout)});
+    options.parameter_overrides(
+      {rclcpp::Parameter("pendulum_state_timeout", kTestTimeout),
+        rclcpp::Parameter("remote_ctrl_timeout", kTestTimeout)});
     supervisor_ = std::make_shared<crane_supervisor::SupervisorNode>(options);
 
     observer_ = std::make_shared<rclcpp::Node>("crane_supervisor_stream_observer");
@@ -80,6 +87,9 @@ protected:
       [this](SupervisorStatus::ConstSharedPtr message) {received_.push_back(*message);});
     pendulum_state_ = observer_->create_publisher<PendulumState>(
       crane_supervisor::kPendulumStateTopic, qos);
+    remote_ctrl_ = observer_->create_publisher<RemoteCtrlStates>(
+      crane_supervisor::kRemoteCtrlStatesTopic, qos);
+    clear_fault_ = observer_->create_client<Trigger>(crane_supervisor::kClearFaultService);
 
     executor_.add_node(supervisor_);
     executor_.add_node(observer_);
@@ -119,17 +129,62 @@ protected:
     return message;
   }
 
-  bool drive_to(std::uint8_t fault, const PendulumState & sample)
+  /// What gpio_controller publishes with the stop released and button 12 held.
+  RemoteCtrlStates held_remote() const
+  {
+    RemoteCtrlStates message;
+    message.header.stamp = observer_->now();
+    message.button12 = true;
+    message.em_stop = false;
+    return message;
+  }
+
+  /// Publish both inputs once, stamped now.
+  void publish(const PendulumState & state, const RemoteCtrlStates & remote)
+  {
+    PendulumState fresh_state = state;
+    fresh_state.header.stamp = observer_->now();
+    pendulum_state_->publish(fresh_state);
+
+    RemoteCtrlStates fresh_remote = remote;
+    fresh_remote.header.stamp = observer_->now();
+    remote_ctrl_->publish(fresh_remote);
+  }
+
+  /// Spin, publishing both inputs every pass, until the newest report is `fault`.
+  bool drive_to(std::uint8_t fault, const PendulumState & state, const RemoteCtrlStates & remote)
   {
     return spin_until(
       [this, fault]() {
         return !received_.empty() && received_.back().fault == fault;
       },
-      [this, &sample]() {
-        PendulumState fresh = sample;
-        fresh.header.stamp = observer_->now();
-        pendulum_state_->publish(fresh);
-      });
+      [this, &state, &remote]() {publish(state, remote);});
+  }
+
+  bool drive_to(std::uint8_t fault, const PendulumState & state)
+  {
+    return drive_to(fault, state, held_remote());
+  }
+
+  /// Call `/crane/clear_fault` and spin until it answers, publishing meanwhile.
+  /**
+   * The publication has to continue during the call: the acknowledgement is
+   * judged against the newest sample the supervisor holds, and a test that went
+   * quiet while it waited would be acknowledging against an absent remote.
+   */
+  Trigger::Response::SharedPtr acknowledge(
+    const PendulumState & state, const RemoteCtrlStates & remote)
+  {
+    if (!clear_fault_->wait_for_service(std::chrono::seconds(5))) {
+      return nullptr;
+    }
+    auto future = clear_fault_->async_send_request(std::make_shared<Trigger::Request>());
+    const bool answered = spin_until(
+      [&future]() {
+        return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+      },
+      [this, &state, &remote]() {publish(state, remote);});
+    return answered ? future.get() : nullptr;
   }
 
   /// The invariants every published report owes, whatever else a test asserts.
@@ -153,6 +208,8 @@ protected:
   rclcpp::Node::SharedPtr observer_;
   rclcpp::Subscription<SupervisorStatus>::SharedPtr status_;
   rclcpp::Publisher<PendulumState>::SharedPtr pendulum_state_;
+  rclcpp::Publisher<RemoteCtrlStates>::SharedPtr remote_ctrl_;
+  rclcpp::Client<Trigger>::SharedPtr clear_fault_;
   std::vector<SupervisorStatus> received_;
 };
 
@@ -214,14 +271,151 @@ TEST_F(StatusStream, TheStreamRunsAtTheRateRos2InterfacesGivesIt)
   expect_contract_of_every_report();
 }
 
-TEST_F(StatusStream, AbsenceIsNotHealthBeforeTheFirstPendulumStateArrives)
+TEST_F(StatusStream, AbsenceOfTheStopSignalIsAssertedBeforeAnythingArrives)
 {
+  // Nothing is published here at all, so the operator remote is among the things
+  // that are not arriving.  wiki/control_architecture.md §6.1: absence of the
+  // stop signal is treated as asserted rather than as released, so the very
+  // first report a freshly started supervisor publishes is the stop.
   ASSERT_TRUE(spin_until([this]() {return !received_.empty();}));
 
   const SupervisorStatus & status = received_.front();
-  EXPECT_EQ(status.fault, SupervisorStatus::FAULT_STATE_HEALTH);
-  EXPECT_NE(status.fault, SupervisorStatus::FAULT_NONE);
-  EXPECT_FALSE(status.message.empty());
+  EXPECT_EQ(status.fault, SupervisorStatus::FAULT_ESTOP);
+  EXPECT_FALSE(status.deadman_held);
+  EXPECT_NE(status.message.find("has arrived"), std::string::npos) << status.message;
+  // And it says what it is and is not, so nobody reads FAULT_ESTOP off a panel
+  // as a safety function this software performed.
+  EXPECT_NE(status.message.find("not protection"), std::string::npos) << status.message;
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStream, AbsenceIsNotHealthBeforeTheFirstPendulumStateArrives)
+{
+  // The remote arrives and the passive state does not, so the state health of
+  // §5.3 is what is left to report.
+  ASSERT_TRUE(
+    spin_until(
+      [this]() {
+        return !received_.empty() && received_.back().fault == SupervisorStatus::FAULT_STATE_HEALTH;
+      },
+      [this]() {
+        RemoteCtrlStates remote = held_remote();
+        remote.header.stamp = observer_->now();
+        remote_ctrl_->publish(remote);
+      }))
+    << received_.back().message;
+
+  EXPECT_NE(received_.back().fault, SupervisorStatus::FAULT_NONE);
+  EXPECT_TRUE(received_.back().deadman_held);
+  EXPECT_FALSE(received_.back().message.empty());
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStream, TheDeadmanIsCarriedEndToEndAndCheckedEveryCycle)
+{
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
+    << received_.back().message;
+  EXPECT_TRUE(received_.back().deadman_held);
+
+  // Released mid-stream, with nothing else changed: §6.2's check runs on every
+  // cycle rather than once at the start of a motion, so the release is caught
+  // where it happens and not at the next goal.
+  RemoteCtrlStates released = held_remote();
+  released.button12 = false;
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_INTERLOCK, trusted_state(), released))
+    << received_.back().message;
+  EXPECT_FALSE(received_.back().deadman_held);
+  EXPECT_NE(received_.back().message.find("button 12"), std::string::npos)
+    << received_.back().message;
+
+  // Pressed again, and it clears itself: an interlock is not a latch.
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
+    << received_.back().message;
+  EXPECT_TRUE(received_.back().deadman_held);
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStream, TheStopLatchesAndOnlyTheAcknowledgementClearsIt)
+{
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
+    << received_.back().message;
+
+  RemoteCtrlStates asserted = held_remote();
+  asserted.em_stop = true;
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_ESTOP, trusted_state(), asserted))
+    << received_.back().message;
+
+  // Refused while the condition still holds, with an explanation and never an
+  // empty success (ROS 2 Interfaces §1).
+  const auto refused = acknowledge(trusted_state(), asserted);
+  ASSERT_NE(refused, nullptr);
+  EXPECT_FALSE(refused->success);
+  EXPECT_FALSE(refused->message.empty());
+  EXPECT_NE(refused->message.find("still asserted"), std::string::npos) << refused->message;
+
+  // Released, and the fault survives it: the latch is what §6.1 asks for, so
+  // that the software comes back in a defined state rather than resuming.
+  const std::size_t before = received_.size();
+  ASSERT_TRUE(
+    spin_until(
+      [this, before]() {return received_.size() > before + 10;},
+      [this]() {publish(trusted_state(), held_remote());}));
+  EXPECT_EQ(received_.back().fault, SupervisorStatus::FAULT_ESTOP);
+  EXPECT_NE(received_.back().message.find("latched"), std::string::npos)
+    << received_.back().message;
+
+  // And the acknowledgement clears it.
+  const auto cleared = acknowledge(trusted_state(), held_remote());
+  ASSERT_NE(cleared, nullptr);
+  EXPECT_TRUE(cleared->success);
+  EXPECT_FALSE(cleared->message.empty());
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
+    << received_.back().message;
+
+  // A cleared latch that re-raises on the next cycle is the correct behaviour.
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_ESTOP, trusted_state(), asserted))
+    << received_.back().message;
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStream, TheRemoteStoppingIsAssertedRatherThanReleased)
+{
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
+    << received_.back().message;
+
+  // The passive state keeps arriving and the remote does not.  A dead GPIO
+  // reader must not be indistinguishable from a released button, so this is the
+  // stop and not the interlock, and it says which of the two it is.
+  ASSERT_TRUE(
+    spin_until(
+      [this]() {return received_.back().fault == SupervisorStatus::FAULT_ESTOP;},
+      [this]() {
+        PendulumState state = trusted_state();
+        state.header.stamp = observer_->now();
+        pendulum_state_->publish(state);
+      }))
+    << received_.back().message;
+  EXPECT_NE(received_.back().message.find("stopped arriving"), std::string::npos)
+    << received_.back().message;
+  EXPECT_FALSE(received_.back().deadman_held);
+
+  // It is latched too: the signal coming back does not clear it by itself, and
+  // the acknowledgement is what does.
+  const std::size_t before = received_.size();
+  ASSERT_TRUE(
+    spin_until(
+      [this, before]() {return received_.size() > before + 10;},
+      [this]() {publish(trusted_state(), held_remote());}));
+  EXPECT_EQ(received_.back().fault, SupervisorStatus::FAULT_ESTOP);
+
+  const auto cleared = acknowledge(trusted_state(), held_remote());
+  ASSERT_NE(cleared, nullptr);
+  EXPECT_TRUE(cleared->success);
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
+    << received_.back().message;
+
   expect_contract_of_every_report();
 }
 
@@ -249,12 +443,18 @@ TEST_F(StatusStream, TheStreamStoppingBringsTheFaultBackRatherThanLeavingItClear
   ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state()))
     << received_.back().message;
 
-  // Nothing publishes from here on.  wiki/control_architecture.md §5.3: an
-  // input that stops arriving has a defined consequence, and a publisher that
-  // died must not be indistinguishable from a healthy one.
+  // The remote keeps arriving and the passive state stops.
+  // wiki/control_architecture.md §5.3: an input that stops arriving has a
+  // defined consequence, and a publisher that died must not be
+  // indistinguishable from a healthy one.
   ASSERT_TRUE(
     spin_until(
-      [this]() {return received_.back().fault == SupervisorStatus::FAULT_STATE_HEALTH;}));
+      [this]() {return received_.back().fault == SupervisorStatus::FAULT_STATE_HEALTH;},
+      [this]() {
+        RemoteCtrlStates remote = held_remote();
+        remote.header.stamp = observer_->now();
+        remote_ctrl_->publish(remote);
+      }));
   EXPECT_NE(received_.back().message.find("stopped arriving"), std::string::npos)
     << received_.back().message;
 

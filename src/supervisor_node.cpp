@@ -28,6 +28,29 @@ rclcpp::QoS contract_qos()
 
 }  // namespace
 
+bool deadman_of(const epsilon_crane_msgs::msg::RemoteCtrlStates & message, int button)
+{
+  // Twelve named booleans and no array, so this is the switch the wire forces.
+  // The default is `false` rather than an exception: `validate()` has already
+  // refused a number outside the range at construction, and a deadman that read
+  // as released would be the safe answer if it ever got past it.
+  switch (button) {
+    case 1: return message.button1;
+    case 2: return message.button2;
+    case 3: return message.button3;
+    case 4: return message.button4;
+    case 5: return message.button5;
+    case 6: return message.button6;
+    case 7: return message.button7;
+    case 8: return message.button8;
+    case 9: return message.button9;
+    case 10: return message.button10;
+    case 11: return message.button11;
+    case 12: return message.button12;
+    default: return false;
+  }
+}
+
 std::chrono::nanoseconds SupervisorNode::status_period()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -38,7 +61,10 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
 : rclcpp::Node("crane_supervisor", options)
 {
   const ParamListener listener(this);
-  config_.pendulum_state_timeout = listener.get_params().pendulum_state_timeout;
+  const auto parameters = listener.get_params();
+  config_.pendulum_state_timeout = parameters.pendulum_state_timeout;
+  config_.remote_ctrl_timeout = parameters.remote_ctrl_timeout;
+  config_.deadman_button = static_cast<int>(parameters.deadman_button);
 
   // generate_parameter_library has already rejected a value outside the
   // declared bounds. The core is checked against its own rule anyway: it is the
@@ -59,19 +85,52 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
       pendulum_state_ = std::move(message);
     });
 
+  remote_ctrl_subscription_ = create_subscription<epsilon_crane_msgs::msg::RemoteCtrlStates>(
+    kRemoteCtrlStatesTopic, contract_qos(),
+    [this](epsilon_crane_msgs::msg::RemoteCtrlStates::ConstSharedPtr message) {
+      remote_ctrl_ = std::move(message);
+    });
+
+  // The acknowledgement of ROS 2 Interfaces §5, and the only thing in this
+  // package a caller can ask for. It lowers a latch and does nothing else: it
+  // starts nothing, resumes nothing and commands nothing, and refusing new goals
+  // while the stop is latched is a mode decision this supervisor does not yet
+  // have the authority to make.
+  clear_fault_service_ = create_service<std_srvs::srv::Trigger>(
+    kClearFaultService,
+    [this](
+      const std_srvs::srv::Trigger::Request::SharedPtr,
+      std_srvs::srv::Trigger::Response::SharedPtr response) {
+      const ClearFaultOutcome outcome = clear_fault(config_, observe());
+      if (outcome.cleared) {
+        estop_latched_ = false;
+      }
+      // ROS 2 Interfaces §1: `success` and an explanation, and never an empty
+      // success. `success` is true only when a latch existed and is now down,
+      // so a caller cannot read an acknowledgement of nothing as a recovery.
+      response->success = outcome.cleared;
+      response->message = outcome.message;
+      RCLCPP_INFO(get_logger(), "%s: %s", kClearFaultService, outcome.message.c_str());
+    });
+
   status_timer_ = create_wall_timer(status_period(), [this]() {update();});
 
   RCLCPP_INFO(
     get_logger(),
-    "crane_supervisor: publishing %s at %.1f Hz. It observes %s and nothing else, and it holds no "
-    "stop authority: the hardware stop input is an unverified commissioning prerequisite, so the "
-    "package has no path to a motion command by construction.",
-    kStatusTopic, kStatusRate, kPendulumStateTopic);
+    "crane_supervisor: publishing %s at %.1f Hz. It observes %s and %s -- button %d of the latter "
+    "is the deadman -- serves %s, and does nothing else. It holds no stop authority: the hardware "
+    "stop input is an unverified commissioning prerequisite, so the package has no path to a "
+    "motion command by construction, and what it does with the emergency stop is diagnosis and "
+    "recovery rather than protection.",
+    kStatusTopic, kStatusRate, kPendulumStateTopic, kRemoteCtrlStatesTopic,
+    config_.deadman_button, kClearFaultService);
 }
 
-void SupervisorNode::update()
+SupervisorInput SupervisorNode::observe() const
 {
   SupervisorInput input;
+  input.estop_latched = estop_latched_;
+
   if (pendulum_state_) {
     input.pendulum_state.received = true;
     input.pendulum_state.valid = pendulum_state_->valid;
@@ -83,7 +142,25 @@ void SupervisorNode::update()
     input.pendulum_state.age = (now() - rclcpp::Time(pendulum_state_->header.stamp)).seconds();
   }
 
-  const SupervisorDecision decision = decide(config_, input);
+  if (remote_ctrl_) {
+    input.remote_ctrl.received = true;
+    input.remote_ctrl.deadman_held = deadman_of(*remote_ctrl_, config_.deadman_button);
+    input.remote_ctrl.em_stop = remote_ctrl_->em_stop;
+    // gpio_controller stamps the message from the control cycle's own time, so
+    // the age is measured the same way as the passive state's and means the
+    // same thing.
+    input.remote_ctrl.age = (now() - rclcpp::Time(remote_ctrl_->header.stamp)).seconds();
+  }
+
+  return input;
+}
+
+void SupervisorNode::update()
+{
+  const SupervisorDecision decision = decide(config_, observe());
+  // The latch is the one thing a cycle carries into the next one. `decide()`
+  // raises it; only an acknowledged `/crane/clear_fault` lowers it.
+  estop_latched_ = decision.estop_latched;
 
   crane_msgs::msg::SupervisorStatus status;
   status.header.stamp = now();

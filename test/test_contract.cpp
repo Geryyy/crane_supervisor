@@ -1,7 +1,10 @@
-// The two contracts this package has with packages outside it: the installed
-// `crane_model` dynamics seam, and the numbering of `crane_msgs/SupervisorStatus`.
+// The contracts this package has with packages outside it: the installed
+// `crane_model` dynamics seam, the numbering of `crane_msgs/SupervisorStatus`,
+// and which of the twelve booleans of `epsilon_crane_msgs/RemoteCtrlStates` the
+// configured deadman selects.
 //
-// Message structs only -- no node, no clock, no graph.  The mode/fault fixture
+// Message structs only -- no node is constructed, no clock read, no graph
+// joined, and the adapter is linked for one free function.  The mode/fault fixture
 // that used to live in this file as a private test double is gone: the real
 // decision core replaces it, and it is exercised in `test_supervisor_core.cpp`.
 // A double beside the implementation would be a second answer to the same
@@ -15,6 +18,8 @@
 #include "crane_model/testing/mock_model.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
 #include "crane_supervisor/supervisor_core.hpp"
+#include "crane_supervisor/supervisor_node.hpp"
+#include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
 
 TEST(CraneSupervisorContract, W08UsesInstalledModelDynamicsContract)
 {
@@ -54,15 +59,44 @@ TEST(CraneSupervisorContract, TheCoreIsNumberedAsTheMessageIsNumbered)
 
 TEST(CraneSupervisorContract, TheRealCoreStartsFromAbsenceRatherThanFromHealth)
 {
-  // The decision a supervisor makes before anything has told it anything.  It
-  // is the one the replaced double got right and the one every later cause is
-  // added on top of, so it is asserted against the wire's own constants here as
-  // well as against the enum in `test_supervisor_core.cpp`.
+  // The decision a supervisor makes before anything has told it anything, in
+  // the wire's own constants as well as in the enum `test_supervisor_core.cpp`
+  // uses.  It is FAULT_ESTOP rather than the FAULT_STATE_HEALTH this asserted
+  // while the remote was not yet an input: with nothing arriving at all, the
+  // stop signal is among the things that are not arriving, and
+  // wiki/control_architecture.md §6.1 reads absence of the stop signal as
+  // asserted rather than as released.  A supervisor that started from a stale
+  // estimate instead would have started from the lesser of the two absences.
   const auto decision = crane_supervisor::decide(crane_supervisor::SupervisorConfig{}, {});
   EXPECT_EQ(
-    static_cast<std::uint8_t>(decision.fault),
-    crane_msgs::msg::SupervisorStatus::FAULT_STATE_HEALTH);
+    static_cast<std::uint8_t>(decision.fault), crane_msgs::msg::SupervisorStatus::FAULT_ESTOP);
+  EXPECT_TRUE(decision.estop_latched);
+  EXPECT_FALSE(decision.deadman_held);
   EXPECT_EQ(
     static_cast<std::uint8_t>(decision.mode), crane_msgs::msg::SupervisorStatus::MODE_IDLE);
   EXPECT_FALSE(decision.message.empty());
+}
+
+TEST(CraneSupervisorContract, TheDeadmanIsReadOffTheFieldTheRetainedStackNames)
+{
+  // The number in the configuration is not the assertion; which *field* it
+  // selects is.  `epsilon_crane_msgs/RemoteCtrlStates` is the retained
+  // machine-telemetry boundary (ROS 2 Interfaces §9), and the retained approval
+  // gate reads `button12` off it -- so the default must select `button12` and
+  // nothing else.  This is the one place the ROS-free core's button number and
+  // the wire's twelve booleans are checked against each other.
+  epsilon_crane_msgs::msg::RemoteCtrlStates message;
+  message.button12 = true;
+  EXPECT_TRUE(
+    crane_supervisor::deadman_of(message, crane_supervisor::SupervisorConfig{}.deadman_button));
+
+  for (int button = crane_supervisor::kFirstButton; button < crane_supervisor::kLastButton;
+    ++button)
+  {
+    EXPECT_FALSE(crane_supervisor::deadman_of(message, button)) << button;
+  }
+
+  message.button12 = false;
+  EXPECT_FALSE(
+    crane_supervisor::deadman_of(message, crane_supervisor::SupervisorConfig{}.deadman_button));
 }

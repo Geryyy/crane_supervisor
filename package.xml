@@ -9,13 +9,22 @@
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <!-- The status stream and the one input it carries end to end. Nothing that
-       reaches a command interface is here, and nothing that reaches one may be
-       added: stop authority is withheld until the hardware stop input is
-       verified, and test/test_no_command_path.py holds this list to that. -->
+  <!-- The status stream, the two inputs it carries end to end, and the one
+       acknowledgement it serves. Nothing that reaches a command interface is
+       here, and nothing that reaches one may be added: stop authority is
+       withheld until the hardware stop input is verified, and
+       test/test_no_command_path.py holds this list to that.
+
+       `epsilon_crane_msgs` is the machine-telemetry boundary the new stack
+       keeps rather than a new dependency of its own (ROS 2 Interfaces §9), and
+       it is what `/crane/remote_ctrl_states` is typed with. `std_srvs` is the
+       type ROS 2 Interfaces §5 gives `/crane/clear_fault`; a service is not a
+       command path, and the guard test names the one this package may serve. -->
   <depend>crane_msgs</depend>
+  <depend>epsilon_crane_msgs</depend>
   <depend>generate_parameter_library</depend>
   <depend>rclcpp</depend>
+  <depend>std_srvs</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_cmake_pytest</test_depend>

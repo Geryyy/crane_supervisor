@@ -3,8 +3,10 @@ project(crane_supervisor)
 
 find_package(ament_cmake REQUIRED)
 find_package(crane_msgs REQUIRED)
+find_package(epsilon_crane_msgs REQUIRED)
 find_package(generate_parameter_library REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(std_srvs REQUIRED)
 
 # The decision core: an input struct in, a decision struct out. No node handle,
 # no message type, no clock, no topic. It is a separate target rather than a
@@ -39,6 +41,8 @@ target_link_libraries(supervisor_node
     supervisor_core
     rclcpp::rclcpp
     ${crane_msgs_TARGETS}
+    ${epsilon_crane_msgs_TARGETS}
+    ${std_srvs_TARGETS}
   PRIVATE
     crane_supervisor_parameters)
 
@@ -65,7 +69,7 @@ ament_export_include_directories(include)
 # header alone, because a second process linking the node would be a second
 # publisher on a contract stream that has exactly one.
 ament_export_libraries(supervisor_core)
-ament_export_dependencies(crane_msgs rclcpp)
+ament_export_dependencies(crane_msgs epsilon_crane_msgs rclcpp std_srvs)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -73,13 +77,17 @@ if(BUILD_TESTING)
   find_package(crane_model REQUIRED)
 
   # The seams outside this package: the installed `crane_model` dynamics
-  # contract, and the numbering `crane_msgs/SupervisorStatus` fixes. Message
-  # structs only -- no node, no clock, no graph.
+  # contract, the numbering `crane_msgs/SupervisorStatus` fixes, and which
+  # `epsilon_crane_msgs/RemoteCtrlStates` boolean the configured deadman
+  # selects. Message structs only -- the adapter is linked for one free
+  # function, and no node is constructed, no clock read, no graph joined.
   ament_add_gtest(test_contract test/test_contract.cpp)
   target_link_libraries(test_contract
     supervisor_core
+    supervisor_node
     crane_model::mock_model
-    ${crane_msgs_TARGETS})
+    ${crane_msgs_TARGETS}
+    ${epsilon_crane_msgs_TARGETS})
 
   # The decision core, offline. No ROS is linked into this binary.
   ament_add_gtest(test_supervisor_core test/test_supervisor_core.cpp)
@@ -89,7 +97,11 @@ if(BUILD_TESTING)
   # executor on the isolated domain `ralph/verify.sh` pins. No launch, no
   # controller manager, no simulator.
   ament_add_gtest(test_status_stream test/test_status_stream.cpp TIMEOUT 120)
-  target_link_libraries(test_status_stream supervisor_node ${crane_msgs_TARGETS})
+  target_link_libraries(test_status_stream
+    supervisor_node
+    ${crane_msgs_TARGETS}
+    ${epsilon_crane_msgs_TARGETS}
+    ${std_srvs_TARGETS})
 
   # The absence that is the feature: no publisher on a command topic, no
   # controller-manager client, nothing that can deactivate a controller.

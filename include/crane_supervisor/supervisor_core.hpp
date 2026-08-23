@@ -11,9 +11,42 @@
 // (wiki/control_architecture.md §5.2). What there is, is a *cause* on every
 // report (PRD user story 53).
 //
-// Two inputs are carried end to end: `crane_msgs/PendulumState` on
-// `/crane/pendulum_state`, and `epsilon_crane_msgs/RemoteCtrlStates` on
-// `/crane/remote_ctrl_states`.
+// Three inputs are carried end to end: `crane_msgs/PendulumState` on
+// `/crane/pendulum_state`, `epsilon_crane_msgs/RemoteCtrlStates` on
+// `/crane/remote_ctrl_states`, and the trajectory controller's own
+// `control_msgs/JointTrajectoryControllerState`.
+//
+// The third is what turns the tracking duty of wiki/control_architecture.md §5
+// row 1 into a *typed cause* instead of the inferred abort §5.0 describes. The
+// behaviour tree's ownership of the retry is correct and untouched; what changes
+// is the signal it acts on. The error is not re-derived here from
+// `/joint_states`: the controller that computes it publishes it, per joint,
+// every control cycle.
+//
+// Two quantities come off that one message and they are not interchangeable:
+//
+//   position error  `error.positions`, rad on four axes and m on two. This is
+//                   the number `tracking_error` carries, because
+//                   wiki/implementation/ros2_interfaces.md §6 fixes that field
+//                   as the max over the actuated joints in rad or m. A max
+//                   taken across two units is an indicator and not a
+//                   comparison, and it is reported as one.
+//   velocity error  `error.velocities`, rad/s and m/s. This is what
+//                   `FAULT_TRACKING` is decided on, per axis, because the one
+//                   tolerance this workspace defines --
+//                   `crane_control/config/tracking_tolerance.yaml`, key `dq_a`
+//                   -- is a *velocity*-tracking tolerance (PRD §6, gate (ii-b)).
+//                   Comparing a position error against it would be rad against
+//                   rad/s, which is the hidden mixed unit this file exists to
+//                   avoid.
+//
+// **The tolerance does not exist yet, and no default is invented for it.** All
+// six values in that file are negative and the file says in its own header that
+// a value which is not finite and positive is not a tolerance. An axis without
+// one raises no tracking fault; the supervisor says so once at configuration,
+// names the axis and the owner of the missing number, and goes on reporting
+// `tracking_error` as a measurement -- the same way the velocity controller's
+// seam clamp goes transparent and warns.
 //
 // The passive state is the one input in this stack that reports its own health
 // honestly, and the three ways it can fail are the three the tracer has to
@@ -63,7 +96,9 @@
 #define CRANE_SUPERVISOR__SUPERVISOR_CORE_HPP_
 
 #include <cstdint>
+#include <limits>
 #include <string>
+#include <vector>
 
 namespace crane_supervisor
 {
@@ -112,6 +147,28 @@ enum class Fault : std::uint8_t
 inline constexpr int kFirstButton = 1;
 inline constexpr int kLastButton = 12;
 
+/// One axis's row of `crane_control/config/tracking_tolerance.yaml`.
+/**
+ * The supervisor holds no tolerance of its own. This struct is the shape the
+ * numbers arrive in, not a place to keep them: the file is the one owner (PRD
+ * §6 -- one number, three consumers, now four), and a value restated in this
+ * package's configuration is a value that can drift away from the clamp's and
+ * the MPC's.
+ */
+struct AxisTolerance
+{
+  /// URDF joint name, as ROS 2 Interfaces §3.1 spells it and as the trajectory
+  /// controller reports it in `joint_names`. Axes are paired by name and never
+  /// by index: the controller's order is its own.
+  std::string joint;
+  /// The per-axis velocity-tracking tolerance, rad/s on the four angles and m/s
+  /// on the two lengths. NaN when the file has not been loaded, negative when it
+  /// has and the number does not exist yet. Both mean the same thing --
+  /// `is_tolerance()` is false, this axis raises no tracking fault, and the
+  /// supervisor says which axis and whose number is missing.
+  double dq_a{std::numeric_limits<double>::quiet_NaN()};
+};
+
 /// The margins the decision is made against. All SI, all named.
 struct SupervisorConfig
 {
@@ -153,6 +210,29 @@ struct SupervisorConfig
    * *diagnosis* lags the event.
    */
   double remote_ctrl_timeout{0.25};
+
+  /// Longest age of the newest `control_msgs/JointTrajectoryControllerState`
+  /// that still counts as arriving, s.
+  /**
+   * Derived exactly as `pendulum_state_timeout` is, and to the same number,
+   * because the two streams have the same shape: the trajectory controller
+   * publishes its state from inside the manager's 100 Hz cycle -- ungated, once
+   * per `update()` -- and this node samples it at 20 Hz, so a healthy sample is
+   * up to one 50 ms status period plus one 10 ms control period old when it is
+   * read. The worst observed control-cycle gap in the recorded machine data adds
+   * 50.4 ms, and 150 ms clears the resulting 110 ms without letting a controller
+   * that stopped publishing pass for a crane that is tracking perfectly.
+   */
+  double controller_state_timeout{0.15};
+
+  /// The six rows of `crane_control/config/tracking_tolerance.yaml`, in the
+  /// order the actuated joints are configured in.
+  /**
+   * Empty until the node loads them, and an empty list is not an error: it is
+   * the state a deployment that has not been given the file is honestly in, and
+   * it raises no tracking fault at all.
+   */
+  std::vector<AxisTolerance> tracking_tolerance;
 
   /// Which `epsilon_crane_msgs/RemoteCtrlStates` button is the deadman, 1..12.
   /**
@@ -217,12 +297,63 @@ struct RemoteCtrlReport
   double age{0.0};
 };
 
-/// Everything one decision is made from. Two inputs in this slice; the rest of
+/// One actuated axis, as the trajectory controller reported it this cycle.
+/**
+ * Copied off `control_msgs/JointTrajectoryControllerState`, one entry per name
+ * in its `joint_names`, in that message's own order. Nothing is derived here:
+ * the controller that computes the error is the one that publishes it.
+ */
+struct AxisError
+{
+  /// The URDF joint name the controller published this row under.
+  std::string joint;
+  /// `error.positions`, rad or m. Feeds `tracking_error` and nothing else.
+  double position_error{0.0};
+  /// `error.velocities`, rad/s or m/s. What `FAULT_TRACKING` is decided on.
+  double velocity_error{0.0};
+  /// False when the controller published no velocity error for this axis.
+  /**
+   * The trajectory controller fills `error.velocities` only when it holds a
+   * velocity state interface *and* a velocity or effort command interface. The
+   * FOLLOW profile gives it both, but a profile that did not would leave the
+   * field empty, and an empty field read as a zero error is a crane that tracks
+   * perfectly by construction. So the absence is carried rather than defaulted:
+   * an axis whose velocity error was not reported is not compared.
+   */
+  bool velocity_error_reported{false};
+};
+
+/// What the node observed of the trajectory controller's state publication.
+struct ControllerStateReport
+{
+  /// False until the first message arrives. As with the other two inputs, a
+  /// stream that stopped is caught by `age` instead.
+  bool received{false};
+  /// `now - header.stamp` of the newest message, s. Negative when the stamp is
+  /// in this node's future, which is a clock fault rather than a fresh sample.
+  double age{0.0};
+  /// One entry per joint the newest message named.
+  std::vector<AxisError> axes;
+};
+
+/// One axis whose velocity error is outside its own tolerance.
+struct TrackingBreach
+{
+  std::string joint;
+  /// Signed, rad/s or m/s. Signed because which way an axis is lagging is the
+  /// first thing anyone looking at a tracking fault wants to know.
+  double velocity_error{0.0};
+  /// The `dq_a` this axis was compared against, same unit.
+  double tolerance{0.0};
+};
+
+/// Everything one decision is made from. Three inputs in this slice; the rest of
 /// the causes of §5 arrive as further members, one issue each.
 struct SupervisorInput
 {
   PendulumStateReport pendulum_state;
   RemoteCtrlReport remote_ctrl;
+  ControllerStateReport controller_state;
   /// The emergency-stop latch as the previous cycle left it.
   /**
    * The latch is state and the core is a pure function, so the state is
@@ -239,10 +370,20 @@ struct SupervisorDecision
 {
   Mode mode{Mode::Idle};
   Fault fault{Fault::StateHealth};
-  /// Max over the actuated joints, rad or m. Not computed in this slice: no
-  /// reference reaches the supervisor yet, so it stays at zero and the message
-  /// says the field is not computed rather than letting a zero read as perfect
-  /// tracking.
+  /// Max over the actuated joints of the absolute *position* error, rad or m,
+  /// as ROS 2 Interfaces §6 fixes the field.
+  /**
+   * An indicator, not a comparison. Four of the six axes are angles and two are
+   * lengths, so the max is taken across two units and the number that wins says
+   * only "this is the largest single-axis deviation anywhere on the crane". The
+   * comparison that decides `FAULT_TRACKING` is per axis, against that axis's
+   * own tolerance, and it is made on the velocity error rather than on this one
+   * -- see the file header.
+   *
+   * Zero when the trajectory controller's state is not arriving. That case is a
+   * fault in its own right, so the zero is never left to read as perfect
+   * tracking.
+   */
   double tracking_error{0.0};
   /// Not computed in this slice: the virtual working cell of §5.1 needs forward
   /// kinematics that `crane_model`'s production backend does not have yet.
@@ -274,7 +415,49 @@ struct ClearFaultOutcome
 };
 
 /// Adopts and checks the margins. Returns false and says why, once, on failure.
+/**
+ * A missing tracking tolerance is deliberately *not* a failure here. It is the
+ * state the workspace is actually in, it is reported rather than refused, and a
+ * supervisor that declined to start over it would take the whole status stream
+ * down for a number that only one of its duties needs.
+ */
 [[nodiscard]] bool validate(const SupervisorConfig & config, std::string & reason);
+
+/// True when a number is a tolerance: finite and positive.
+/**
+ * `tracking_tolerance.yaml` states the rule in its own header and writes the
+ * absent numbers out as `-1.0` rather than omitting them, so that the gap is
+ * visible in the file that will one day carry the value. NaN -- the parameter
+ * default, meaning the file was never loaded -- fails the same test.
+ */
+[[nodiscard]] bool is_tolerance(double dq_a) noexcept;
+
+/// What to say once, at configuration, about the axes that have no tolerance.
+/**
+ * Empty when every configured axis has one. Otherwise it names the axes, says
+ * that they raise no tracking fault, and names the owner of the missing number
+ * -- gate (ii-b) or the identification campaign, both human-only (PRD §14).
+ * Nothing in this package may fill the gap with a plausible default.
+ */
+[[nodiscard]] std::string tracking_tolerance_notice(const SupervisorConfig & config);
+
+/// The reduction ROS 2 Interfaces §6 fixes: max over the actuated joints of the
+/// absolute position error, rad or m. Zero over an empty report.
+[[nodiscard]] double max_position_error(const ControllerStateReport & report) noexcept;
+
+/// The comparison, per axis and in the tolerance's own unit. Worst first.
+/**
+ * Paired by joint name, never by index: `joint_names` is the controller's
+ * ordering and the configuration's is its own. An axis with no tolerance, or
+ * one the controller reported no velocity error for, is not compared -- and is
+ * therefore absent from the result rather than present with a zero.
+ *
+ * "Worst" is by how far past its own tolerance an axis is, not by the raw
+ * error: over six axes in two units the raw magnitudes are not comparable, and
+ * the ratio is.
+ */
+[[nodiscard]] std::vector<TrackingBreach> tracking_breaches(
+  const SupervisorConfig & config, const ControllerStateReport & report);
 
 /// One status cycle. Total: every input produces a decision with a cause.
 [[nodiscard]] SupervisorDecision decide(

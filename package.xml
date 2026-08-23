@@ -19,7 +19,16 @@
        keeps rather than a new dependency of its own (ROS 2 Interfaces §9), and
        it is what `/crane/remote_ctrl_states` is typed with. `std_srvs` is the
        type ROS 2 Interfaces §5 gives `/crane/clear_fault`; a service is not a
-       command path, and the guard test names the one this package may serve. -->
+       command path, and the guard test names the one this package may serve.
+
+       `control_msgs` is ros2_control's own message set, which the Libraries
+       page carries as part of ros2_control rather than package by package. The
+       one type taken from it, `JointTrajectoryControllerState`, is what the
+       forked trajectory controller already publishes about itself. It is read
+       and never sent: this package holds no `trajectory_msgs` type, no action
+       client and no publisher on anything but its own status stream, and the
+       guard test holds it to that. -->
+  <depend>control_msgs</depend>
   <depend>crane_msgs</depend>
   <depend>epsilon_crane_msgs</depend>
   <depend>generate_parameter_library</depend>

@@ -1,6 +1,7 @@
 #include "crane_supervisor/supervisor_node.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -64,7 +65,22 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   const auto parameters = listener.get_params();
   config_.pendulum_state_timeout = parameters.pendulum_state_timeout;
   config_.remote_ctrl_timeout = parameters.remote_ctrl_timeout;
+  config_.controller_state_timeout = parameters.controller_state_timeout;
   config_.deadman_button = static_cast<int>(parameters.deadman_button);
+
+  // The six numbers arrive from `crane_control/config/tracking_tolerance.yaml`
+  // -- the file's node key is the wildcard on purpose, so the seam clamp, the
+  // MPC's constraint margin and this supervisor read the same rows out of the
+  // same file. Nothing is restated here: the declared default is NaN, which is
+  // the absence of a number rather than a number that happens to be small, and
+  // a profile that loads the file for one consumer and not another is a visible
+  // omission rather than a silent disagreement.
+  config_.tracking_tolerance.clear();
+  config_.tracking_tolerance.reserve(parameters.joints.size());
+  for (const std::string & joint : parameters.joints) {
+    config_.tracking_tolerance.push_back(
+      AxisTolerance{joint, parameters.tracking_tolerance.joints_map.at(joint).dq_a});
+  }
 
   // generate_parameter_library has already rejected a value outside the
   // declared bounds. The core is checked against its own rule anyway: it is the
@@ -74,6 +90,16 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   std::string reason;
   if (!validate(config_, reason)) {
     throw std::runtime_error("crane_supervisor: " + reason);
+  }
+
+  // Once, at configuration, and never again: an axis with no tolerance raises no
+  // tracking fault, and a supervisor that stayed quiet about it would be
+  // reporting FAULT_NONE for a check it is not making. It is a warning and not a
+  // refusal -- the number is human-owned and does not exist yet, and taking the
+  // whole status stream down over it would withhold four duties to report one.
+  const std::string notice = tracking_tolerance_notice(config_);
+  if (!notice.empty()) {
+    RCLCPP_WARN(get_logger(), "crane_supervisor: %s", notice.c_str());
   }
 
   status_publisher_ =
@@ -89,6 +115,16 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
     kRemoteCtrlStatesTopic, contract_qos(),
     [this](epsilon_crane_msgs::msg::RemoteCtrlStates::ConstSharedPtr message) {
       remote_ctrl_ = std::move(message);
+    });
+
+  // The third input, and the one that makes the tracking duty of §5 row 1 a
+  // typed cause. The controller that computes the error is the one that
+  // publishes it, so nothing is re-derived here from `/joint_states`.
+  controller_state_subscription_ =
+    create_subscription<control_msgs::msg::JointTrajectoryControllerState>(
+    kControllerStateTopic, contract_qos(),
+    [this](control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr message) {
+      controller_state_ = std::move(message);
     });
 
   // The acknowledgement of ROS 2 Interfaces §5, and the only thing in this
@@ -117,13 +153,13 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
 
   RCLCPP_INFO(
     get_logger(),
-    "crane_supervisor: publishing %s at %.1f Hz. It observes %s and %s -- button %d of the latter "
-    "is the deadman -- serves %s, and does nothing else. It holds no stop authority: the hardware "
-    "stop input is an unverified commissioning prerequisite, so the package has no path to a "
-    "motion command by construction, and what it does with the emergency stop is diagnosis and "
-    "recovery rather than protection.",
+    "crane_supervisor: publishing %s at %.1f Hz. It observes %s, %s -- button %d of it is the "
+    "deadman -- and %s, serves %s, and does nothing else. It holds no stop authority: the "
+    "hardware stop input is an unverified commissioning prerequisite, so the package has no path "
+    "to a motion command by construction, and what it does with the emergency stop is diagnosis "
+    "and recovery rather than protection.",
     kStatusTopic, kStatusRate, kPendulumStateTopic, kRemoteCtrlStatesTopic,
-    config_.deadman_button, kClearFaultService);
+    config_.deadman_button, kControllerStateTopic, kClearFaultService);
 }
 
 SupervisorInput SupervisorNode::observe() const
@@ -150,6 +186,31 @@ SupervisorInput SupervisorNode::observe() const
     // the age is measured the same way as the passive state's and means the
     // same thing.
     input.remote_ctrl.age = (now() - rclcpp::Time(remote_ctrl_->header.stamp)).seconds();
+  }
+
+  if (controller_state_) {
+    const auto & message = *controller_state_;
+    input.controller_state.received = true;
+    // The trajectory controller stamps its state with the control cycle's own
+    // time, the same clock the other two inputs are aged against.
+    input.controller_state.age = (now() - rclcpp::Time(message.header.stamp)).seconds();
+    input.controller_state.axes.reserve(message.joint_names.size());
+    for (std::size_t i = 0; i < message.joint_names.size(); ++i) {
+      AxisError axis;
+      axis.joint = message.joint_names[i];
+      if (i < message.error.positions.size()) {
+        axis.position_error = message.error.positions[i];
+      }
+      // Only when the controller actually published one. It fills
+      // `error.velocities` only with a velocity state interface and a velocity
+      // or effort command interface, and an absent field read as a zero error
+      // would be a crane that tracks perfectly by construction.
+      if (i < message.error.velocities.size()) {
+        axis.velocity_error = message.error.velocities[i];
+        axis.velocity_error_reported = true;
+      }
+      input.controller_state.axes.push_back(std::move(axis));
+    }
   }
 
   return input;

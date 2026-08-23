@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.8)
 project(crane_supervisor)
 
 find_package(ament_cmake REQUIRED)
+find_package(control_msgs REQUIRED)
 find_package(crane_msgs REQUIRED)
 find_package(epsilon_crane_msgs REQUIRED)
 find_package(generate_parameter_library REQUIRED)
@@ -40,6 +41,7 @@ target_link_libraries(supervisor_node
   PUBLIC
     supervisor_core
     rclcpp::rclcpp
+    ${control_msgs_TARGETS}
     ${crane_msgs_TARGETS}
     ${epsilon_crane_msgs_TARGETS}
     ${std_srvs_TARGETS}
@@ -69,7 +71,7 @@ ament_export_include_directories(include)
 # header alone, because a second process linking the node would be a second
 # publisher on a contract stream that has exactly one.
 ament_export_libraries(supervisor_core)
-ament_export_dependencies(crane_msgs epsilon_crane_msgs rclcpp std_srvs)
+ament_export_dependencies(control_msgs crane_msgs epsilon_crane_msgs rclcpp std_srvs)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -99,13 +101,24 @@ if(BUILD_TESTING)
   ament_add_gtest(test_status_stream test/test_status_stream.cpp TIMEOUT 120)
   target_link_libraries(test_status_stream
     supervisor_node
+    ${control_msgs_TARGETS}
     ${crane_msgs_TARGETS}
     ${epsilon_crane_msgs_TARGETS}
     ${std_srvs_TARGETS})
+  # The fixture that proves the *file* is the source of the six numbers: it is
+  # written in the shape `crane_control/config/tracking_tolerance.yaml` has,
+  # wildcard node key and all, so a node that could not read that file cannot
+  # read this one either.
+  target_compile_definitions(test_status_stream PRIVATE
+    CRANE_SUPERVISOR_TEST_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/config")
 
   # The absence that is the feature: no publisher on a command topic, no
   # controller-manager client, nothing that can deactivate a controller.
   ament_add_pytest_test(test_no_command_path test/test_no_command_path.py)
+
+  # The other absence that is a feature: this package keeps no copy of the one
+  # tracking tolerance, so the file that owns it cannot be disagreed with.
+  ament_add_pytest_test(test_no_tolerance_of_its_own test/test_no_tolerance_of_its_own.py)
 endif()
 
 ament_package()

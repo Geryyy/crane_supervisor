@@ -1,12 +1,27 @@
 # The `crane_supervisor` node of ROS 2 Interfaces 2, as the `fake` and
 # `hardware` profiles of crane_bringup compose it.
 #
-# Three parameters, because everything else about this node is a contract rather
-# than a setting: the topic and service names of ROS 2 Interfaces 4 and 5 and the
-# 20 Hz status rate of ROS 2 Interfaces 2 are constants in the source, so a
-# deployment cannot rename or re-rate a stream the task layer and the operator
+# Margins and wiring, because everything else about this node is a contract
+# rather than a setting: the topic and service names of ROS 2 Interfaces 4 and 5
+# and the 20 Hz status rate of ROS 2 Interfaces 2 are constants in the source, so
+# a deployment cannot rename or re-rate a stream the task layer and the operator
 # panel subscribe to. What is left is what is a property of a rig rather than of
-# the architecture: two margins and the wiring of one remote.
+# the architecture: three margins and the wiring of one remote.
+#
+# **`tracking_tolerance` is deliberately absent from this file, exactly as it is
+# from crane_control/config/follow_controllers.yaml.** It is the one number that
+# sizes the seam clamp, the MPC's constraint margin and FAULT_TRACKING here
+# (PRD 6), so it lives in crane_control/config/tracking_tolerance.yaml -- one
+# file, wildcard node key, read by every consumer -- rather than once per
+# consumer. A profile that wants this supervisor to raise FAULT_TRACKING passes
+# that file to this node as a second parameter file; without it every axis
+# reports no tolerance, the supervisor warns once at configuration and names the
+# axes, and tracking_error is still published as a measurement. The numbers do
+# not exist yet, so today no profile passes it and that is the honest state.
+#
+# `joints` is absent for a different reason: the six actuated joints are fixed by
+# ROS 2 Interfaces 3.2 and the declared default already is them. A deployment
+# that restated the list here would only be able to get it wrong.
 crane_supervisor:
   ros__parameters:
     # Seconds. See src/crane_supervisor_parameters.yaml for the derivation and
@@ -19,6 +34,13 @@ crane_supervisor:
     # 5.3, 6.1). Not a safety timing requirement -- the hardware and PLC chain
     # has already acted; this margin only decides how fast the software says so.
     remote_ctrl_timeout: 0.25
+    # Seconds. Past this the trajectory controller counts as no longer
+    # publishing its own state, and the tracking error is reported as unmeasured
+    # rather than as zero: a controller that died must not look like a crane that
+    # is tracking perfectly (control_architecture.md 5.3). Same derivation and
+    # same number as pendulum_state_timeout -- both are 100 Hz streams out of the
+    # manager's cycle, sampled here at 20 Hz.
+    controller_state_timeout: 0.15
     # Which RemoteCtrlStates button the deadman is. 12 is read from the retained
     # stack -- epsilon_crane_behavior_tree's approval gate tests button12, and
     # the TUI maps it to the z key control_architecture.md 6.2 names -- and not

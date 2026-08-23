@@ -33,6 +33,7 @@
 
 #include <memory>
 
+#include "control_msgs/msg/joint_trajectory_controller_state.hpp"
 #include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
 #include "crane_supervisor/supervisor_core.hpp"
@@ -55,6 +56,23 @@ inline constexpr char kPendulumStateTopic[] = "/crane/pendulum_state";
 inline constexpr char kRemoteCtrlStatesTopic[] = "/crane/remote_ctrl_states";
 inline constexpr char kClearFaultService[] = "/crane/clear_fault";
 inline constexpr double kStatusRate = 20.0;
+
+/// Where the trajectory controller's own state publication is read from.
+/**
+ * The trajectory controller publishes it on its *private* `~/controller_state`,
+ * which resolves under whatever the deployment named that controller
+ * (`trajectory_controller_a2b` in the FOLLOW profile). §1 forbids relying on
+ * that: cross-node contracts are absolute and live under `/crane/...`, and a
+ * subscriber that reached into another node's namespace would break the first
+ * time a second trajectory controller was loaded.
+ *
+ * So this node subscribes to the contract name and to nothing else, exactly as
+ * it does for the remote -- whose producer, `gpio_controller`, likewise
+ * publishes on a private name. Lining the two up is a remap and belongs to
+ * whoever composes the profile. ROS 2 Interfaces §4 does not yet carry a row for
+ * this stream; the name follows §1's rule and the row is owed.
+ */
+inline constexpr char kControllerStateTopic[] = "/crane/controller_state";
 
 /// The configured deadman, out of the twelve booleans the message carries.
 /**
@@ -105,6 +123,10 @@ private:
   /// one. Held for the same reason, and for one more: its absence is what §6.1
   /// reads as an asserted stop.
   epsilon_crane_msgs::msg::RemoteCtrlStates::ConstSharedPtr remote_ctrl_;
+  /// The newest message on `/crane/controller_state`, or null before the first
+  /// one. Held for the same reason as the other two: a trajectory controller
+  /// that stopped publishing is not a crane that is tracking perfectly.
+  control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr controller_state_;
   /// The emergency-stop latch, carried from one decision into the next. Raised
   /// by `decide()`, lowered only by an acknowledged `/crane/clear_fault`.
   bool estop_latched_{false};
@@ -116,6 +138,8 @@ private:
   rclcpp::Subscription<crane_msgs::msg::PendulumState>::SharedPtr pendulum_state_subscription_;
   rclcpp::Subscription<epsilon_crane_msgs::msg::RemoteCtrlStates>::SharedPtr
     remote_ctrl_subscription_;
+  rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    controller_state_subscription_;
   rclcpp::Publisher<crane_msgs::msg::SupervisorStatus>::SharedPtr status_publisher_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_fault_service_;
   rclcpp::TimerBase::SharedPtr status_timer_;

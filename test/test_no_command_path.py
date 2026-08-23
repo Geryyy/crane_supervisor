@@ -34,11 +34,13 @@ NON_SOURCE_DIRECTORIES = {".git", "__pycache__", "build", "install", "log"}
 STATUS_TOPIC = "/crane/supervisor/status"
 PENDULUM_STATE_TOPIC = "/crane/pendulum_state"
 REMOTE_CTRL_STATES_TOPIC = "/crane/remote_ctrl_states"
+CONTROLLER_STATE_TOPIC = "/crane/controller_state"
 CLEAR_FAULT_SERVICE = "/crane/clear_fault"
 PERMITTED_ROS_NAMES = {
     STATUS_TOPIC,
     PENDULUM_STATE_TOPIC,
     REMOTE_CTRL_STATES_TOPIC,
+    CONTROLLER_STATE_TOPIC,
     CLEAR_FAULT_SERVICE,
 }
 
@@ -61,6 +63,14 @@ FORBIDDEN_ROS_NAMES = ("/controller_manager", "/joint_states", "/cbs/")
 # What replaces the blanket ban is narrower and stricter: the test below names
 # the one service this package may serve and the one type it may serve it with,
 # so `/crane/set_mode`, which is still a later issue, cannot arrive unnoticed.
+#
+# `JointTrajectory` came off it the same way, and for the same kind of reason: it
+# was a stand-in for `trajectory_msgs`, the package a *commanded* trajectory is
+# typed with, and it also matched `control_msgs/JointTrajectoryControllerState`
+# -- which is a controller describing itself, subscribed to and never published.
+# The ban is now on the package that carries the command type, so a
+# `trajectory_msgs::msg::JointTrajectory` publisher still cannot appear, and the
+# subscription test below pins the exact three types this node consumes.
 FORBIDDEN_IDENTIFIERS = (
     "controller_manager",
     "SwitchController",
@@ -73,7 +83,7 @@ FORBIDDEN_IDENTIFIERS = (
     "CommandInterface",
     "hardware_interface",
     "controller_interface",
-    "JointTrajectory",
+    "trajectory_msgs",
     "FollowJointTrajectory",
     "JointJog",
     "Twist",
@@ -93,6 +103,7 @@ PERMITTED_DEPENDENCIES = {
     "ament_cmake",
     "ament_cmake_gtest",
     "ament_cmake_pytest",
+    "control_msgs",
     "crane_model",
     "crane_msgs",
     "epsilon_crane_msgs",
@@ -205,6 +216,7 @@ def test_the_package_publishes_one_stream_and_only_reads_its_inputs():
     assert subscriptions == [
         "crane_msgs::msg::PendulumState",
         "epsilon_crane_msgs::msg::RemoteCtrlStates",
+        "control_msgs::msg::JointTrajectoryControllerState",
     ], subscriptions
     assert services == PERMITTED_SERVICE_TYPES, services
 

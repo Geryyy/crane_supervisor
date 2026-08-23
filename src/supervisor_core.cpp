@@ -1,8 +1,11 @@
 #include "crane_supervisor/supervisor_core.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace crane_supervisor
 {
@@ -53,12 +56,88 @@ constexpr char kNoStatusGiven[] =
 
 constexpr char kObserving[] =
   "no fault: the passive joint state is arriving inside its margin and pendulum_state_broadcaster "
-  "reports it usable, the operator remote is arriving, its emergency stop is released and nothing "
+  "reports it usable, the trajectory controller's own state is arriving and no axis is outside "
+  "its tolerance, the operator remote is arriving, its emergency stop is released and nothing "
   "is latched, and the deadman is held. Those are the only inputs this supervisor watches -- "
-  "tracking, working cell, solver, sway and reference are not observed yet, tracking_error and "
-  "inside_working_cell are not computed and carry the value that claims nothing, and the "
-  "supervisor holds no stop authority until the hardware stop input is verified. Read FAULT_NONE "
-  "as 'nothing this supervisor watches is wrong', not as 'the machine is safe'.";
+  "working cell, solver, sway and reference are not observed yet, inside_working_cell is not "
+  "computed and carries the value that claims nothing, and the supervisor holds no stop "
+  "authority until the hardware stop input is verified. Read FAULT_NONE as 'nothing this "
+  "supervisor watches is wrong', not as 'the machine is safe'.";
+
+// The trajectory controller's own state publication, and the tracking duty of
+// wiki/control_architecture.md §5 row 1 that is decided from it. Three of these
+// are §5.3's rule applied to a third input -- a controller that stopped
+// publishing its error is not a crane that is tracking perfectly -- and the
+// fourth is the typed cause §5.0 exists to produce.
+constexpr char kControllerStateNeverArrived[] =
+  "state health: no control_msgs/JointTrajectoryControllerState has arrived on "
+  "/crane/controller_state since this supervisor started, so the tracking error is not being "
+  "measured at all and tracking_error carries 0.0 as the absence of a measurement rather than as "
+  "perfect tracking. Check that the trajectory controller is loaded and active on the controller "
+  "manager and that its private controller_state output reaches the contract name.";
+
+constexpr char kControllerStateStoppedArriving[] =
+  "state health: the trajectory controller stopped publishing its own state, so the tracking "
+  "error is no longer measured. The newest control_msgs/JointTrajectoryControllerState on "
+  "/crane/controller_state is ";
+
+constexpr char kControllerStateStoppedArrivingTail[] =
+  " s old, past the configured margin of ";
+
+constexpr char kControllerStateStoppedArrivingAdvice[] =
+  " s. A controller that died must not look like one that is tracking perfectly, so this is a "
+  "fault and not a tracking_error of zero: check the controller manager's cycle and whether the "
+  "trajectory controller is still active.";
+
+constexpr char kControllerStateStampAhead[] =
+  "state health: the age of the trajectory controller's state cannot be judged. The newest "
+  "control_msgs/JointTrajectoryControllerState on /crane/controller_state is stamped ";
+
+constexpr char kControllerStateStampAheadTail[] =
+  " s in this supervisor's future, further ahead than the configured margin of ";
+
+constexpr char kControllerStateStampAheadAdvice[] =
+  " s. Synchronise the clock of the host publishing it with this one; until then a tracking error "
+  "measured a moment ago and one measured a minute ago are indistinguishable.";
+
+constexpr char kTrackingExceeded[] =
+  "tracking: the velocity-tracking tolerance is exceeded on ";
+
+constexpr char kTrackingExceededTail[] =
+  ". This is the typed cause the behaviour tree branches on -- the decision to retry, abandon or "
+  "re-approach stays in the task layer, which has the context to make it; what this report "
+  "replaces is the stall inferred from a deliberately tight goal tolerance. Nothing was stopped, "
+  "ramped or commanded here. tracking_error on this report is the largest absolute position "
+  "error over the actuated joints, in rad or m as ROS 2 Interfaces 6 fixes that field; the "
+  "comparison above is per axis on the velocity error, because the tolerance in "
+  "crane_control/config/tracking_tolerance.yaml is a velocity tolerance.";
+
+constexpr char kNoAxisCompared[] =
+  " No axis is being compared against a tolerance, so tracking_error is a measurement and not a "
+  "verdict: ";
+
+constexpr char kNoToleranceAtAll[] =
+  "no per-axis velocity-tracking tolerance is configured. The number does not exist yet -- it "
+  "comes from merge gate (ii-b) or from the identification campaign, both human-only -- and it "
+  "belongs in crane_control/config/tracking_tolerance.yaml, which is the one file the seam clamp, "
+  "the MPC's constraint margin and this supervisor all read, so that they cannot drift apart.";
+
+constexpr char kNoVelocityErrorReported[] =
+  "a tolerance is configured but the trajectory controller reports no velocity error for the axes "
+  "it covers. It fills that field only when it holds a velocity state interface and a velocity or "
+  "effort command interface; a profile that gives it neither leaves the field empty, and an empty "
+  "field must not be read as a zero error.";
+
+constexpr char kNoticeHead[] =
+  "no velocity-tracking tolerance for ";
+
+constexpr char kNoticeTail[] =
+  ". Those axes raise no FAULT_TRACKING and tracking_error is still reported for them as a "
+  "measurement. A value that is not finite and positive is not a tolerance, and this supervisor "
+  "does not stand one at a plausible default: the number comes from merge gate (ii-b) or from the "
+  "identification campaign (PRD 14), both human-only, and it goes in "
+  "crane_control/config/tracking_tolerance.yaml -- read by the seam clamp, by the MPC's "
+  "constraint margin and by this supervisor, so that one number cannot become three.";
 
 // The emergency stop and the deadman. Every one of these says the same thing
 // about what it is for, because the sentence is the point: this software path is
@@ -158,6 +237,74 @@ std::string seconds_text(double seconds)
   return std::string(buffer);
 }
 
+/// A joint-space quantity as text. Four decimals, which is a tenth of a
+/// milliradian and a tenth of a millimetre -- finer than anything this machine
+/// resolves, and coarse enough not to print a double's tail at an operator.
+std::string quantity_text(double value)
+{
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "%.4f", value);
+  return std::string(buffer);
+}
+
+/// The unit of one axis, from its URDF name.
+/**
+ * ROS 2 Interfaces §3.1 splits the actuated set into four `theta*` revolute
+ * axes and two `q*` prismatic ones, and the split is what makes the max in
+ * `tracking_error` a mixed-unit number. The unit is read off the name rather
+ * than tabulated, because a table would be a second place for the split to be
+ * written down and the naming rule is nomenclature §4's, not this file's.
+ */
+const char * angular_or_linear(const std::string & joint, bool per_second)
+{
+  const bool angular = !joint.empty() && joint.front() == 't';
+  if (per_second) {
+    return angular ? "rad/s" : "m/s";
+  }
+  return angular ? "rad" : "m";
+}
+
+/// What a stream is doing, with never-started separated from stopped.
+/**
+ * The same three absences the passive state is judged by, named once so the
+ * trajectory controller's state is judged the same way rather than by a second
+ * copy of the same three comparisons.
+ */
+enum class StreamState
+{
+  NeverArrived,
+  StoppedArriving,
+  StampAhead,
+  Arriving,
+};
+
+StreamState stream_state(double timeout, bool received, double age)
+{
+  if (!received) {
+    return StreamState::NeverArrived;
+  }
+  if (age > timeout) {
+    return StreamState::StoppedArriving;
+  }
+  if (age < -timeout) {
+    return StreamState::StampAhead;
+  }
+  return StreamState::Arriving;
+}
+
+/// `a`, `a and b`, `a, b and c` -- a list an operator reads as a sentence.
+std::string joined(const std::vector<std::string> & items)
+{
+  std::string text;
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (i > 0) {
+      text += (i + 1 == items.size()) ? " and " : ", ";
+    }
+    text += items[i];
+  }
+  return text;
+}
+
 /// What the stop signal is doing, with absence separated from assertion.
 /**
  * Four of the five are §6.1's "treat absence as asserted" and only `Released`
@@ -223,6 +370,38 @@ std::string stop_message(
   return std::string(kStopLatched) + kDiagnosisNotProtection;
 }
 
+/// Why no axis was compared this cycle, or empty when at least one was.
+/**
+ * Two different absences, and they are not the same thing to chase: nobody has
+ * measured the tolerance yet, or the tolerance exists and the controller is not
+ * publishing the quantity it applies to.
+ */
+std::string nothing_compared_reason(
+  const SupervisorConfig & config, const ControllerStateReport & report)
+{
+  bool any_tolerance = false;
+  for (const AxisTolerance & tolerance : config.tracking_tolerance) {
+    if (!is_tolerance(tolerance.dq_a)) {
+      continue;
+    }
+    any_tolerance = true;
+    for (const AxisError & axis : report.axes) {
+      if (axis.joint == tolerance.joint && axis.velocity_error_reported) {
+        return {};
+      }
+    }
+  }
+  return any_tolerance ? kNoVelocityErrorReported : kNoToleranceAtAll;
+}
+
+/// One axis of a tracking fault, in the operator's terms and with its unit.
+std::string breach_text(const TrackingBreach & breach)
+{
+  return breach.joint + " (velocity error " + quantity_text(breach.velocity_error) + " " +
+         angular_or_linear(breach.joint, true) + ", tolerance " + quantity_text(breach.tolerance) +
+         " " + angular_or_linear(breach.joint, true) + ")";
+}
+
 }  // namespace
 
 bool validate(const SupervisorConfig & config, std::string & reason)
@@ -241,6 +420,23 @@ bool validate(const SupervisorConfig & config, std::string & reason)
       "number would report a dead reader as a released button";
     return false;
   }
+  if (!std::isfinite(config.controller_state_timeout) || config.controller_state_timeout <= 0.0) {
+    reason =
+      "controller_state_timeout must be a finite positive number of seconds; a margin of zero or "
+      "less would report the trajectory controller dead on every cycle, and one that is not a "
+      "number would let a controller that stopped publishing pass for a crane that is tracking "
+      "perfectly";
+    return false;
+  }
+  for (const AxisTolerance & axis : config.tracking_tolerance) {
+    if (axis.joint.empty()) {
+      reason =
+        "every tracking tolerance names the URDF joint it belongs to; an unnamed one can never be "
+        "paired with an axis of the trajectory controller's joint_names and would be a tolerance "
+        "that silently applies to nothing";
+      return false;
+    }
+  }
   if (config.deadman_button < kFirstButton || config.deadman_button > kLastButton) {
     reason =
       "deadman_button must name one of the twelve booleans of "
@@ -249,6 +445,62 @@ bool validate(const SupervisorConfig & config, std::string & reason)
     return false;
   }
   return true;
+}
+
+bool is_tolerance(double dq_a) noexcept
+{
+  return std::isfinite(dq_a) && dq_a > 0.0;
+}
+
+std::string tracking_tolerance_notice(const SupervisorConfig & config)
+{
+  std::vector<std::string> missing;
+  for (const AxisTolerance & axis : config.tracking_tolerance) {
+    if (!is_tolerance(axis.dq_a)) {
+      missing.push_back(axis.joint);
+    }
+  }
+  if (missing.empty()) {
+    return {};
+  }
+  return kNoticeHead + joined(missing) + kNoticeTail;
+}
+
+double max_position_error(const ControllerStateReport & report) noexcept
+{
+  double worst = 0.0;
+  for (const AxisError & axis : report.axes) {
+    worst = std::max(worst, std::abs(axis.position_error));
+  }
+  return worst;
+}
+
+std::vector<TrackingBreach> tracking_breaches(
+  const SupervisorConfig & config, const ControllerStateReport & report)
+{
+  std::vector<TrackingBreach> breaches;
+  for (const AxisTolerance & tolerance : config.tracking_tolerance) {
+    if (!is_tolerance(tolerance.dq_a)) {
+      continue;
+    }
+    for (const AxisError & axis : report.axes) {
+      if (axis.joint != tolerance.joint || !axis.velocity_error_reported) {
+        continue;
+      }
+      if (std::abs(axis.velocity_error) > tolerance.dq_a) {
+        breaches.push_back({tolerance.joint, axis.velocity_error, tolerance.dq_a});
+      }
+      break;
+    }
+  }
+
+  std::stable_sort(
+    breaches.begin(), breaches.end(),
+    [](const TrackingBreach & left, const TrackingBreach & right) {
+      return std::abs(left.velocity_error) / left.tolerance >
+             std::abs(right.velocity_error) / right.tolerance;
+    });
+  return breaches;
 }
 
 SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput & input)
@@ -260,7 +512,19 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
 
   const PendulumStateReport & state = input.pendulum_state;
   const RemoteCtrlReport & remote = input.remote_ctrl;
+  const ControllerStateReport & controller = input.controller_state;
   const StopSignal signal = stop_signal(config, remote);
+  const StreamState tracking_stream =
+    stream_state(config.controller_state_timeout, controller.received, controller.age);
+
+  // Filled before any branch returns, for the same reason `deadman_held` is: it
+  // is a field of its own on every report, so the largest deviation on the crane
+  // stays visible in the cycles where a more consequential cause owns `fault`.
+  // Zero while the stream is not arriving -- and that case is itself a fault
+  // below, so the zero is never the only thing said about it.
+  if (tracking_stream == StreamState::Arriving) {
+    decision.tracking_error = max_position_error(controller);
+  }
 
   // Filled before any branch returns, because it is owed on *every* status and
   // not only on the ones where the deadman is what went wrong. It is also the
@@ -314,7 +578,48 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
     return decision;
   }
 
-  // Last of the three, and continuous rather than checked once at the start of a
+  // The freshness of the input the tracking comparison consumes, judged before
+  // the comparison and not after it: §5.3 allows no input to stop arriving
+  // without a defined consequence, and the consequence here is that the error
+  // is unmeasured rather than zero.
+  switch (tracking_stream) {
+    case StreamState::NeverArrived:
+      decision.fault = Fault::StateHealth;
+      decision.message = kControllerStateNeverArrived;
+      return decision;
+    case StreamState::StoppedArriving:
+      decision.fault = Fault::StateHealth;
+      decision.message = kControllerStateStoppedArriving + seconds_text(controller.age) +
+        kControllerStateStoppedArrivingTail + seconds_text(config.controller_state_timeout) +
+        kControllerStateStoppedArrivingAdvice;
+      return decision;
+    case StreamState::StampAhead:
+      decision.fault = Fault::StateHealth;
+      decision.message = kControllerStateStampAhead + seconds_text(-controller.age) +
+        kControllerStateStampAheadTail + seconds_text(config.controller_state_timeout) +
+        kControllerStateStampAheadAdvice;
+      return decision;
+    case StreamState::Arriving:
+      break;
+  }
+
+  // §5 row 1, as a typed cause. Per axis and in the tolerance's own unit,
+  // because a max over rad/s and m/s decides nothing; the single number on the
+  // wire is the indicator and this is the verdict. The decision about what to do
+  // next is not made here and is not made by this supervisor at all (§5.0).
+  const std::vector<TrackingBreach> breaches = tracking_breaches(config, controller);
+  if (!breaches.empty()) {
+    std::vector<std::string> texts;
+    texts.reserve(breaches.size());
+    for (const TrackingBreach & breach : breaches) {
+      texts.push_back(breach_text(breach));
+    }
+    decision.fault = Fault::Tracking;
+    decision.message = kTrackingExceeded + joined(texts) + kTrackingExceededTail;
+    return decision;
+  }
+
+  // Last of the four, and continuous rather than checked once at the start of a
   // motion (§6.2). It is last because it is the only one of them that is a fact
   // about the operator rather than a defect: a released deadman is the ordinary
   // resting state of the machine, and letting it outrank a dead publisher would
@@ -328,6 +633,12 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
 
   decision.fault = Fault::None;
   decision.message = kObserving;
+  // A clear report must not imply a check nobody made. When no axis could be
+  // compared, the sentence above is amended rather than left to stand.
+  const std::string uncompared = nothing_compared_reason(config, controller);
+  if (!uncompared.empty()) {
+    decision.message += kNoAxisCompared + uncompared;
+  }
   return decision;
 }
 

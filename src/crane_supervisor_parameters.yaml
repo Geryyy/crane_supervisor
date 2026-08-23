@@ -41,6 +41,68 @@ crane_supervisor:
       underneath a running stream is not one anybody can reason about."
     validation:
       bounds<>: [0.001, 10.0]
+  controller_state_timeout:
+    type: double
+    default_value: 0.15
+    read_only: true
+    description: "Longest age of the newest
+      control_msgs/JointTrajectoryControllerState on /crane/controller_state that
+      still counts as arriving, s. Past it the supervisor reports
+      FAULT_STATE_HEALTH and says the tracking error is unmeasured, because a
+      trajectory controller that stopped publishing is not a crane that is
+      tracking perfectly and a tracking_error of zero must never be the only
+      thing said about it (wiki/control_architecture.md 5.3). Derived exactly as
+      pendulum_state_timeout is and to the same number: the controller publishes
+      its state once per update(), ungated, inside the manager's 100 Hz cycle,
+      and this node samples it at 20 Hz, so a healthy sample is up to 60 ms old
+      when it is read and the worst control-cycle gap in the recorded machine
+      data adds a further 50.4 ms. 150 ms clears the resulting 110 ms.
+      Read-only, for the reason the other two margins are: a margin an operator
+      can move underneath a running stream makes the status unreproducible."
+    validation:
+      bounds<>: [0.001, 10.0]
+  joints:
+    type: string_array
+    default_value:
+      - theta1_slewing_joint
+      - theta2_boom_joint
+      - theta3_arm_joint
+      - q4_big_telescope
+      - theta8_rotator_joint
+      - q9_left_rail_joint
+    read_only: true
+    description: "URDF names of the six actuated joints, as ROS 2 Interfaces 3.1
+      spells them and 3.2 fixes the set. This is the list tracking_tolerance
+      below is keyed on, and the names the trajectory controller reports in
+      joint_names -- axes are paired by name and never by index, because the
+      controller's ordering is its own. It is a list of names and not of numbers:
+      nothing about the tolerance itself is stated here. Read-only, and fixed at
+      n_a = 6, because the actuated set is a property of the machine."
+    validation:
+      unique<>: null
+      fixed_size<>: [6]
+  tracking_tolerance:
+    __map_joints:
+      dq_a:
+        type: double
+        default_value: .NAN
+        description: "The per-axis velocity-tracking tolerance, rad/s on the four
+          angles and m/s on the two lengths. **One number, now four consumers**
+          (PRD 6 and 10): the seam clamp in crane_velocity_controller, the MPC's
+          constraint margin, the D4 acceptance measure, and FAULT_TRACKING here.
+          It is declared with a NaN default and is never given a value in this
+          package's own configuration: the value lives in
+          crane_control/config/tracking_tolerance.yaml, whose node key is the
+          wildcard so that every consumer reads the same six rows out of the same
+          file and they cannot drift apart. The number does not exist yet -- all
+          six rows in that file are negative and say so -- and it comes from merge
+          gate (ii-b) or from the identification campaign, both human-only, because
+          mock hardware mirrors commands into states exactly and the tracking error
+          there is identically zero. A value that is not finite and positive is not
+          a tolerance: that axis raises no FAULT_TRACKING, the supervisor warns once
+          at configuration and names the axis and the owner of the missing number,
+          and tracking_error goes on being reported as a measurement. A fabricated
+          default would be worse than the gap."
   deadman_button:
     type: int
     default_value: 12

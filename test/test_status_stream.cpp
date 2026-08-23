@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "control_msgs/msg/joint_trajectory_controller_state.hpp"
 #include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
 #include "crane_supervisor/supervisor_node.hpp"
@@ -30,10 +31,17 @@
 namespace
 {
 
+using control_msgs::msg::JointTrajectoryControllerState;
 using crane_msgs::msg::PendulumState;
 using crane_msgs::msg::SupervisorStatus;
 using epsilon_crane_msgs::msg::RemoteCtrlStates;
 using std_srvs::srv::Trigger;
+
+/// The six actuated joints of ROS 2 Interfaces §3.2, as the trajectory
+/// controller publishes them in `joint_names`.
+const std::vector<std::string> kActuatedJoints{
+  "theta1_slewing_joint", "theta2_boom_joint", "theta3_arm_joint",
+  "q4_big_telescope", "theta8_rotator_joint", "q9_left_rail_joint"};
 
 /// Shorter than the shipped margin so that "the stream stopped" is reachable
 /// inside a test budget.  It is an override of the declared parameter, not a
@@ -72,13 +80,22 @@ public:
 class StatusStream : public ::testing::Test
 {
 protected:
-  void SetUp() override
+  /// How the node under test is built. Overridden by the fixture that hands it
+  /// a tracking tolerance, so that both fixtures run the deployment's node
+  /// rather than a second one written for the test.
+  virtual rclcpp::NodeOptions node_options() const
   {
     rclcpp::NodeOptions options;
     options.parameter_overrides(
       {rclcpp::Parameter("pendulum_state_timeout", kTestTimeout),
-        rclcpp::Parameter("remote_ctrl_timeout", kTestTimeout)});
-    supervisor_ = std::make_shared<crane_supervisor::SupervisorNode>(options);
+        rclcpp::Parameter("remote_ctrl_timeout", kTestTimeout),
+        rclcpp::Parameter("controller_state_timeout", kTestTimeout)});
+    return options;
+  }
+
+  void SetUp() override
+  {
+    supervisor_ = std::make_shared<crane_supervisor::SupervisorNode>(node_options());
 
     observer_ = std::make_shared<rclcpp::Node>("crane_supervisor_stream_observer");
     const rclcpp::QoS qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile();
@@ -89,6 +106,8 @@ protected:
       crane_supervisor::kPendulumStateTopic, qos);
     remote_ctrl_ = observer_->create_publisher<RemoteCtrlStates>(
       crane_supervisor::kRemoteCtrlStatesTopic, qos);
+    controller_state_ = observer_->create_publisher<JointTrajectoryControllerState>(
+      crane_supervisor::kControllerStateTopic, qos);
     clear_fault_ = observer_->create_client<Trigger>(crane_supervisor::kClearFaultService);
 
     executor_.add_node(supervisor_);
@@ -139,8 +158,40 @@ protected:
     return message;
   }
 
-  /// Publish both inputs once, stamped now.
-  void publish(const PendulumState & state, const RemoteCtrlStates & remote)
+  /// What the forked trajectory controller publishes when it is tracking.
+  /**
+   * Six joints, `error.positions` and `error.velocities` both filled -- which is
+   * what the FOLLOW profile produces, since it gives the controller a velocity
+   * state interface and a velocity command interface.
+   */
+  JointTrajectoryControllerState tracking_controller_state() const
+  {
+    JointTrajectoryControllerState message;
+    message.header.stamp = observer_->now();
+    message.joint_names = kActuatedJoints;
+    message.error.positions.assign(kActuatedJoints.size(), 0.0);
+    message.error.velocities.assign(kActuatedJoints.size(), 0.0);
+    return message;
+  }
+
+  /// The same, with one axis out by `position_error` and `velocity_error`.
+  JointTrajectoryControllerState controller_state_with_error(
+    const std::string & joint, double position_error, double velocity_error) const
+  {
+    JointTrajectoryControllerState message = tracking_controller_state();
+    for (std::size_t i = 0; i < message.joint_names.size(); ++i) {
+      if (message.joint_names[i] == joint) {
+        message.error.positions[i] = position_error;
+        message.error.velocities[i] = velocity_error;
+      }
+    }
+    return message;
+  }
+
+  /// Publish all three inputs once, stamped now.
+  void publish(
+    const PendulumState & state, const RemoteCtrlStates & remote,
+    const JointTrajectoryControllerState & controller)
   {
     PendulumState fresh_state = state;
     fresh_state.header.stamp = observer_->now();
@@ -149,16 +200,32 @@ protected:
     RemoteCtrlStates fresh_remote = remote;
     fresh_remote.header.stamp = observer_->now();
     remote_ctrl_->publish(fresh_remote);
+
+    JointTrajectoryControllerState fresh_controller = controller;
+    fresh_controller.header.stamp = observer_->now();
+    controller_state_->publish(fresh_controller);
   }
 
-  /// Spin, publishing both inputs every pass, until the newest report is `fault`.
-  bool drive_to(std::uint8_t fault, const PendulumState & state, const RemoteCtrlStates & remote)
+  void publish(const PendulumState & state, const RemoteCtrlStates & remote)
+  {
+    publish(state, remote, tracking_controller_state());
+  }
+
+  /// Spin, publishing every input every pass, until the newest report is `fault`.
+  bool drive_to(
+    std::uint8_t fault, const PendulumState & state, const RemoteCtrlStates & remote,
+    const JointTrajectoryControllerState & controller)
   {
     return spin_until(
       [this, fault]() {
         return !received_.empty() && received_.back().fault == fault;
       },
-      [this, &state, &remote]() {publish(state, remote);});
+      [this, &state, &remote, &controller]() {publish(state, remote, controller);});
+  }
+
+  bool drive_to(std::uint8_t fault, const PendulumState & state, const RemoteCtrlStates & remote)
+  {
+    return drive_to(fault, state, remote, tracking_controller_state());
   }
 
   bool drive_to(std::uint8_t fault, const PendulumState & state)
@@ -209,8 +276,33 @@ protected:
   rclcpp::Subscription<SupervisorStatus>::SharedPtr status_;
   rclcpp::Publisher<PendulumState>::SharedPtr pendulum_state_;
   rclcpp::Publisher<RemoteCtrlStates>::SharedPtr remote_ctrl_;
+  rclcpp::Publisher<JointTrajectoryControllerState>::SharedPtr controller_state_;
   rclcpp::Client<Trigger>::SharedPtr clear_fault_;
   std::vector<SupervisorStatus> received_;
+};
+
+/// The same node, handed the six numbers out of a file in the shape
+/// `crane_control/config/tracking_tolerance.yaml` has.
+/**
+ * A `--params-file`, not a `parameter_overrides` list, and the fixture keeps the
+ * real file's wildcard node key: what is asserted is that this node can read the
+ * file the seam clamp and the MPC read, not that it can be handed six doubles.
+ * The numbers in the fixture are arbitrary and its own header says so -- the
+ * tolerance for any machine comes from merge gate (ii-b) or the identification
+ * campaign, both human-only, and no automated test in this workspace can produce
+ * one.
+ */
+class StatusStreamWithTolerances : public StatusStream
+{
+protected:
+  rclcpp::NodeOptions node_options() const override
+  {
+    rclcpp::NodeOptions options = StatusStream::node_options();
+    options.arguments(
+      {"--ros-args", "--params-file",
+        std::string(CRANE_SUPERVISOR_TEST_CONFIG_DIR) + "/tracking_tolerance_fixture.yaml"});
+    return options;
+  }
 };
 
 }  // namespace
@@ -434,6 +526,144 @@ TEST_F(StatusStream, ThePendulumStateIsCarriedEndToEnd)
   ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_STATE_HEALTH, degraded));
   EXPECT_NE(received_.back().message.find(degraded.status), std::string::npos)
     << received_.back().message;
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStream, TheTrackingErrorIsCarriedEndToEndFromTheControllersOwnState)
+{
+  // The error is not re-derived from `/joint_states`: the controller that
+  // computes it publishes it, and this is the whole path from that publication
+  // to the field ROS 2 Interfaces §6 fixes -- max over the actuated joints of
+  // the absolute position error, rad or m.
+  ASSERT_TRUE(
+    drive_to(
+      SupervisorStatus::FAULT_NONE, trusted_state(), held_remote(),
+      controller_state_with_error("theta3_arm_joint", -0.25, 0.0)))
+    << received_.back().message;
+  EXPECT_DOUBLE_EQ(received_.back().tracking_error, 0.25);
+
+  // Without a tolerance nothing is compared, and the clear report says which of
+  // the two absences that is rather than implying a check nobody made.
+  EXPECT_NE(received_.back().message.find("No axis is being compared"), std::string::npos)
+    << received_.back().message;
+  EXPECT_NE(received_.back().message.find("human-only"), std::string::npos)
+    << received_.back().message;
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStream, AControllerThatStopsPublishingIsAFaultAndNotAZeroError)
+{
+  ASSERT_TRUE(
+    drive_to(
+      SupervisorStatus::FAULT_NONE, trusted_state(), held_remote(),
+      controller_state_with_error("q4_big_telescope", 0.31, 0.0)))
+    << received_.back().message;
+  EXPECT_DOUBLE_EQ(received_.back().tracking_error, 0.31);
+
+  // The other two inputs keep arriving and the trajectory controller stops.
+  // wiki/control_architecture.md §5.3: an input that stops arriving has a
+  // defined consequence, and here the consequence is that the error is reported
+  // as unmeasured rather than republished or quietly zeroed into a clear report.
+  ASSERT_TRUE(
+    spin_until(
+      [this]() {
+        return received_.back().fault == SupervisorStatus::FAULT_STATE_HEALTH;
+      },
+      [this]() {
+        PendulumState state = trusted_state();
+        state.header.stamp = observer_->now();
+        pendulum_state_->publish(state);
+        RemoteCtrlStates remote = held_remote();
+        remote.header.stamp = observer_->now();
+        remote_ctrl_->publish(remote);
+      }))
+    << received_.back().message;
+  EXPECT_NE(received_.back().message.find("stopped publishing its own state"), std::string::npos)
+    << received_.back().message;
+  EXPECT_DOUBLE_EQ(received_.back().tracking_error, 0.0);
+
+  // And it recovers on its own when the controller comes back: a stale input is
+  // not a latch.
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
+    << received_.back().message;
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStreamWithTolerances, ATrackingExcessIsATypedCauseThatNamesTheAxis)
+{
+  // wiki/control_architecture.md §5.0, end to end: the behaviour tree gets a
+  // constant it can branch on and a message that says which axis, instead of a
+  // stall inferred from a deliberately tight goal tolerance.
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
+    << received_.back().message;
+  // With every axis inside its tolerance the clear report makes no excuse.
+  EXPECT_EQ(received_.back().message.find("No axis is being compared"), std::string::npos)
+    << received_.back().message;
+
+  // theta2_boom_joint's fixture tolerance is 0.02 rad/s.
+  ASSERT_TRUE(
+    drive_to(
+      SupervisorStatus::FAULT_TRACKING, trusted_state(), held_remote(),
+      controller_state_with_error("theta2_boom_joint", 0.11, 0.09)))
+    << received_.back().message;
+  EXPECT_NE(received_.back().message.find("theta2_boom_joint"), std::string::npos)
+    << received_.back().message;
+  EXPECT_NE(received_.back().message.find("rad/s"), std::string::npos)
+    << received_.back().message;
+  // The reported number stays what §6 says it is -- the position error, rad or
+  // m -- while the verdict above it was made per axis on the velocity error.
+  EXPECT_DOUBLE_EQ(received_.back().tracking_error, 0.11);
+
+  // It clears itself when the axis comes back inside: tracking is a fact about
+  // the machine right now, not a latch.
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
+    << received_.back().message;
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStreamWithTolerances, TheSixNumbersComeOutOfAFileInTheSharedShape)
+{
+  // The tolerance is one number with four consumers and it lives in one file
+  // (PRD §6). This asserts the loading path rather than the values: the fixture
+  // uses the real file's wildcard node key and its `tracking_tolerance.<joint>.
+  // dq_a` keys, and it gives each axis a different number so that a node that
+  // paired them by index would be caught here.
+  const auto & tolerances = supervisor_->config().tracking_tolerance;
+  ASSERT_EQ(tolerances.size(), kActuatedJoints.size());
+  for (std::size_t i = 0; i < tolerances.size(); ++i) {
+    EXPECT_EQ(tolerances[i].joint, kActuatedJoints[i]);
+    EXPECT_DOUBLE_EQ(tolerances[i].dq_a, 0.01 * static_cast<double>(i + 1));
+  }
+  // Every axis has one, so there is nothing left to warn about.
+  EXPECT_TRUE(crane_supervisor::tracking_tolerance_notice(supervisor_->config()).empty());
+}
+
+TEST_F(StatusStream, WithNoToleranceFileNoTrackingFaultIsRaisedAndTheNodeSaysSo)
+{
+  // The state every profile is in today: the six rows of
+  // `crane_control/config/tracking_tolerance.yaml` are negative and nobody loads
+  // it. An axis a long way out raises no FAULT_TRACKING, tracking_error is still
+  // published as a measurement, and the configuration notice names the axes and
+  // the owner of the missing number.
+  const std::string notice =
+    crane_supervisor::tracking_tolerance_notice(supervisor_->config());
+  EXPECT_FALSE(notice.empty());
+  EXPECT_NE(notice.find("theta1_slewing_joint"), std::string::npos) << notice;
+  EXPECT_NE(notice.find("(ii-b)"), std::string::npos) << notice;
+
+  ASSERT_TRUE(
+    drive_to(
+      SupervisorStatus::FAULT_NONE, trusted_state(), held_remote(),
+      controller_state_with_error("theta1_slewing_joint", 1.5, 4.0)))
+    << received_.back().message;
+  EXPECT_DOUBLE_EQ(received_.back().tracking_error, 1.5);
+  for (const SupervisorStatus & status : received_) {
+    EXPECT_NE(status.fault, SupervisorStatus::FAULT_TRACKING) << status.message;
+  }
 
   expect_contract_of_every_report();
 }

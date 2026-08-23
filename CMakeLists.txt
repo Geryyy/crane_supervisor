@@ -3,6 +3,7 @@ project(crane_supervisor)
 
 find_package(ament_cmake REQUIRED)
 find_package(control_msgs REQUIRED)
+find_package(controller_manager_msgs REQUIRED)
 find_package(crane_msgs REQUIRED)
 find_package(epsilon_crane_msgs REQUIRED)
 find_package(generate_parameter_library REQUIRED)
@@ -42,6 +43,7 @@ target_link_libraries(supervisor_node
     supervisor_core
     rclcpp::rclcpp
     ${control_msgs_TARGETS}
+    ${controller_manager_msgs_TARGETS}
     ${crane_msgs_TARGETS}
     ${epsilon_crane_msgs_TARGETS}
     ${std_srvs_TARGETS}
@@ -71,11 +73,13 @@ ament_export_include_directories(include)
 # header alone, because a second process linking the node would be a second
 # publisher on a contract stream that has exactly one.
 ament_export_libraries(supervisor_core)
-ament_export_dependencies(control_msgs crane_msgs epsilon_crane_msgs rclcpp std_srvs)
+ament_export_dependencies(
+  control_msgs controller_manager_msgs crane_msgs epsilon_crane_msgs rclcpp std_srvs)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
+  find_package(controller_manager REQUIRED)
   find_package(crane_model REQUIRED)
 
   # The seams outside this package: the installed `crane_model` dynamics
@@ -119,8 +123,25 @@ if(BUILD_TESTING)
   target_compile_definitions(test_status_stream PRIVATE
     CRANE_SUPERVISOR_TEST_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/config")
 
-  # The absence that is the feature: no publisher on a command topic, no
-  # controller-manager client, nothing that can deactivate a controller.
+  # The mode, against a real controller manager in this process: the S5 shape
+  # `crane_control` already uses (PRD "Seams", S5), with mock hardware and the
+  # control loop driven by hand on the isolated domain `ralph/verify.sh` pins.
+  # A switch is the one call that must never be issued against the machine by
+  # accident, so it is asserted here and never against a launch.
+  ament_add_gtest(test_mode_switch test/test_mode_switch.cpp TIMEOUT 300)
+  target_link_libraries(test_mode_switch
+    supervisor_node
+    controller_manager::controller_manager
+    ${controller_manager_msgs_TARGETS}
+    ${crane_msgs_TARGETS}
+    ${epsilon_crane_msgs_TARGETS}
+    ${std_srvs_TARGETS})
+  target_compile_definitions(test_mode_switch PRIVATE
+    CRANE_SUPERVISOR_TEST_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/config")
+
+  # The absence that is the feature: no publisher on a command topic, and no
+  # reach beyond the two controller-manager services ROS 2 Interfaces §5 puts
+  # here on purpose.
   ament_add_pytest_test(test_no_command_path test/test_no_command_path.py)
 
   # The other absence that is a feature: this package keeps no copy of the one

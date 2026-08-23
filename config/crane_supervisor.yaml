@@ -58,6 +58,54 @@ crane_supervisor:
     # commissioning_prerequisites.md 2). Same derivation and same number as
     # remote_ctrl_timeout: both are 20 Hz contracts sampled here at 20 Hz.
     controller_health_timeout: 0.25
+    # Seconds. How old the controller manager's newest answer may be and still
+    # say which mode is active. Past it the mode on the status stream reads as
+    # *not known* and every /crane/set_mode request is refused, because a
+    # precondition cannot be checked against a view this supervisor does not
+    # have (PRD 10 step 2). It is the one input here that is polled rather than
+    # subscribed -- see ControllerManagerReport in supervisor_core.hpp -- and its
+    # age is measured from arrival, because ListControllers carries no header.
+    # Same derivation and same number as the two 20 Hz margins above.
+    controller_manager_timeout: 0.25
+
+    # Which controller holds the arm claim in each mode
+    # (control_architecture.md 7). Names, because the controller manager loads
+    # by name and the profile chooses the names; the architecture fixes only the
+    # four modes.
+    #
+    # `follow` is the pair crane_bringup's `fake` and `hardware` profiles spawn,
+    # in the cascade's activation order of PRD 5: the inner velocity loop is
+    # active before anything chains onto its reference interfaces.
+    #
+    # `manual` is deliberately absent, and its absence is the honest state
+    # rather than an omission. The manual forwarding and proportional
+    # controllers of control_architecture.md 7.2 live in the retained stack and
+    # no CBS profile composes one, so MODE_MANUAL is a mode this deployment does
+    # not implement: the supervisor refuses the request and says so, instead of
+    # naming a controller that would fail to load.
+    #
+    # `mpc` is absent for a different reason: there is no horizon producer until
+    # slice 6, so MODE_MPC is refused by PRD 10 step 2's freshness check before
+    # any controller list is consulted. Naming one here would change nothing.
+    mode_controllers:
+      follow:
+        - crane_velocity_controller
+        - trajectory_controller_a2b
+
+    # The tool claim of control_architecture.md 7.3 -- a second, independent
+    # claim on the same pump, which no mode switch touches.
+    #
+    # **Empty, and that is what this deployment actually is.** With the block
+    # gripper the tool axis runs on its own controller and can move while the
+    # arm controller is inactive, which is why the supervisor and not the
+    # controller layer is what keeps a gripper action from being issued during
+    # an arm motion. On the CBS profiles today crane_velocity_controller claims
+    # all six velocity interfaces including q9_left_rail_joint, so there is one
+    # claim and no separate tool controller to name. The model carries the
+    # second claim because the machine has one; the list is empty because this
+    # composition does not expose it yet, and a name invented here would be a
+    # controller nothing spawns.
+    tool_controllers: []
 
     # The sway duty of control_architecture.md 5 row 7: a bound on the passive
     # joint *rate* that raises FAULT_SWAY and names which coordinate crossed it,

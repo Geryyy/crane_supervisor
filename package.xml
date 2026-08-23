@@ -35,9 +35,32 @@
   <depend>rclcpp</depend>
   <depend>std_srvs</depend>
 
+  <!-- The one exception, and the reason it is here rather than anywhere else.
+       ROS 2 Interfaces §5 puts `/controller_manager/switch_controller` behind
+       the supervisor: mode changes go through it, not from the behaviour tree,
+       and a stack in which two elements can switch controllers has no arbiter
+       at all. This is the *message* package and not `controller_manager`
+       itself: what is linked here are two service types, so the node calls the
+       manager over the graph and holds no controller, no plugin and no
+       hardware interface. The Libraries page carries the ros2_control message
+       sets as part of ros2_control rather than package by package, exactly as
+       it does for `control_msgs` above. The guard test names the two service
+       types and no others. -->
+  <depend>controller_manager_msgs</depend>
+
   <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>crane_model</test_depend>
+  <!-- The in-process controller-manager harness of PRD "Seams" S5, the shape
+       `crane_control` already uses: a real ControllerManager with mock
+       hardware, driven by hand on the isolated domain `ralph/verify.sh` pins.
+       Test-only, and it has to be: a switch is the one call that must never be
+       issued against the machine's live graph by accident, so it is asserted
+       against a manager inside the test process and never against a launch.
+       `velocity_controllers` supplies the two real controllers the harness
+       switches between; what matters about them is the claim they hold. -->
+  <test_depend>controller_manager</test_depend>
+  <test_depend>velocity_controllers</test_depend>
 
   <export><build_type>ament_cmake</build_type></export>
 </package>

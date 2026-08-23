@@ -1,7 +1,8 @@
 # crane_supervisor
 
 The supervisor of [[control_architecture]] §5, in the state PRD §2 slice 3 leaves
-it: **status and mode only**.  It watches, it reports, and it does not act.
+it: **status and mode only**.  It watches, it reports, and the one thing it
+decides is which controller holds the claim.
 
 - a **ROS-free decision core** — `include/crane_supervisor/supervisor_core.hpp`.
   An input struct in, a decision struct out.  No node handle, no message type, no
@@ -16,8 +17,15 @@ it: **status and mode only**.  It watches, it reports, and it does not act.
   `/crane/remote_ctrl_states`, `control_msgs/JointTrajectoryControllerState`
   on `/crane/controller_state`, and `crane_msgs/VelocityControllerHealth` on
   `/crane/velocity_controller/health`.
-- one **service** — `/crane/clear_fault` (`std_srvs/Trigger`, ROS 2 Interfaces
-  §5), which acknowledges a latched emergency stop and does nothing else.
+- two **services** — `/crane/clear_fault` (`std_srvs/Trigger`), which
+  acknowledges a latched emergency stop and does nothing else, and
+  `/crane/set_mode` (`crane_msgs/SetMode`), which is the **only** way a mode
+  changes (ROS 2 Interfaces §5).
+- two **clients on the controller manager** — `list_controllers`, which is where
+  the reported mode comes from, and `switch_controller`, which is the one call
+  this package makes that reaches the machine.  ROS 2 Interfaces §5 puts that
+  client here and nowhere else: mode changes go **through the supervisor**, not
+  from the behaviour tree.
 
 > **The emergency stop and the deadman are read here for diagnosis and clean
 > recovery. They are not the protection.** The stop chain is hardware and PLC
@@ -37,19 +45,47 @@ on the machine, not an agent and not this package.
 
 Until it is verified the system must not advertise a safety function it cannot
 perform (PRD user story 54).  So this package holds **no publisher on a command
-topic, no controller-manager client, and nothing that can deactivate a
-controller** — and `test/test_no_command_path.py` asserts the absence, because an
-absence nobody checks is one that comes back by accident.  It is withheld, not
-unfinished.
+topic and nothing that writes a setpoint** — and `test/test_no_command_path.py`
+asserts the absence, because an absence nobody checks is one that comes back by
+accident.  It is withheld, not unfinished.
 
-Reading the emergency stop does not change that, and the guard did not have to be
-relaxed to let it in.  What it lost was a blanket ban on `create_service`, which
-was only ever there because `/crane/clear_fault` was a later issue; what replaced
-it names the one service this package may serve and the one type it may serve it
-with, so `/crane/set_mode` — still a later issue — cannot arrive unnoticed.
-`std_srvs/Trigger` carries no request fields at all, which is what makes it safe
-to expose from a node with no authority: there is nothing in it for a caller to
-ask this supervisor to do.
+**A mode change is not a stop, and the difference is the whole of what is still
+withheld.**  A mode change is *asked for*, on `/crane/set_mode`, by an operator
+or by the task layer, and is answered — performed, or refused with a reason.  A
+stop would be this supervisor deactivating a claim *on its own*, on a fault, and
+zeroing at the driver boundary.  Nothing here does the second, and no code path
+below reaches a switch except from a request.  `MODE_IDLE` is the closest the two
+come, and the report on that switch says outright that releasing the arm claim is
+not a way to bring the machine to rest: nothing is zeroed at the driver boundary,
+and §7.2 measured that a manual controller which deactivates leaves its last
+velocity latched on the interface it just released.
+
+The guard was **updated rather than relaxed** each time this package grew a
+reach, and each time what replaced a blanket ban was narrower.
+
+`create_service` came off the banned list when `/crane/clear_fault` landed; what
+replaced it names the services this package may serve and the types it may serve
+them with.  `std_srvs/Trigger` carries no request fields at all, and
+`crane_msgs/SetMode` carries one `uint8` — no setpoint, no joint, no duration —
+so neither is a shape a caller can smuggle a motion command through.
+
+`create_client`, `controller_manager`, `SwitchController` and `switch_controller`
+came off it in issue 026, for the same kind of reason: they were banned because
+the arbitration was a later issue, and that is this issue.  ROS 2 Interfaces §5
+makes the supervisor the only element that may call
+`/controller_manager/switch_controller`, so the ban had to lift somewhere for the
+stack to have an arbiter at all — and the safest place is the one package whose
+every other reach is asserted.  What replaced it pins the two service *types* by
+name and the two service *names* as literals, so a third client cannot appear and
+neither of the two can be pointed anywhere else.  What stays banned is everything
+that would let this package *hold* a piece of the control loop rather than call
+the manager over the graph: `controller_interface` and `hardware_interface` are
+how a package becomes a controller, `command_interface` is how it writes one, and
+`load_controller`, `unload_controller`, `configure_controller` and
+`set_hardware_component_state` are the manager calls that go beyond arbitrating a
+claim.  `controller_manager` itself stays a **test** dependency: the harness
+builds a manager inside the test process, and linking one into the deployed node
+would be a different reach from calling it.
 
 Reading the trajectory controller's state cost the guard one more relaxation, of
 the same shape.  `JointTrajectory` was on the banned-identifier list as a
@@ -123,9 +159,117 @@ asserted means in practice.
 
 `FAULT_NONE` from this supervisor means *nothing it watches is wrong*, not *the
 machine is safe*, and the `message` on a clear report says so.  Working cell and
-solver are later issues; `mode` is `MODE_IDLE` and nothing else until mode
-arbitration exists, because a supervisor must never report a mode it has not
-confirmed.
+solver are later issues.  `mode` is the section below.
+
+## The mode, and the one authority this supervisor has
+
+`/crane/set_mode` is the only way a mode changes, and this node is the only
+element in the stack that calls `/controller_manager/switch_controller`
+(ROS 2 Interfaces §5).
+
+**The exclusion already existed; what is added is the decision in front of it.**
+§7: manual and autonomous both claim the same `velocity` command interfaces, so
+ros2_control refuses to activate one while the other holds it, and §7 calls that
+a sound foundation to keep.  This supervisor keeps it and makes the exclusion an
+*arbitrated* decision with a stated reason, instead of an activation failure
+somebody has to read a log to understand.
+
+### What is reported is what is active
+
+`mode` on the status stream is re-derived from the controller manager on every
+cycle, never remembered from the last successful request.  A mode is active when
+**every** controller configured for it is active; when none is, the arm claim is
+free and that is `MODE_IDLE` as an observation rather than as a default.
+
+Three things follow, and each is a case a remembered mode would have hidden:
+
+| What the manager says | What goes on the wire |
+|---|---|
+| it is not answering, or its newest answer is older than `controller_manager_timeout` | `MODE_IDLE`, and the clause says the mode is **not known** and why.  No mode change is admitted while this holds |
+| some of a mode's controllers are up and not all | `MODE_IDLE`, and the clause names the ones that are up.  A half-state is not a mode, and rounding it into one would be a mode nobody can act on |
+| a controller is active, owns command interfaces and is in no configured mode and no tool claim | reported by name in the clause.  It is a claim this configuration does not describe, and it can refuse a switch by holding an interface the incoming controller needs |
+
+The clause is on **every** report, whatever the fault is: `MODE_IDLE` on a report
+whose manager is silent and `MODE_IDLE` on one whose arm claim is free are the
+same byte and different facts, and only the words tell them apart.  The mode is
+polled and not subscribed, so it is deliberately not one of the four `Input`s —
+`ControllerManagerReport` in `supervisor_core.hpp` says how §5.3's rule is met for
+something whose failure shows at the call site.
+
+### What a request is answered with
+
+Every precondition is checked **before** anything is deactivated, and the plan is
+a single activate/deactivate pair for one strict `switch_controller` call — so a
+switch that cannot succeed is refused from the mode the machine is already in and
+is never discovered half-way (PRD §10 step 2, user story 35).  In order:
+
+| Refused when | Because |
+|---|---|
+| the request is not one of the four constants | a `uint8` is not a mode until it has been checked, and answering 200 with a plausible mode is worse than refusing it |
+| the mode is `MODE_MPC` | PRD §10 step 2 requires the horizon's freshness to be verified before the trajectory controller is deactivated, and there is no horizon: the check exists and refuses, which is what makes slice 6 an activation rather than a build |
+| the controller manager has not answered inside its deadline | a precondition cannot be checked against a view this supervisor does not have, and a switch issued blind is the half-way discovery §10 forbids |
+| a fault is latched **and** the mode is a motion mode | the latched cause is the reason, carried rather than restated, and clearing it goes through `/crane/clear_fault`.  `MODE_IDLE` is still reachable: releasing the claim is the one direction a latched stop does not argue against |
+| the deployment configures no controller for the mode | there is nothing to activate, and an empty switch reported as a success is a no-op an operator cannot see.  `MODE_MANUAL` is in this state on today's profiles |
+| a controller the mode needs is not loaded on the manager | it could never have been activated, and the machine keeps the claim it holds |
+| a controller the mode needs is loaded and not `inactive` or `active` | that is not a state a switch can move, and a controller that will not configure is a failure to chase on the manager rather than in this request |
+
+Every one of them sets `success=false`, says which precondition fired, and ends
+in *Nothing was deactivated* (ROS 2 Interfaces §1, PRD user story 36).
+`active_mode` on the response is **what is actually active after the call** —
+read back off the manager afterwards, never assumed — so a refusal reports the
+mode the machine was already in, and a switch the manager accepted but that
+landed somewhere else is reported as where it landed, with a clause saying so.
+A request for the mode that is already active is a no-op and is reported as one
+rather than as a switch.
+
+### Two claims, not one machine
+
+§7.3: with the block gripper the tool axis is driven by its **own** controller
+rather than by the arm's, so it can move while the arm controller is inactive — a
+second, independent claim on the same pump, and *the supervisor, not the
+controller layer, is what keeps a gripper action from being issued during an arm
+motion*.  A mode model that mapped one machine onto one claim would be wrong on
+the machine this stack runs on, and wrong silently: it would deactivate a tool
+controller it never meant to touch.
+
+So the configuration carries the arm claim's controllers **per mode** and the
+tool claim's **separately**, a mode switch plans over the arm claim alone, and
+the tool claim is reported on every answer and never switched by a mode request.
+`validate()` refuses a controller that is in both, because an arm mode change
+would then take down the gripper it is supposed to leave alone.
+
+**Slice 3 cannot see the tool claim on the deployed profiles, and the shipped
+configuration says so rather than modelling it away.**
+`crane_velocity_controller` claims all six `velocity` interfaces including
+`q9_left_rail_joint`, so the CBS stack has one claim today and `tool_controllers`
+ships empty; the clause on every report says that outright instead of staying
+quiet, because a report that mentioned the tool only when it was held would be a
+one-claim model with an exception in it.  `test/test_mode_switch.cpp` is where the
+second claim exists: it composes a tool controller on the gripper axis and
+asserts that activating, changing and releasing an arm mode leaves it exactly
+where it was.
+
+### Where it is tested, and where it is not
+
+Against a real `controller_manager` **inside the test process**, with mock
+hardware and the control loop driven by hand, on the isolated domain
+`ralph/verify.sh` pins — the S5 shape `crane_control` already uses.  A switch is
+the one call that must never be issued against the machine by accident, and this
+workspace's sim runs join the real crane's DDS graph, so it is never asserted
+against a launch.  The arbitration itself is decided in the ROS-free core, so
+every refusal is reachable from a unit test with no runtime at all.
+
+**One cost is known and is not fixed here.**  `/crane/set_mode` and the status
+timer share this node's default callback group, so while a switch is in flight
+the 20 Hz stream does not tick and no subscription callback runs.  On a healthy
+manager that is a control cycle — milliseconds, far inside every input's
+freshness deadline.  A manager that hangs can hold the handler for about four
+seconds, and the next status report will then say inputs went stale: *true*, since
+this supervisor was not looking, but the message names the producer rather than
+the pause.  What would fix it is the arbitration in a callback group of its own on
+a multi-threaded executor, which costs a lock over the held messages and the latch
+that are plain members today — a change to the node's concurrency model, and not
+this issue's.
 
 ## Every input has a freshness deadline, and none is exempt
 
@@ -223,11 +367,14 @@ button is pressed again: an interlock is a fact about the operator, not a latch.
 | `false` | nothing is latched | an acknowledgement of nothing is reported as a no-op rather than as a clear, so `success == true` always means *a latch existed and is now down* |
 | `true` | a latch existed and the condition behind it is gone | and if the stop recurs the latch is raised again on the next cycle, which is the specified behaviour and not a failed clear |
 
-**Nothing here acts.**  No stop, no ramp, no deactivation, no command — on the
+**Nothing here acts on its own.**  No stop, no ramp, no command — on the
 emergency stop least of all, since §6.1 makes the software's relationship to the
-stop chain supplementary and one-directional.  Refusing new goals while the stop
-is latched is a *mode* decision and belongs to the issue where this supervisor
-first has authority over anything.
+stop chain supplementary and one-directional.  What the latch *does* reach is the
+arbitration: a latched fault refuses a switch into a motion mode, with the
+latched cause as the reason, and `MODE_IDLE` stays reachable.  That is a refusal
+of something asked for, not an action taken; the latch still lowers only through
+`/crane/clear_fault`, and the expression that decides whether it is up is shared
+with the status cycle so the two cannot disagree about what is latched.
 
 ## Which button the deadman is
 
@@ -320,10 +467,17 @@ lives here, because a copy is how one number becomes three.
 
 §5 row 7 gives the supervisor one narrow duty about the sway: **refuse to start a
 motion that depends on sway being settled, and report.**  It does not damp — that
-is slice 6 — and it does not stop a motion already running for being swingy.  The
-*refusal* half needs an authority over a mode that this package will not have
-until `/crane/set_mode` exists, so what is here is the report and the signal
-somebody else refuses on.
+is slice 6 — and it does not stop a motion already running for being swingy.
+
+The *refusal* half is still not wired, and `/crane/set_mode` is not where it
+belongs.  A mode change is not a motion: activating `MODE_FOLLOW` puts a
+controller in charge of the claim, and the motion starts when a goal reaches that
+controller.  Refusing the mode for a swinging load would refuse the crane the
+ability to *hold*, which is the opposite of the duty.  What the row asks for is a
+refusal at the **goal**, and this supervisor has no authority over goals: the
+task layer sends them straight to the trajectory controller's action.  So what is
+here is the report and the three-valued signal somebody else refuses on, and the
+gap is named rather than closed by putting the check where it happens to fit.
 
 Two different things come off the passive rate and they are not interchangeable:
 
@@ -455,14 +609,34 @@ an input and reported on every status, whatever `fault` says.
 
 ## Configuration
 
-Nine read-only parameters are shipped in `config/crane_supervisor.yaml`:
+Eleven read-only parameters are shipped in `config/crane_supervisor.yaml`:
 `pendulum_state_timeout`, `remote_ctrl_timeout`, `controller_state_timeout`,
-`controller_health_timeout`, the four under `sway`, and
+`controller_health_timeout`, `controller_manager_timeout`,
+`mode_controllers.follow`, `tool_controllers`, the four under `sway`, and
 `deadman_button`.  The first four are the freshness deadlines of the four
 `Input`s, one each, and they are the only place those numbers exist — the core's
 array has no default, so a deadline that is not configured is a node that does
 not start.  Their names are the ones `crane_bringup` already passes; they read
 `timeout` where the core reads `deadline`, and the two mean the same thing.
+
+`controller_manager_timeout` is the fifth margin and the one that is not an
+`Input`'s: how old the manager's newest answer may be and still say which mode is
+active.  Past it the mode reads as *not known* and every mode change is refused.
+Its age is measured from **arrival** rather than from a header stamp, because
+`ListControllers` carries none — weaker than the four above, and weaker in the
+safe direction, since it cannot be fooled by a publisher whose clock ran ahead.
+
+`mode_controllers` and `tool_controllers` are names and not types, because the
+architecture fixes the four modes and a profile fixes what implements them and
+under which names the manager loaded them.  `follow` is the pair the `fake` and
+`hardware` profiles spawn, in the cascade's activation order (PRD §5).  `manual`
+and `mpc` are left unset and each for its own reason: no CBS profile composes a
+manual controller, so `MODE_MANUAL` is a mode this deployment does not implement
+and the request is refused with that as the reason; `MODE_MPC` is refused by the
+freshness check before any list is consulted.  `tool_controllers` is empty
+because this composition has one claim — see *Two claims, not one machine*.
+`validate()` refuses lists that overlap, a controller shared with the tool claim,
+and any controller under `idle`.
 
 `sway.dq_u_max`, `sway.dq_u_settled`, `sway.settled_release_factor` and
 `sway.settle_dwell` are the sway duty's bounds, and **every one of them is a

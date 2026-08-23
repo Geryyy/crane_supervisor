@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "crane_supervisor/supervisor_core.hpp"
@@ -88,6 +90,18 @@ crane_supervisor::SupervisorConfig with_shipped_deadlines(
   config.deadline(Input::RemoteCtrl) = 0.25;
   config.deadline(Input::ControllerState) = 0.15;
   config.deadline(Input::ControllerHealth) = 0.25;
+  // The polled view of the controller manager. Not one of the four -- it is a
+  // service and not a stream -- and refused by `validate()` all the same when
+  // it is missing, so a fixture that omitted it would not be a configuration a
+  // node could start from.
+  config.controller_manager_deadline = 0.25;
+  // The arm claim's controllers, as `config/crane_supervisor.yaml` ships them:
+  // the FOLLOW pair in the cascade's activation order, and nothing for
+  // MODE_MANUAL or MODE_FOLLOW's absent siblings. That is the deployment's own
+  // state and not a convenience -- no CBS profile composes a manual controller,
+  // and MODE_MPC has no producer until slice 6.
+  config.mode_controllers[crane_supervisor::index_of(crane_supervisor::Mode::Follow)] = {
+    "crane_velocity_controller", "trajectory_controller_a2b"};
   config.sway = shipped_sway_bound();
   return config;
 }
@@ -1536,9 +1550,21 @@ TEST(SupervisorCore, EveryReachableDecisionCarriesACause)
     for (const auto & input : every_input()) {
       const auto decision = crane_supervisor::decide(config, input);
       EXPECT_FALSE(decision.message.empty());
-      // Mode arbitration is a later issue; until then the supervisor reports the
-      // one mode it has verified, whatever it was told.
+      // The mode is re-derived from the controller manager's own answer on
+      // every cycle, so what is asserted here is that `decide()` reports what
+      // `active_mode()` read rather than anything of its own. None of these
+      // inputs carries an answer, which is the state a supervisor with no
+      // manager on the graph is in: the mode is not known and MODE_IDLE -- the
+      // reading that claims the least -- is what goes on the wire.
+      const auto active = crane_supervisor::active_mode(config, input.controller_manager);
+      EXPECT_EQ(decision.mode, active.mode);
       EXPECT_EQ(decision.mode, crane_supervisor::Mode::Idle);
+      EXPECT_FALSE(active.known);
+      // And the clause that says so is on every one of them, whatever the fault
+      // is: MODE_IDLE on a report whose manager is silent and MODE_IDLE on one
+      // whose arm claim is free are the same byte and different facts.
+      EXPECT_NE(decision.message.find(crane_supervisor::kModeClausePrefix), std::string::npos)
+        << decision.message;
       // The working cell is still not computed in this slice, and carries the
       // value that claims nothing rather than a stub that claims something.
       EXPECT_FALSE(decision.inside_working_cell);
@@ -1655,4 +1681,486 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheInnerLoopsThree)
       }
     }
   }
+}
+
+// --------------------------------------------------------------------------
+// The mode, and the one authority this supervisor has.  Everything below is
+// offline: `arbitrate_mode()` decides and returns a plan, and nothing in this
+// binary can switch anything.  What a real switch does against a real
+// controller manager is `test_mode_switch.cpp`.
+// --------------------------------------------------------------------------
+
+namespace
+{
+
+using crane_supervisor::ActiveMode;
+using crane_supervisor::ControllerManagerReport;
+using crane_supervisor::ControllerReport;
+using crane_supervisor::Mode;
+
+constexpr char kVelocityController[] = "crane_velocity_controller";
+constexpr char kFollower[] = "trajectory_controller_a2b";
+constexpr char kManualController[] = "manual_velocity_controller";
+constexpr char kToolController[] = "tool_velocity_controller";
+
+/// The shipped configuration with a manual controller and a tool claim added.
+/**
+ * Today's profiles have neither -- no CBS profile composes a manual controller,
+ * and `crane_velocity_controller` holds all six `velocity` interfaces including
+ * the gripper axis, so the deployment has one claim.  A test of the arbitration
+ * has to have both, because what is being asserted is that the *model* carries
+ * a second claim and a mode it does not implement, which is exactly what a
+ * deployment that only ever had one would never exercise
+ * (wiki/control_architecture.md §7.3).
+ */
+crane_supervisor::SupervisorConfig config_with_modes()
+{
+  crane_supervisor::SupervisorConfig config = default_config();
+  config.mode_controllers[crane_supervisor::index_of(Mode::Manual)] = {kManualController};
+  config.tool_controllers = {kToolController};
+  return config;
+}
+
+/// One row of what the controller manager would have answered.
+ControllerReport controller(
+  const std::string & name, const std::string & state,
+  const std::vector<std::string> & claimed = {})
+{
+  ControllerReport report;
+  report.name = name;
+  report.state = state;
+  report.claimed_interfaces = claimed;
+  return report;
+}
+
+/// An answer that came back just now, listing `controllers`.
+ControllerManagerReport answered(std::vector<ControllerReport> controllers)
+{
+  ControllerManagerReport report;
+  report.answer.received = true;
+  report.answer.age = 0.01;
+  report.controllers = std::move(controllers);
+  return report;
+}
+
+/// Everything loaded and inactive: the state after a manager comes up with the
+/// controllers configured and nothing spawned.
+ControllerManagerReport all_inactive()
+{
+  return answered(
+    {controller(kVelocityController, "inactive"), controller(kFollower, "inactive"),
+      controller(kManualController, "inactive"), controller(kToolController, "inactive")});
+}
+
+/// The same, with the FOLLOW pair active and holding the arm claim.
+ControllerManagerReport following()
+{
+  return answered(
+    {controller(kVelocityController, "active", {"theta1_slewing_joint/velocity"}),
+      controller(kFollower, "active", {"crane_velocity_controller/theta1_slewing_joint/velocity"}),
+      controller(kManualController, "inactive"), controller(kToolController, "inactive")});
+}
+
+/// A healthy observation with the controller manager answering.
+crane_supervisor::SupervisorInput input_with(ControllerManagerReport manager)
+{
+  crane_supervisor::SupervisorInput input = healthy_input();
+  input.controller_manager = std::move(manager);
+  return input;
+}
+
+/// One request, arbitrated against a healthy machine in a named state.
+crane_supervisor::ModeArbitration ask(
+  const crane_supervisor::SupervisorConfig & config, Mode mode, ControllerManagerReport manager)
+{
+  return crane_supervisor::arbitrate_mode(
+    config, static_cast<std::uint8_t>(mode), input_with(std::move(manager)));
+}
+
+}  // namespace
+
+TEST(SupervisorMode, TheActiveModeIsReadOffTheManagerAndNotRemembered)
+{
+  const auto config = config_with_modes();
+
+  // Nothing active: the arm claim is free, and that is MODE_IDLE as an
+  // observation rather than as a default.
+  const ActiveMode idle = crane_supervisor::active_mode(config, all_inactive());
+  EXPECT_TRUE(idle.known);
+  EXPECT_EQ(idle.mode, Mode::Idle);
+  EXPECT_FALSE(idle.partial);
+  EXPECT_TRUE(idle.active_controllers.empty());
+
+  // Both of FOLLOW's controllers active: MODE_FOLLOW, and the report names them.
+  const ActiveMode follow = crane_supervisor::active_mode(config, following());
+  EXPECT_TRUE(follow.known);
+  EXPECT_EQ(follow.mode, Mode::Follow);
+  EXPECT_FALSE(follow.partial);
+  EXPECT_EQ(
+    follow.active_controllers, (std::vector<std::string>{kVelocityController, kFollower}));
+
+  // One of the two: a half-state is not a mode.  MODE_IDLE is what claims the
+  // least, and the clause says which controller is up rather than rounding the
+  // drift off into a mode nobody can act on.
+  ControllerManagerReport half = following();
+  half.controllers[1].state = "inactive";
+  const ActiveMode drifted = crane_supervisor::active_mode(config, half);
+  EXPECT_TRUE(drifted.known);
+  EXPECT_TRUE(drifted.partial);
+  EXPECT_EQ(drifted.mode, Mode::Idle);
+  const std::string clause = crane_supervisor::mode_clause(config, drifted);
+  EXPECT_NE(clause.find(kVelocityController), std::string::npos) << clause;
+  EXPECT_EQ(clause.find(kFollower), std::string::npos) << clause;
+}
+
+TEST(SupervisorMode, AManagerThatIsNotAnsweringLeavesTheModeNotKnown)
+{
+  const auto config = config_with_modes();
+
+  // Never answered.  MODE_IDLE goes on the wire because no motion mode can be
+  // confirmed, and the clause says outright that this is not an observation
+  // that nothing is running.
+  const ActiveMode silent = crane_supervisor::active_mode(config, {});
+  EXPECT_FALSE(silent.known);
+  EXPECT_EQ(silent.mode, Mode::Idle);
+  EXPECT_EQ(silent.cause, Staleness::NeverArrived);
+  EXPECT_NE(
+    crane_supervisor::mode_clause(config, silent).find("not known"), std::string::npos);
+
+  // Answered once and then stopped.  A remembered mode would stand on the wire
+  // for ever; this ages out, and the two absences do not read the same.
+  ControllerManagerReport stale = following();
+  stale.answer.age = 10.0 * config.controller_manager_deadline;
+  const ActiveMode aged = crane_supervisor::active_mode(config, stale);
+  EXPECT_FALSE(aged.known);
+  EXPECT_EQ(aged.mode, Mode::Idle);
+  EXPECT_EQ(aged.cause, Staleness::StoppedArriving);
+  EXPECT_NE(
+    crane_supervisor::mode_clause(config, silent), crane_supervisor::mode_clause(config, aged));
+}
+
+TEST(SupervisorMode, TheStatusModeIsWhatTheManagerSaysAndNothingElse)
+{
+  // End of the path the acceptance criterion is about: `decide()` reports what
+  // was read, and a clear report is not a claim about the mode.
+  const auto config = config_with_modes();
+  auto input = input_with(following());
+  const auto decision = crane_supervisor::decide(config, input);
+  EXPECT_EQ(decision.fault, crane_supervisor::Fault::None);
+  EXPECT_EQ(decision.mode, Mode::Follow);
+  EXPECT_NE(decision.message.find("MODE_FOLLOW"), std::string::npos) << decision.message;
+  EXPECT_NE(decision.message.find(kVelocityController), std::string::npos) << decision.message;
+}
+
+TEST(SupervisorMode, AValueThatIsNotAModeIsRefusedRatherThanCast)
+{
+  const auto config = config_with_modes();
+  const auto refused = crane_supervisor::arbitrate_mode(config, 200, input_with(all_inactive()));
+  EXPECT_FALSE(refused.accepted);
+  EXPECT_FALSE(refused.switch_required);
+  EXPECT_TRUE(refused.activate.empty());
+  EXPECT_TRUE(refused.deactivate.empty());
+  EXPECT_NE(refused.message.find("MODE_MPC"), std::string::npos) << refused.message;
+
+  // And the four that are modes are not refused for being unreadable.
+  for (std::uint8_t value = 0; value < 4; ++value) {
+    EXPECT_TRUE(crane_supervisor::is_mode(value)) << static_cast<int>(value);
+  }
+  EXPECT_FALSE(crane_supervisor::is_mode(4));
+}
+
+TEST(SupervisorMode, MpcIsRefusedWithTheReasonAndNotLeftToFailAtTheClaim)
+{
+  // PRD §10 step 2, in the only form slice 3 can implement it: the horizon's
+  // freshness is verified *before* anything is deactivated, and there is no
+  // horizon, so the answer is no.  The check exists and refuses, which is what
+  // makes slice 6 an activation rather than a build.
+  const auto config = config_with_modes();
+  const auto refused = ask(config, Mode::Mpc, following());
+  EXPECT_FALSE(refused.accepted);
+  EXPECT_TRUE(refused.deactivate.empty()) << "the trajectory controller was planned away";
+  EXPECT_NE(refused.message.find("slice 6"), std::string::npos) << refused.message;
+  EXPECT_NE(refused.message.find("freshness"), std::string::npos) << refused.message;
+  // And the machine is reported in the mode it is still in, not in the one that
+  // was asked for.
+  EXPECT_EQ(refused.active.mode, Mode::Follow);
+}
+
+TEST(SupervisorMode, NoViewOfTheManagerRefusesEverySwitchRatherThanSwitchingBlind)
+{
+  const auto config = config_with_modes();
+  crane_supervisor::SupervisorInput input = healthy_input();
+  const auto refused =
+    crane_supervisor::arbitrate_mode(config, static_cast<std::uint8_t>(Mode::Follow), input);
+  EXPECT_FALSE(refused.accepted);
+  EXPECT_TRUE(refused.activate.empty());
+  EXPECT_TRUE(refused.deactivate.empty());
+  EXPECT_NE(refused.message.find("cannot see the controller manager"), std::string::npos)
+    << refused.message;
+}
+
+TEST(SupervisorMode, ALatchedFaultRefusesAMotionModeAndCarriesTheLatchedCause)
+{
+  const auto config = config_with_modes();
+  crane_supervisor::SupervisorInput input = input_with(all_inactive());
+  input.estop_latched = true;
+
+  const auto refused =
+    crane_supervisor::arbitrate_mode(config, static_cast<std::uint8_t>(Mode::Follow), input);
+  EXPECT_FALSE(refused.accepted);
+  EXPECT_TRUE(refused.deactivate.empty());
+  // The latched cause is the reason, carried rather than restated, and it names
+  // where the acknowledgement goes.
+  EXPECT_NE(refused.message.find("emergency stop"), std::string::npos) << refused.message;
+  EXPECT_NE(refused.message.find("/crane/clear_fault"), std::string::npos) << refused.message;
+
+  // Absence of the stop signal is asserted, so it latches the same way and
+  // refuses the same switch (§6.1).
+  crane_supervisor::SupervisorInput absent = input_with(all_inactive());
+  absent.stream(Input::RemoteCtrl).received = false;
+  EXPECT_FALSE(
+    crane_supervisor::arbitrate_mode(config, static_cast<std::uint8_t>(Mode::Manual), absent)
+    .accepted);
+
+  // MODE_IDLE is not refused by it: releasing the claim is the one direction a
+  // latched stop does not argue against.
+  crane_supervisor::SupervisorInput latched_and_following = input_with(following());
+  latched_and_following.estop_latched = true;
+  const auto to_idle = crane_supervisor::arbitrate_mode(
+    config, static_cast<std::uint8_t>(Mode::Idle), latched_and_following);
+  EXPECT_TRUE(to_idle.accepted) << to_idle.message;
+  EXPECT_TRUE(to_idle.switch_required);
+}
+
+TEST(SupervisorMode, EveryPreconditionIsCheckedBeforeAnythingIsPlannedAwayFromTheActiveMode)
+{
+  // PRD §10 step 2 and user story 35, as a property of the plan rather than of
+  // the timing: on every refusal there is nothing to deactivate, so a switch
+  // that cannot succeed leaves the machine in the mode it is already in and is
+  // never discovered half-way.
+  const auto config = config_with_modes();
+
+  // A mode this deployment configures no controller for.
+  auto empty_manual = config;
+  empty_manual.mode_controllers[crane_supervisor::index_of(Mode::Manual)].clear();
+  const auto unconfigured = ask(empty_manual, Mode::Manual, following());
+  EXPECT_FALSE(unconfigured.accepted);
+  EXPECT_TRUE(unconfigured.deactivate.empty());
+  EXPECT_NE(unconfigured.message.find("no controller"), std::string::npos)
+    << unconfigured.message;
+
+  // A controller the manager has never heard of.
+  ControllerManagerReport without_manual = following();
+  without_manual.controllers.erase(without_manual.controllers.begin() + 2);
+  const auto missing = ask(config, Mode::Manual, without_manual);
+  EXPECT_FALSE(missing.accepted);
+  EXPECT_TRUE(missing.deactivate.empty()) << "the FOLLOW pair was planned away for a switch "
+                                             "that could never have completed";
+  EXPECT_NE(missing.message.find("not loaded"), std::string::npos) << missing.message;
+
+  // A controller that is loaded and will not configure.
+  ControllerManagerReport unconfigurable = following();
+  unconfigurable.controllers[2].state = "unconfigured";
+  const auto stuck = ask(config, Mode::Manual, unconfigurable);
+  EXPECT_FALSE(stuck.accepted);
+  EXPECT_TRUE(stuck.deactivate.empty());
+  EXPECT_NE(stuck.message.find("unconfigured"), std::string::npos) << stuck.message;
+
+  // Every one of them says what was *not* done, so an operator is never left
+  // with an unexplained no-op (PRD user story 36).
+  for (const auto & refusal : {unconfigured, missing, stuck}) {
+    EXPECT_FALSE(refusal.message.empty());
+    EXPECT_NE(refusal.message.find("Nothing was deactivated"), std::string::npos)
+      << refusal.message;
+    EXPECT_EQ(refusal.active.mode, Mode::Follow);
+  }
+}
+
+TEST(SupervisorMode, TheModesAreMutuallyExclusiveAndTheSwitchIsOneCall)
+{
+  // §7: manual and autonomous already exclude each other by resource claim, and
+  // what this adds is the arbitrated decision in front of it.  The plan carries
+  // the deactivation of the outgoing mode and the activation of the incoming
+  // one together, so the machine passes from one to the other inside one of the
+  // manager's cycles rather than through a state that is neither.
+  const auto config = config_with_modes();
+  const auto to_manual = ask(config, Mode::Manual, following());
+  ASSERT_TRUE(to_manual.accepted) << to_manual.message;
+  EXPECT_TRUE(to_manual.switch_required);
+  EXPECT_EQ(to_manual.activate, (std::vector<std::string>{kManualController}));
+  EXPECT_EQ(to_manual.deactivate, (std::vector<std::string>{kVelocityController, kFollower}));
+
+  // The order of the activation is the deployment's own and is not sorted:
+  // PRD §5's cascade brings the inner loop up before anything chains onto its
+  // reference interfaces.
+  const auto to_follow = ask(config, Mode::Follow, all_inactive());
+  ASSERT_TRUE(to_follow.accepted) << to_follow.message;
+  EXPECT_EQ(to_follow.activate, (std::vector<std::string>{kVelocityController, kFollower}));
+  EXPECT_TRUE(to_follow.deactivate.empty());
+}
+
+TEST(SupervisorMode, TheToolClaimIsNeverSwitchedByAModeRequest)
+{
+  // §7.3: with the block gripper the tool axis is on its own controller and can
+  // move while the arm controller is inactive -- a second, independent claim on
+  // the same pump.  A mode model that assumed one claim per machine would
+  // deactivate it here, silently, on every arm mode change.
+  const auto config = config_with_modes();
+  ControllerManagerReport with_tool = following();
+  with_tool.controllers[3].state = "active";
+  with_tool.controllers[3].claimed_interfaces = {"q9_left_rail_joint/velocity"};
+
+  const auto to_manual = ask(config, Mode::Manual, with_tool);
+  ASSERT_TRUE(to_manual.accepted) << to_manual.message;
+  EXPECT_EQ(
+    std::find(to_manual.deactivate.begin(), to_manual.deactivate.end(), kToolController),
+    to_manual.deactivate.end())
+    << "an arm mode change deactivated the tool claim";
+  EXPECT_EQ(
+    std::find(to_manual.activate.begin(), to_manual.activate.end(), kToolController),
+    to_manual.activate.end());
+
+  // Releasing the arm claim does not release it either: MODE_IDLE is a mode of
+  // the arm and not of the machine.
+  const auto to_idle = ask(config, Mode::Idle, with_tool);
+  ASSERT_TRUE(to_idle.accepted) << to_idle.message;
+  EXPECT_EQ(to_idle.deactivate, (std::vector<std::string>{kVelocityController, kFollower}));
+
+  // And it is reported, so a caller can see that a gripper action and an arm
+  // motion are two claims rather than one machine.
+  const ActiveMode active = crane_supervisor::active_mode(config, with_tool);
+  EXPECT_EQ(active.active_tool_controllers, (std::vector<std::string>{kToolController}));
+  const std::string clause = crane_supervisor::mode_clause(config, active);
+  EXPECT_NE(clause.find("Tool claim"), std::string::npos) << clause;
+  EXPECT_NE(clause.find(kToolController), std::string::npos) << clause;
+}
+
+TEST(SupervisorMode, ADeploymentWithNoToolClaimSaysSoRatherThanImplyingOneClaim)
+{
+  // The shipped state: `crane_velocity_controller` holds all six `velocity`
+  // interfaces including `q9_left_rail_joint`, so this composition has one
+  // claim.  The clause reports the absence rather than staying quiet, because a
+  // report that mentioned the tool only when it was held would be a
+  // one-claim-per-machine model with an exception in it.
+  const auto config = default_config();
+  const std::string clause =
+    crane_supervisor::mode_clause(config, crane_supervisor::active_mode(config, following()));
+  EXPECT_NE(clause.find("No tool claim is configured"), std::string::npos) << clause;
+  EXPECT_NE(clause.find("7.3"), std::string::npos) << clause;
+}
+
+TEST(SupervisorMode, AClaimTheConfigurationDoesNotDescribeIsReportedRatherThanIgnored)
+{
+  // The other half of "not one claim per machine": something active that owns a
+  // command interface and belongs to no configured mode and to no tool claim.
+  // It is reported and not refused on -- a broadcaster owns none and would be a
+  // false alarm -- and it can still block a switch by holding an interface the
+  // incoming controller needs.
+  const auto config = config_with_modes();
+  ControllerManagerReport report = following();
+  report.controllers.push_back(controller("joint_state_broadcaster", "active"));
+  report.controllers.push_back(
+    controller("someone_elses_controller", "active", {"theta2_boom_joint/velocity"}));
+
+  const ActiveMode active = crane_supervisor::active_mode(config, report);
+  EXPECT_EQ(
+    active.unmodelled_claimants, (std::vector<std::string>{"someone_elses_controller"}));
+  const std::string clause = crane_supervisor::mode_clause(config, active);
+  EXPECT_NE(clause.find("someone_elses_controller"), std::string::npos) << clause;
+  EXPECT_EQ(clause.find("joint_state_broadcaster"), std::string::npos) << clause;
+}
+
+TEST(SupervisorMode, TheModeAlreadyActiveIsANoOpAndIsReportedAsOne)
+{
+  const auto config = config_with_modes();
+  const auto again = ask(config, Mode::Follow, following());
+  EXPECT_TRUE(again.accepted);
+  EXPECT_FALSE(again.switch_required);
+  EXPECT_TRUE(again.activate.empty());
+  EXPECT_TRUE(again.deactivate.empty());
+  EXPECT_NE(again.message.find("no switch was issued"), std::string::npos) << again.message;
+  EXPECT_EQ(again.active.mode, Mode::Follow);
+}
+
+TEST(SupervisorMode, ReleasingTheClaimIsAModeChangeAndSaysItIsNotAStop)
+{
+  // The one place this issue comes closest to §5.2's withheld stop path, and
+  // the report is where the difference is stated: nothing is zeroed at the
+  // driver boundary, and §7.2 measured that a manual controller which
+  // deactivates leaves its last velocity latched on the interface it released.
+  const auto config = config_with_modes();
+  const auto to_idle = ask(config, Mode::Idle, following());
+  ASSERT_TRUE(to_idle.accepted) << to_idle.message;
+  EXPECT_TRUE(to_idle.activate.empty());
+  EXPECT_EQ(to_idle.deactivate, (std::vector<std::string>{kVelocityController, kFollower}));
+  EXPECT_NE(to_idle.message.find("not a stop"), std::string::npos) << to_idle.message;
+  EXPECT_NE(to_idle.message.find("latched on the interface"), std::string::npos)
+    << to_idle.message;
+}
+
+TEST(SupervisorMode, EveryRequestIsAnsweredWithACauseAndNeverWithAnEmptyResult)
+{
+  // ROS 2 Interfaces §1 and PRD user story 36, over every mode against every
+  // state of the machine this core can be handed.  A refused switch that leaves
+  // an operator with an unexplained no-op is the failure this sweep is written
+  // against.
+  const std::vector<ControllerManagerReport> machines{
+    ControllerManagerReport{}, all_inactive(), following()};
+  for (const auto & config : {default_config(), config_with_modes()}) {
+    for (const auto & machine : machines) {
+      for (std::uint8_t value = 0; value < 6; ++value) {
+        crane_supervisor::SupervisorInput input = input_with(machine);
+        for (const bool latched : {false, true}) {
+          input.estop_latched = latched;
+          const auto arbitration = crane_supervisor::arbitrate_mode(config, value, input);
+          EXPECT_FALSE(arbitration.message.empty()) << static_cast<int>(value);
+          // A refusal never plans anything away, and an accepted no-op never
+          // plans anything either.
+          if (!arbitration.accepted || !arbitration.switch_required) {
+            EXPECT_TRUE(arbitration.activate.empty()) << arbitration.message;
+            EXPECT_TRUE(arbitration.deactivate.empty()) << arbitration.message;
+          }
+          // Nothing is ever planned that is not a controller of a mode: the
+          // tool claim is out of reach of a mode request by construction.
+          for (const auto & name : arbitration.deactivate) {
+            EXPECT_NE(name, kToolController) << arbitration.message;
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(SupervisorMode, ValidateRefusesAConfigurationTheArbitrationCouldNotAnswerFrom)
+{
+  std::string reason;
+
+  // A controller in two modes: two modes would read as active at once and the
+  // answer would depend on which list was checked first.
+  auto overlapping = config_with_modes();
+  overlapping.mode_controllers[crane_supervisor::index_of(Mode::Manual)] = {kVelocityController};
+  EXPECT_FALSE(crane_supervisor::validate(overlapping, reason));
+  EXPECT_NE(reason.find(kVelocityController), std::string::npos) << reason;
+
+  // A controller that is both a mode's and the tool claim's: an arm mode change
+  // would deactivate the gripper it is supposed to leave alone (§7.3).
+  auto shared_tool = config_with_modes();
+  shared_tool.tool_controllers = {kFollower};
+  EXPECT_FALSE(crane_supervisor::validate(shared_tool, reason));
+  EXPECT_NE(reason.find("7.3"), std::string::npos) << reason;
+
+  // MODE_IDLE with controllers: releasing the claim would become a claim.
+  auto busy_idle = config_with_modes();
+  busy_idle.mode_controllers[crane_supervisor::index_of(Mode::Idle)] = {kManualController};
+  EXPECT_FALSE(crane_supervisor::validate(busy_idle, reason));
+  EXPECT_NE(reason.find("MODE_IDLE"), std::string::npos) << reason;
+
+  // And the polled view has a deadline like everything else, or the mode would
+  // either always be unknown or never be.
+  auto undated = config_with_modes();
+  undated.controller_manager_deadline = 0.0;
+  EXPECT_FALSE(crane_supervisor::validate(undated, reason));
+  EXPECT_NE(reason.find("controller manager"), std::string::npos) << reason;
+
+  EXPECT_TRUE(crane_supervisor::validate(config_with_modes(), reason)) << reason;
 }

@@ -4,12 +4,62 @@
 // owns the I/O and the timing and nothing else, so every branch below is
 // reachable from a unit test with no ROS runtime in the process.
 //
-// This slice is status and mode only (PRD §2, slice 3). The supervisor's
-// distinguishing capability -- an independent stop path -- is withheld until
-// commissioning prerequisite 3 is verified, so nothing here returns anything
-// that acts: there is no stop, no ramp, no deactivation and no command
-// (wiki/control_architecture.md §5.2). What there is, is a *cause* on every
-// report (PRD user story 53).
+// This slice is status and mode only (PRD §2, slice 3), and since issue 026
+// this file carries both halves of it. The supervisor's distinguishing
+// capability -- an independent stop path -- is still withheld until
+// commissioning prerequisite 3 is verified, so nothing here stops, ramps or
+// commands anything on its own (wiki/control_architecture.md §5.2). What there
+// is, is a *cause* on every report (PRD user story 53), and one narrow
+// authority: which controller holds the claim.
+//
+// # The one authority, and what it is not
+//
+// §7 says manual and autonomous are already mutually exclusive **by resource
+// claim** -- both want the same `velocity` command interfaces, so ros2_control
+// refuses to activate one while the other holds it -- and calls that a sound
+// foundation to keep. What this package adds is not a second exclusion
+// mechanism but a *decision* in front of the existing one: `arbitrate_mode()`
+// answers which mode may hold the claim and says why, so that a refusal is a
+// sentence an operator reads rather than an activation failure somebody has to
+// find in a log.
+//
+// The difference between that and the stop path of §5.2 is the whole of what is
+// still withheld, and it is worth stating rather than implying:
+//
+//   a mode change  is *asked for* on `/crane/set_mode`, by an operator or by
+//                  the task layer, and is answered -- performed, or refused
+//                  with a reason. Every precondition is checked before anything
+//                  is deactivated (PRD §10 step 2, user story 35), so a switch
+//                  that cannot succeed is refused from the mode the machine is
+//                  already in rather than discovered half-way through one.
+//   a stop         would be this supervisor deactivating a claim *on its own*,
+//                  on a fault, and zeroing at the driver boundary. Nothing here
+//                  does that, nothing here may, and no function below is
+//                  reachable except from a request.
+//
+// `MODE_IDLE` is a mode and not a stop, and the report it produces says so
+// outright: releasing the claim is not the same as bringing the machine to
+// rest, because §7.2's measured defect leaves a manual controller's last
+// velocity latched on the interface it just released.
+//
+// # Claims, plural, and why the model is not one per machine
+//
+// §7.3 is the trap this model is shaped around. With the block gripper the tool
+// axis is driven by its **own** controller rather than by the arm's, so it can
+// move while the arm controller is inactive: a second, independent claim on the
+// same pump. A mode model that mapped one machine onto one claim would be wrong
+// on the machine this stack runs on, and would be wrong silently -- it would
+// deactivate a tool controller it never meant to touch, or leave one holding a
+// claim it never accounted for.
+//
+// So `SupervisorConfig` carries the controllers of the **arm claim** per mode
+// and the controllers of the **tool claim** separately, and a mode switch plans
+// over the arm claim alone: the tool claim is reported and never switched by a
+// mode request. What the deployed `fake` and `hardware` profiles configure today
+// is one claim -- `crane_velocity_controller` holds all six `velocity`
+// interfaces including the gripper axis -- so the tool list ships empty and the
+// configuration file says why. The model carries the second claim because §7.3
+// says the machine has one, not because slice 3 can see it.
 //
 // Four inputs are carried end to end, and `Input` below is the registry of
 // them: `crane_msgs/PendulumState` on `/crane/pendulum_state`,
@@ -213,9 +263,12 @@ namespace crane_supervisor
  * package is ROS-free and cannot include the message to say so; the contract
  * test does, and asserts each pair.
  *
- * Only `Idle` is ever reported in this slice. Mode arbitration and
- * `/crane/set_mode` are a later issue, and a supervisor that announced a mode
- * it had not verified would be advertising an arbitration it does not perform.
+ * What is reported is **re-derived from the controller manager on every status
+ * cycle**, never remembered from the last successful `/crane/set_mode` call. A
+ * supervisor whose model of the world drifts from the world is worse than one
+ * that admits it does not know, and a controller that died, was never spawned
+ * or was switched by somebody else is exactly the drift a remembered mode would
+ * hide.
  */
 enum class Mode : std::uint8_t
 {
@@ -224,6 +277,27 @@ enum class Mode : std::uint8_t
   Follow = 2,
   Mpc = 3,
 };
+
+/// How many modes there are. The bound of everything that is per mode.
+inline constexpr std::size_t kModeCount = 4;
+
+/// One mode as its own array index.
+[[nodiscard]] inline constexpr std::size_t index_of(Mode mode) noexcept
+{
+  return static_cast<std::size_t>(mode);
+}
+
+/// True when a raw wire value names one of the four modes.
+/**
+ * `crane_msgs/SetMode` carries a `uint8`, so a caller can ask for 200. Casting
+ * that to `Mode` and arbitrating on it would be undefined behaviour dressed up
+ * as a mode change, and answering it with a plausible mode would be worse: the
+ * request is refused and the response says which values exist.
+ */
+[[nodiscard]] bool is_mode(std::uint8_t value) noexcept;
+
+/// The mode's constant name, as an operator reads it off a panel.
+[[nodiscard]] const char * mode_name(Mode mode) noexcept;
 
 /// Why the stack is not to be trusted, numbered as the message numbers it.
 /**
@@ -466,6 +540,56 @@ struct SupervisorConfig
    */
   std::array<double, kInputCount> freshness_deadline{};
 
+  /// How old the controller manager's answer may be and still say what is
+  /// active, s.
+  /**
+   * Zero for the same reason the four above are: `validate()` refuses it and
+   * the node throws rather than reporting a mode off a snapshot with no margin
+   * on it. It is separate from the array because the thing it bounds is a poll
+   * and not a stream -- see `ControllerManagerReport`.
+   */
+  double controller_manager_deadline{0.0};
+
+  /// Which controllers hold the **arm claim** in each mode, indexed by `Mode`.
+  /**
+   * The names a deployment loaded its controllers under, so this is
+   * configuration and not a constant: the architecture fixes the four modes and
+   * a profile fixes what implements them. `mode_controllers[index_of(Idle)]` is
+   * empty by definition -- `MODE_IDLE` is the absence of a motion claim, not a
+   * controller -- and `validate()` refuses a deployment that gives it one.
+   *
+   * An empty list for a *motion* mode is not an error either: it is the honest
+   * state of a deployment that composes no controller for it, and the request
+   * is refused with that as the reason. `MODE_MANUAL` is empty on today's
+   * profiles for exactly that reason, and `MODE_MPC` is empty because its
+   * producer does not exist until slice 6.
+   *
+   * The non-empty lists must be **pairwise disjoint**, which `validate()`
+   * enforces. That is not tidiness: `active_mode()` reads the machine by asking
+   * which mode's controllers are all active, so a list that were a subset of
+   * another's would make two modes read as active at once and the answer would
+   * depend on the order this file happened to check them in.
+   */
+  std::array<std::vector<std::string>, kModeCount> mode_controllers;
+
+  /// Which controllers hold the **tool claim**, in every mode.
+  /**
+   * §7.3: with the block gripper the tool axis is on its own controller and can
+   * move while the arm controller is inactive, so it is a second claim on the
+   * same pump. No mode owns it and no mode switch touches it -- a request for
+   * `MODE_FOLLOW` neither activates nor deactivates a gripper controller -- and
+   * what the arbitration does with it is *report* it, so that a caller can see
+   * that an arm motion and a gripper action are two claims rather than one
+   * machine.
+   *
+   * Empty on the deployed profiles today, and that is the honest state rather
+   * than a modelling choice: `crane_velocity_controller` claims all six
+   * `velocity` interfaces including `q9_left_rail_joint`, so the CBS stack
+   * currently has one claim. `config/crane_supervisor.yaml` says so beside the
+   * empty list.
+   */
+  std::vector<std::string> tool_controllers;
+
   /// The six rows of `crane_control/config/tracking_tolerance.yaml`, in the
   /// order the actuated joints are configured in.
   /**
@@ -535,6 +659,64 @@ struct StreamReport
   /// `now - header.stamp` of the newest message, s. Negative when the stamp is
   /// in this node's future, which is a clock fault rather than a fresh sample.
   double age{0.0};
+};
+
+/// One controller, as the controller manager described it.
+/**
+ * The three fields of `controller_manager_msgs/ControllerState` this package
+ * reads, and no more. `claimed_interfaces` is here rather than derived because
+ * it is the only thing on the graph that says *which* claim a controller holds:
+ * §7.3's second claim on the same pump is two controllers holding disjoint sets
+ * of command interfaces, and a model that only knew controller names could not
+ * tell that from one controller holding both.
+ */
+struct ControllerReport
+{
+  /// The name the controller manager loaded it under, which is the name a mode
+  /// list names and a switch request carries.
+  std::string name;
+  /// `unconfigured`, `inactive`, `active` or `finalized`, verbatim. Carried and
+  /// not folded into a bool: "not active" covers a controller that is one call
+  /// away from active and one that failed to configure, and a switch that could
+  /// not succeed has to be refused for the right reason.
+  std::string state;
+  /// The command interfaces this controller owns right now.
+  std::vector<std::string> claimed_interfaces;
+};
+
+/// What the controller manager last said about its controllers.
+/**
+ * This is the one input of this supervisor that is **polled** rather than
+ * subscribed, and it is deliberately not an `Input`: the registry above is the
+ * enum of every *subscription* this package holds, and every piece of machinery
+ * around it -- the `subscribe()` helper, the policy row's `topic` and `stopped`
+ * strings, the constructor's claim check -- is shaped for a stream.
+ *
+ * §5.3's rule still applies and is met differently, because the failure is a
+ * different shape. A subscription that stops arriving is invisible without a
+ * deadline; a service that stops answering fails at the call site, where the
+ * node can see it. So the consequence is defined by construction rather than by
+ * a table: no answer, or an answer older than `controller_manager_deadline`,
+ * means the active mode **is not known**, and every report says so in the mode
+ * clause instead of carrying the last mode the supervisor happened to see.
+ *
+ * It raises no fault of its own, and that is a decision rather than an
+ * omission. A controller manager that stops answering `list_controllers` is not
+ * a degraded estimate and is not a stopped machine -- the controllers may be
+ * cycling perfectly -- so `FAULT_STATE_HEALTH` would blame the crane for a hole
+ * in this supervisor's own view. What it does do is refuse every mode change:
+ * `arbitrate_mode()` cannot check a precondition against a view it does not
+ * have, and a switch issued blind is exactly the half-way discovery PRD §10
+ * step 2 forbids.
+ */
+struct ControllerManagerReport
+{
+  /// The transport half, judged by the same `freshness_of()` every input is:
+  /// `received` is whether an answer has ever come back, `age` is how long ago
+  /// the newest one did, on this node's own clock.
+  StreamReport answer;
+  /// One entry per loaded controller, in the order the manager listed them.
+  std::vector<ControllerReport> controllers;
 };
 
 /// What `/crane/pendulum_state` said about itself this cycle.
@@ -660,6 +842,14 @@ struct SupervisorInput
   ControllerStateReport controller_state;
   ControllerHealthReport controller_health;
 
+  /// What the controller manager last said, and how old that answer is.
+  /**
+   * Not one of the `streams` above, because it is polled rather than
+   * subscribed; judged by the same `freshness_of()` they are, because the
+   * question "is this old enough to stop believing" is the same question.
+   */
+  ControllerManagerReport controller_manager;
+
   /// The emergency-stop latch as the previous cycle left it.
   /**
    * The latch is state and the core is a pure function, so the state is
@@ -702,6 +892,16 @@ struct SupervisorInput
 /// One decision, in the shape `crane_msgs/SupervisorStatus` carries it.
 struct SupervisorDecision
 {
+  /// What is **active** right now, re-derived from the controller manager.
+  /**
+   * Never the last mode a `/crane/set_mode` call succeeded in reaching. When
+   * the manager's answer is absent or stale the mode is not known, and this
+   * field carries `Idle` -- the value that claims the least, since no motion
+   * mode can be confirmed to hold the claim -- while the mode clause on the
+   * message says outright that it is not known and why. `Idle` here therefore
+   * means "no configured motion mode is known to be active", which is also what
+   * it means when the manager answers and nothing is running.
+   */
   Mode mode{Mode::Idle};
   Fault fault{Fault::StateHealth};
   /// Max over the actuated joints of the absolute *position* error, rad or m,
@@ -869,6 +1069,146 @@ struct ClearFaultOutcome
  */
 [[nodiscard]] ClearFaultOutcome clear_fault(
   const SupervisorConfig & config, const SupervisorInput & input);
+
+/// What the controller manager's answer says is active, per claim.
+/**
+ * Read from the world rather than remembered, every status cycle and again on
+ * every `/crane/set_mode` call.
+ */
+struct ActiveMode
+{
+  /// The mode whose controllers are **all** active, or `Idle` when none is.
+  Mode mode{Mode::Idle};
+  /// False when the manager's answer is absent or stale, so `mode` above is the
+  /// value that claims the least rather than an observation.
+  bool known{false};
+  /// Which of the two it is, judged by the same rule every input is judged by.
+  Staleness cause{Staleness::NeverArrived};
+  /// The controllers of the arm claim that are active right now, named.
+  /**
+   * Named and not counted, for the reason the uncommissioned axes are: a report
+   * that says `crane_velocity_controller` tells somebody what to look at.
+   */
+  std::vector<std::string> active_controllers;
+  /// The controllers of the **tool claim** that are active right now (§7.3).
+  /**
+   * Reported and never switched. It is a separate list because a gripper action
+   * and an arm motion are two claims on the same pump, and a report that added
+   * them together would be the one-claim-per-machine model this package does
+   * not use.
+   */
+  std::vector<std::string> active_tool_controllers;
+  /// Active controllers this supervisor's model does not account for.
+  /**
+   * A controller that is active, owns command interfaces, and is in no mode
+   * list and not in the tool list. It is **reported and not refused**: the
+   * broadcasters own no command interface and would be false alarms, while a
+   * controller that does own one is a third claim on the same pump that this
+   * configuration never described. §7.3's point is that the machine has more
+   * claims than a mode model has modes, so the honest thing is to say which
+   * rather than to pretend the list is closed.
+   */
+  std::vector<std::string> unmodelled_claimants;
+  /// True when the active controllers do not form exactly one configured mode.
+  /**
+   * Either some of a mode's controllers are up and not all of them, or two
+   * modes are complete at once. Both mean the world drifted: something was
+   * activated or died outside a mode change. `mode` is `Idle`, because no
+   * configured motion mode holds the claim on its own, and the clause names the
+   * controllers that are up so that the half-state is visible rather than
+   * rounded off into a mode nobody can act on.
+   */
+  bool partial{false};
+};
+
+/// How the mode clause every report ends in opens.
+/**
+ * Exported for the same reason `kSettledClausePrefix` is: a test that has to
+ * find the seam should not have to write the sentence out a second time.
+ */
+inline constexpr char kModeClausePrefix[] = " Mode: ";
+
+/// One `/crane/set_mode` decision, before anything has been switched.
+/**
+ * Total in the same sense `decide()` is: every request produces an answer with
+ * a cause, and `message` is never empty (ROS 2 Interfaces §1, PRD user story
+ * 36). A refused switch that leaves an operator with an unexplained no-op is
+ * the failure this struct exists against.
+ */
+struct ModeArbitration
+{
+  /// Whether the request is admissible. False means refused, and `message`
+  /// says by which precondition.
+  bool accepted{false};
+  /// Whether a switch is owed. False with `accepted` true is the request for
+  /// the mode that is already active: nothing is issued and it is reported as
+  /// a no-op rather than as a switch.
+  bool switch_required{false};
+  /// The controllers to activate, in the order they must come up.
+  std::vector<std::string> activate;
+  /// The controllers to deactivate. Only ever controllers of the arm claim:
+  /// no mode request touches the tool claim (§7.3).
+  std::vector<std::string> deactivate;
+  /// What is active **now**, before anything is switched. This is what the
+  /// response carries when the request is refused, because a refusal leaves the
+  /// machine in the mode it was already in.
+  ActiveMode active;
+  /// Why, in words an operator can act on. Never empty.
+  std::string message;
+};
+
+/// What the controller manager's answer says is active.
+/**
+ * A mode is active when **every** controller configured for it is active. That
+ * is why `validate()` insists the mode lists be pairwise disjoint: with nested
+ * lists two modes could satisfy the test at once and the answer would be
+ * whichever this function looked at first.
+ */
+[[nodiscard]] ActiveMode active_mode(
+  const SupervisorConfig & config, const ControllerManagerReport & report);
+
+/// The mode clause, for the end of any report. Never empty.
+[[nodiscard]] std::string mode_clause(const SupervisorConfig & config, const ActiveMode & active);
+
+/// One `/crane/set_mode` request, arbitrated. Nothing is switched here.
+/**
+ * Every precondition is evaluated **before** the plan is returned, and the plan
+ * is a single activate/deactivate pair for one `switch_controller` call, so a
+ * switch that cannot succeed is refused from the mode the machine is already in
+ * and is never discovered half-way (PRD §10 step 2, user story 35). In order:
+ *
+ *   1. the request names one of the four modes;
+ *   2. `MODE_MPC` is refused -- the horizon freshness of PRD §10 step 2 cannot
+ *      be verified because no producer exists until slice 6;
+ *   3. the controller manager has answered inside its deadline, since a
+ *      precondition cannot be checked against a view this supervisor does not
+ *      have;
+ *   4. the mode asked for is not the one already active;
+ *   5. a latched fault refuses a switch into a *motion* mode, with the latched
+ *      cause as the reason. `MODE_IDLE` is not refused by it: releasing the
+ *      claim is the one direction a latched stop does not argue against;
+ *   6. the deployment configures controllers for the mode;
+ *   7. every one of them is loaded on the manager and is in a state a switch
+ *      can move.
+ *
+ * `input` is the same observation `decide()` is judged from, deliberately: an
+ * arbitration that consulted a second, older view of the stop signal could
+ * admit a switch whose refusal the very next status cycle still stands by.
+ */
+[[nodiscard]] ModeArbitration arbitrate_mode(
+  const SupervisorConfig & config, std::uint8_t requested, const SupervisorInput & input);
+
+/// The account of a switch that was issued, once the outcome is known.
+/**
+ * Composed here rather than in the adapter so that the sentence an operator
+ * reads is written once, beside the arbitration that produced the plan.
+ * `reached` is the mode the controller manager reports **after** the call --
+ * `active_mode` on the response is what is actually active, never what was
+ * asked for.
+ */
+[[nodiscard]] std::string mode_switch_message(
+  const SupervisorConfig & config, Mode requested, const ModeArbitration & arbitration,
+  bool switched, const std::string & carried, const ActiveMode & reached);
 
 }  // namespace crane_supervisor
 

@@ -108,6 +108,109 @@ crane_supervisor:
       can move underneath a running stream makes the status unreproducible."
     validation:
       bounds<>: [0.001, 10.0]
+  controller_manager_timeout:
+    type: double
+    default_value: 0.25
+    read_only: true
+    description: "How old the controller manager's newest list_controllers answer
+      may be and still say which mode is active, s. Past it the mode reported on
+      /crane/supervisor/status is *not known* and every mode change is refused,
+      because a precondition cannot be checked against a view this supervisor
+      does not have (PRD 10 step 2). This is the one input of this node that is
+      polled rather than subscribed, so it is deliberately not an Input of the
+      registry above -- the failure has a different shape, and
+      ControllerManagerReport in supervisor_core.hpp says how 5.3's rule is met
+      for it. Derived like the two 20 Hz margins and to the same number: the poll
+      goes out once per 20 Hz status cycle and the answer is taken on a later
+      one, so a healthy answer is up to 50 ms of round trip plus 50 ms of status
+      period old when it is read, and the worst control-cycle gap in the recorded
+      machine data adds a further 50.4 ms; 250 ms clears the resulting 150 ms
+      without letting a manager that stopped answering pass for one that is still
+      there. Unlike the four above, the age is measured from *arrival* rather
+      than from a header stamp: ListControllers carries no header, so there is
+      nothing else to date it by -- which is weaker, and weaker in the safe
+      direction, since it cannot be fooled by a publisher whose clock ran ahead.
+      Read-only, for the reason the other margins are."
+    validation:
+      bounds<>: [0.001, 10.0]
+  # Which controller holds the claim in each mode
+  # (wiki/control_architecture.md 7), and which holds the tool claim (7.3).
+  #
+  # **Names, not types, and therefore configuration.** The architecture fixes
+  # the four modes of crane_msgs/SupervisorStatus; a bringup profile fixes what
+  # implements them and under which names the controller manager loads them. A
+  # supervisor that hardcoded either would arbitrate over a machine other than
+  # the one it was composed onto.
+  #
+  # Every list defaults to empty and an empty list is not an error: it is the
+  # honest state of a deployment that composes no controller for that mode, and
+  # a request for it is refused with that as the reason rather than answered
+  # with a switch that would do nothing. MODE_IDLE has no list at all -- it is
+  # the absence of a motion claim -- and validate() refuses one that has been
+  # given controllers.
+  #
+  # The non-empty lists must be pairwise disjoint, which validate() enforces:
+  # the active mode is read by asking which mode's controllers are *all* active,
+  # so a controller in two lists would make two modes read as active at once.
+  mode_controllers:
+    manual:
+      type: string_array
+      default_value: []
+      read_only: true
+      description: "The controllers that hold the arm claim in MODE_MANUAL, in
+        the order they must be activated. Empty on the CBS profiles today: the
+        manual forwarding and proportional controllers live in the retained
+        stack and no `fake` or `hardware` profile composes one, so MODE_MANUAL is
+        a mode this deployment does not implement and the request is refused with
+        that as the reason. Read-only: which controller drives the machine in a
+        mode is not a runtime adjustment."
+      validation:
+        unique<>: null
+    follow:
+      type: string_array
+      default_value: []
+      read_only: true
+      description: "The controllers that hold the arm claim in MODE_FOLLOW, in
+        the order they must be activated -- which is the cascade's order of
+        PRD 5: the inner velocity loop is active before anything chains onto its
+        reference interfaces. config/crane_supervisor.yaml names the pair the
+        `fake` and `hardware` profiles spawn. Read-only, for the reason
+        mode_controllers.manual is."
+      validation:
+        unique<>: null
+    mpc:
+      type: string_array
+      default_value: []
+      read_only: true
+      description: "The controllers that hold the arm claim in MODE_MPC. Empty,
+        and it stays empty until slice 6: there is no horizon producer, so PRD 10
+        step 2's freshness check cannot pass and MODE_MPC is refused before this
+        list is ever consulted. It is declared now so that slice 6 is an
+        activation rather than a build. Read-only, for the reason
+        mode_controllers.manual is."
+      validation:
+        unique<>: null
+  tool_controllers:
+    type: string_array
+    default_value: []
+    read_only: true
+    description: "The controllers that hold the **tool claim**
+      (wiki/control_architecture.md 7.3), in every mode. With the block gripper
+      the tool axis is driven by its own controller rather than by the arm's, so
+      it can move while the arm controller is inactive: a second, independent
+      claim on the same pump. No mode owns it and no mode switch touches it --
+      a request for MODE_FOLLOW neither activates nor deactivates a gripper
+      controller -- and what the arbitration does with it is report it, so that a
+      caller can see that an arm motion and a gripper action are two claims
+      rather than one machine. Empty on the CBS profiles today, and that is the
+      honest state rather than a modelling choice: crane_velocity_controller
+      claims all six velocity interfaces including q9_left_rail_joint, so this
+      deployment has one claim. A controller may not appear both here and in a
+      mode list; validate() refuses that, because an arm mode change would then
+      deactivate the gripper it is supposed to leave alone. Read-only, for the
+      reason the mode lists are."
+    validation:
+      unique<>: null
   # The sway duty of wiki/control_architecture.md 5 row 7. Four numbers, and
   # **every one of them is a design value rather than a measured one** -- each
   # description below says what it was derived from and what would replace it.

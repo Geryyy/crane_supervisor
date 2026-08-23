@@ -1,0 +1,58 @@
+# The controllers the in-process controller-manager harness of
+# `test_mode_switch.cpp` loads.  Three of them, and what matters about each is
+# the **claim** it holds -- not what it computes.
+#
+# `follow_velocity_controller` and `manual_velocity_controller` are two
+# controllers on the same five arm joints, so they want the same five `velocity`
+# command interfaces and ros2_control refuses to activate one while the other
+# holds it.  That is exactly the exclusion wiki/control_architecture.md 7 calls a
+# sound foundation to keep, reproduced here at test scale: what this issue adds
+# is the arbitrated decision in front of it, and a harness whose two modes did
+# not actually conflict would prove nothing about that.
+#
+# `tool_velocity_controller` is the second claim of 7.3.  It holds the gripper
+# axis alone, so it can be active while either arm controller is, and the test
+# asserts that an arm mode change leaves it exactly where it was.  The deployed
+# CBS profiles have no such controller -- `crane_velocity_controller` claims all
+# six `velocity` interfaces including `q9_left_rail_joint` -- so this file is
+# where the second claim exists at all today, and `config/crane_supervisor.yaml`
+# says so beside its empty `tool_controllers`.
+#
+# Stand-ins, deliberately: `velocity_controllers/JointGroupVelocityController` is
+# a real controller from the ros2_control distribution, and none of the
+# properties this harness asserts is a property of its control law.  What the
+# real FOLLOW pair does -- the chained cascade of PRD 5, activated inner loop
+# first -- is a property of the *plan*, and it is asserted offline in
+# `test_supervisor_core.cpp`, where a two-controller mode needs no hardware.
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+    follow_velocity_controller:
+      type: velocity_controllers/JointGroupVelocityController
+    manual_velocity_controller:
+      type: velocity_controllers/JointGroupVelocityController
+    tool_velocity_controller:
+      type: velocity_controllers/JointGroupVelocityController
+
+follow_velocity_controller:
+  ros__parameters:
+    joints:
+      - theta1_slewing_joint
+      - theta2_boom_joint
+      - theta3_arm_joint
+      - q4_big_telescope
+      - theta8_rotator_joint
+
+manual_velocity_controller:
+  ros__parameters:
+    joints:
+      - theta1_slewing_joint
+      - theta2_boom_joint
+      - theta3_arm_joint
+      - q4_big_telescope
+      - theta8_rotator_joint
+
+tool_velocity_controller:
+  ros__parameters:
+    joints:
+      - q9_left_rail_joint

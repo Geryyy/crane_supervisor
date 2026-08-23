@@ -391,9 +391,16 @@ protected:
       // it, and status data carries no geometric expression frame.
       EXPECT_NE(rclcpp::Time(status.header.stamp).nanoseconds(), 0);
       EXPECT_EQ(status.header.frame_id, "");
-      // Mode arbitration is a later issue; the supervisor never reports a mode
-      // it has not verified.
+      // There is no controller manager on this domain, which is exactly the
+      // case the mode clause exists for: the mode is *not known*, MODE_IDLE is
+      // reported because no motion mode can be confirmed, and the words say
+      // which of the two it is.  A supervisor that remembered a mode instead
+      // would put one here off a request that never happened.  Real switches
+      // against a real manager are `test_mode_switch.cpp`.
       EXPECT_EQ(status.mode, SupervisorStatus::MODE_IDLE);
+      EXPECT_NE(status.message.find(crane_supervisor::kModeClausePrefix), std::string::npos)
+        << status.message;
+      EXPECT_NE(status.message.find("not known"), std::string::npos) << status.message;
       // PRD user story 53: every report carries a cause.
       EXPECT_FALSE(status.message.empty()) << static_cast<int>(status.fault);
     }

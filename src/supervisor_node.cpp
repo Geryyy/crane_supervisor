@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "crane_supervisor/crane_supervisor_parameters.hpp"
 
@@ -42,6 +43,13 @@ std::string deadline_summary(const SupervisorConfig & config)
       seconds_text(config.freshness_deadline[i]) + " s";
   }
   return text;
+}
+
+/// Seconds as a `std::chrono` duration, for the two blocking waits.
+std::chrono::nanoseconds budget(double seconds)
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::duration<double>(seconds));
 }
 
 }  // namespace
@@ -91,7 +99,18 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   config_.deadline(Input::RemoteCtrl) = parameters.remote_ctrl_timeout;
   config_.deadline(Input::ControllerState) = parameters.controller_state_timeout;
   config_.deadline(Input::ControllerHealth) = parameters.controller_health_timeout;
+  config_.controller_manager_deadline = parameters.controller_manager_timeout;
   config_.deadman_button = static_cast<int>(parameters.deadman_button);
+
+  // Which controller holds the claim in each mode, and which holds the tool
+  // claim. Names and not types: the controller manager loads by name, a profile
+  // chooses the names, and this supervisor arbitrates between whatever it was
+  // told. `MODE_IDLE` gets no list -- it is the absence of a motion claim -- and
+  // `validate()` refuses one that has been given controllers.
+  config_.mode_controllers[index_of(Mode::Manual)] = parameters.mode_controllers.manual;
+  config_.mode_controllers[index_of(Mode::Follow)] = parameters.mode_controllers.follow;
+  config_.mode_controllers[index_of(Mode::Mpc)] = parameters.mode_controllers.mpc;
+  config_.tool_controllers = parameters.tool_controllers;
 
   // The sway duty's bounds, in the order `PassiveAxis` fixes -- which is also
   // the order `crane_msgs/PendulumState` publishes its two arrays in, so nothing
@@ -223,6 +242,31 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
       RCLCPP_INFO(get_logger(), "%s: %s", kClearFaultService, outcome.message.c_str());
     });
 
+  // The arbitration of ROS 2 Interfaces §5, and the only way a mode changes.
+  // It is served on the default callback group, so the outer executor answers
+  // it; the blocking calls it makes go out on the private group below.
+  set_mode_service_ = create_service<crane_msgs::srv::SetMode>(
+    kSetModeService,
+    [this](
+      const crane_msgs::srv::SetMode::Request::SharedPtr request,
+      crane_msgs::srv::SetMode::Response::SharedPtr response) {
+      set_mode(request, response);
+    });
+
+  // The one exception to this package's absence of a path to the machine, and
+  // the reason it is safe to have: the group is never added to the executor
+  // that spins this node, so the two clients below are served only by the
+  // private executor, only from the two places that spin it.
+  controller_manager_group_ =
+    create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+  controller_manager_executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+  controller_manager_executor_->add_callback_group(
+    controller_manager_group_, get_node_base_interface());
+  list_controllers_ = create_client<controller_manager_msgs::srv::ListControllers>(
+    kListControllersService, rmw_qos_profile_services_default, controller_manager_group_);
+  switch_controller_ = create_client<controller_manager_msgs::srv::SwitchController>(
+    kSwitchControllerService, rmw_qos_profile_services_default, controller_manager_group_);
+
   // The freshness sweep runs from here and from nowhere else. A deadline
   // evaluated in a subscription callback could not fire on the stream that
   // stopped, which is the only stream it exists for.
@@ -232,12 +276,15 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
     get_logger(),
     "crane_supervisor: publishing %s at %.1f Hz. Every input it holds has a freshness deadline of "
     "its own and none is exempt -- %s -- and an input that stops arriving is reported as a fault "
-    "rather than left at FAULT_NONE. Button %d of the remote is the deadman. It serves %s and "
-    "does nothing else. It holds no stop authority: the hardware stop input is an unverified "
-    "commissioning prerequisite, so the package has no path to a motion command by construction, "
-    "and what it does with the emergency stop is diagnosis and recovery rather than protection.",
+    "rather than left at FAULT_NONE. Button %d of the remote is the deadman. It serves %s and %s. "
+    "The mode it reports is re-derived from %s every cycle and never remembered, and %s is the one "
+    "call this package makes that reaches the machine -- narrowly: it decides which controller "
+    "holds the claim and carries no setpoint. It holds no stop authority: the hardware stop input "
+    "is an unverified commissioning prerequisite, so releasing a claim on MODE_IDLE is a mode "
+    "change somebody asked for and not a way to bring the machine to rest, and what it does with "
+    "the emergency stop is diagnosis and recovery rather than protection.",
     kStatusTopic, kStatusRate, deadline_summary(config_).c_str(), config_.deadman_button,
-    kClearFaultService);
+    kClearFaultService, kSetModeService, kListControllersService, kSwitchControllerService);
 }
 
 SupervisorInput SupervisorNode::observe() const
@@ -316,6 +363,8 @@ SupervisorInput SupervisorNode::observe() const
     }
   }
 
+  input.controller_manager = observe_controller_manager();
+
   if (controller_health_) {
     const auto & message = *controller_health_;
     // A cast and not a lookup table: the message and the core's enum share one
@@ -337,8 +386,192 @@ SupervisorInput SupervisorNode::observe() const
   return input;
 }
 
+ControllerManagerReport SupervisorNode::observe_controller_manager() const
+{
+  ControllerManagerReport report;
+  if (!controllers_) {
+    return report;
+  }
+  report.answer.received = true;
+  // Arrival and not a stamp: `ListControllers` carries no header, so the only
+  // thing this answer can be aged against is when this node heard it. That is a
+  // weaker measurement than the four streams' and it is weaker in the safe
+  // direction -- it cannot be fooled by a producer whose clock ran ahead.
+  report.answer.age = (now() - controllers_at_).seconds();
+  report.controllers.reserve(controllers_->controller.size());
+  for (const auto & controller : controllers_->controller) {
+    ControllerReport entry;
+    entry.name = controller.name;
+    entry.state = controller.state;
+    entry.claimed_interfaces = controller.claimed_interfaces;
+    report.controllers.push_back(std::move(entry));
+  }
+  return report;
+}
+
+void SupervisorNode::poll_controller_manager()
+{
+  // The private group's only non-blocking spin. Anything the two clients have
+  // waiting is dispatched here, on the status cycle, on the outer executor's
+  // own thread.
+  controller_manager_executor_->spin_some();
+
+  if (pending_snapshot_.has_value()) {
+    if (
+      pending_snapshot_->future.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+    {
+      controllers_ = pending_snapshot_->future.get();
+      controllers_at_ = now();
+      pending_snapshot_.reset();
+      return;
+    }
+    // A request that outlived its own deadline is dropped rather than waited
+    // on. Left in flight it would block every later poll, and the snapshot
+    // would then age out and read as "not known" for a reason that is this
+    // node's rather than the manager's.
+    if ((now() - pending_snapshot_->sent_at).seconds() > config_.controller_manager_deadline) {
+      list_controllers_->remove_pending_request(pending_snapshot_->request_id);
+      pending_snapshot_.reset();
+    }
+    return;
+  }
+
+  if (!list_controllers_->service_is_ready()) {
+    return;
+  }
+  auto pending = list_controllers_->async_send_request(
+    std::make_shared<controller_manager_msgs::srv::ListControllers::Request>());
+  const std::int64_t request_id = pending.request_id;
+  pending_snapshot_ = PendingSnapshot{pending.future.share(), request_id, now()};
+}
+
+bool SupervisorNode::refresh_controller_manager(double timeout)
+{
+  // A poll in flight is abandoned first: its answer is older than the one about
+  // to be asked for, and letting it land afterwards would replace a fresh view
+  // of the machine with a stale one at the worst possible moment.
+  if (pending_snapshot_.has_value()) {
+    list_controllers_->remove_pending_request(pending_snapshot_->request_id);
+    pending_snapshot_.reset();
+  }
+  if (!list_controllers_->service_is_ready()) {
+    return false;
+  }
+
+  auto pending = list_controllers_->async_send_request(
+    std::make_shared<controller_manager_msgs::srv::ListControllers::Request>());
+  const std::int64_t request_id = pending.request_id;
+  auto future = pending.future.share();
+  if (
+    controller_manager_executor_->spin_until_future_complete(future, budget(timeout)) !=
+    rclcpp::FutureReturnCode::SUCCESS)
+  {
+    list_controllers_->remove_pending_request(request_id);
+    // The snapshot is left exactly as it was. An old answer is aged and
+    // reported as old; it is never replaced by a guess.
+    return false;
+  }
+  controllers_ = future.get();
+  controllers_at_ = now();
+  return true;
+}
+
+bool SupervisorNode::switch_controllers(
+  const std::vector<std::string> & activate, const std::vector<std::string> & deactivate,
+  std::string & account)
+{
+  if (!switch_controller_->service_is_ready()) {
+    account =
+      "the controller manager's switch service is not reachable from this node, so the switch was "
+      "never issued and nothing was deactivated";
+    return false;
+  }
+
+  auto request = std::make_shared<controller_manager_msgs::srv::SwitchController::Request>();
+  request->activate_controllers = activate;
+  request->deactivate_controllers = deactivate;
+  // Strict, and both lists in one request: a best-effort switch that activated
+  // half of a mode would leave the machine in a state no mode names, and two
+  // requests would put it through one. §7's exclusion by resource claim is what
+  // makes the single strict call the right shape -- the manager refuses the
+  // whole thing rather than letting two claimants meet.
+  request->strictness = controller_manager_msgs::srv::SwitchController::Request::STRICT;
+  request->activate_asap = true;
+  request->timeout = rclcpp::Duration::from_seconds(kSwitchControllerTimeout);
+
+  auto pending = switch_controller_->async_send_request(request);
+  const std::int64_t request_id = pending.request_id;
+  auto future = pending.future.share();
+  if (
+    controller_manager_executor_->spin_until_future_complete(future, budget(kSwitchBudget)) !=
+    rclcpp::FutureReturnCode::SUCCESS)
+  {
+    switch_controller_->remove_pending_request(request_id);
+    account =
+      "the call did not come back inside this node's own budget, so whether the manager performed "
+      "the switch is unknown here -- which is why active_mode below is read back off the manager "
+      "rather than assumed";
+    return false;
+  }
+  const auto response = future.get();
+  account = response->message;
+  return response->ok;
+}
+
+void SupervisorNode::set_mode(
+  const crane_msgs::srv::SetMode::Request::SharedPtr request,
+  crane_msgs::srv::SetMode::Response::SharedPtr response)
+{
+  // Truth about the machine, taken now. Every precondition below is checked
+  // against this snapshot, before anything is deactivated (PRD §10 step 2): a
+  // switch that cannot succeed is refused from the mode the machine is already
+  // in. A stale snapshot would make `arbitrate_mode()` refuse for want of a
+  // view, which is the safe direction for this failure to fall in.
+  refresh_controller_manager(kControllerManagerCallBudget);
+
+  const ModeArbitration arbitration = arbitrate_mode(config_, request->mode, observe());
+  if (!arbitration.accepted || !arbitration.switch_required) {
+    // ROS 2 Interfaces §1: `success` and an explanation, never an empty
+    // success. `active_mode` is what is active, which after a refusal is the
+    // mode the machine was already in.
+    response->success = arbitration.accepted;
+    response->message = arbitration.message + mode_clause(config_, arbitration.active);
+    response->active_mode = static_cast<std::uint8_t>(arbitration.active.mode);
+    if (arbitration.accepted) {
+      RCLCPP_INFO(get_logger(), "%s: %s", kSetModeService, response->message.c_str());
+    } else {
+      RCLCPP_WARN(get_logger(), "%s: %s", kSetModeService, response->message.c_str());
+    }
+    return;
+  }
+
+  const Mode requested = static_cast<Mode>(request->mode);
+  std::string account;
+  const bool switched = switch_controllers(arbitration.activate, arbitration.deactivate, account);
+
+  // Read back, never assumed. `active_mode` on the response is what is actually
+  // active after the call -- that is the whole reason the mode is re-derived at
+  // all, and a switch the manager accepted can still land somewhere else.
+  refresh_controller_manager(kControllerManagerCallBudget);
+  const ActiveMode reached = active_mode(config_, observe_controller_manager());
+
+  response->success = switched && reached.known && !reached.partial && reached.mode == requested;
+  response->message =
+    mode_switch_message(config_, requested, arbitration, switched, account, reached);
+  response->active_mode = static_cast<std::uint8_t>(reached.mode);
+  if (response->success) {
+    RCLCPP_INFO(get_logger(), "%s: %s", kSetModeService, response->message.c_str());
+  } else {
+    RCLCPP_WARN(get_logger(), "%s: %s", kSetModeService, response->message.c_str());
+  }
+}
+
 void SupervisorNode::update()
 {
+  // Before the decision, so that the mode on this report is re-derived from the
+  // newest answer the manager has given rather than from the one before it.
+  poll_controller_manager();
+
   const SupervisorDecision decision = decide(config_, observe());
   // The two things a cycle carries into the next one. `decide()` raises the
   // latch and only an acknowledged `/crane/clear_fault` lowers it; the sway dwell

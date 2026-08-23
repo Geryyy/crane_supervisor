@@ -1,0 +1,16 @@
+# The `crane_supervisor` node of ROS 2 Interfaces 2, as the `fake` and
+# `hardware` profiles of crane_bringup compose it.
+#
+# One parameter, because everything else about this node is a contract rather
+# than a setting: the topic names of ROS 2 Interfaces 4 and the 20 Hz status
+# rate of ROS 2 Interfaces 2 are constants in the source, so a deployment cannot
+# rename or re-rate a stream the task layer and the operator panel subscribe to.
+# What is left is the one number that is a property of a rig rather than of the
+# architecture.
+crane_supervisor:
+  ros__parameters:
+    # Seconds. See src/crane_supervisor_parameters.yaml for the derivation and
+    # for why it is read-only. The margin only has to separate "arriving" from
+    # "stopped"; the general staleness policy of control_architecture.md 5.3 is
+    # a later issue.
+    pendulum_state_timeout: 0.15

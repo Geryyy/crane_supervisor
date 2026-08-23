@@ -1,0 +1,22 @@
+crane_supervisor:
+  pendulum_state_timeout:
+    type: double
+    default_value: 0.15
+    read_only: true
+    description: "Longest age of the newest crane_msgs/PendulumState on
+      /crane/pendulum_state that still counts as arriving, s. Past it the
+      supervisor reports FAULT_STATE_HEALTH: wiki/control_architecture.md 5.3
+      allows no input to stop arriving without a defined consequence, and this
+      margin is what turns 'stopped' into that consequence for the one input
+      this slice carries. Derived, not measured, and deliberately loose --
+      100 Hz publication sampled at 20 Hz makes a healthy sample up to 60 ms old
+      when it is read, and the worst control-cycle gap in the recorded machine
+      data is a further 50.4 ms, so 150 ms clears a healthy stack without
+      hiding a dead publisher for a human-perceptible time. The general
+      staleness policy of 5.3 -- per input, per consequence -- is a later issue
+      and will want a tighter number than this one. Read-only: the fault this
+      margin decides is the only thing the tracer proves, and a margin an
+      operator can move underneath a running stream makes the status
+      unreproducible."
+    validation:
+      bounds<>: [0.001, 10.0]

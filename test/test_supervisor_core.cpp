@@ -93,7 +93,44 @@ crane_supervisor::RemoteCtrlReport held_remote()
   return remote;
 }
 
-/// Both inputs arriving, in time, trusted, with the operator holding the button.
+/// The inner velocity loop arriving, in time, with nothing to report.
+/**
+ * Deliberately not a default-constructed `ControllerHealthReport`: that one has
+ * never arrived, and §5.3's rule is that an input which is not arriving is a
+ * fault rather than a quiet FAULT_NONE. A fixture that wants a healthy stack has
+ * to say that this stream is arriving, exactly as it already has to for the
+ * other three.
+ */
+crane_supervisor::ControllerHealthReport healthy_inner_loop()
+{
+  crane_supervisor::ControllerHealthReport inner_loop;
+  inner_loop.received = true;
+  inner_loop.age = 0.01;
+  inner_loop.fault = crane_supervisor::Fault::None;
+  return inner_loop;
+}
+
+/// The report `crane_velocity_controller` publishes on the `hardware` profile
+/// today: prerequisite 4 is missing, so the gripper axis ran PI only and the
+/// loop raises the commissioning code and names the axis.
+crane_supervisor::ControllerHealthReport uncommissioned_gripper()
+{
+  crane_supervisor::ControllerHealthReport inner_loop = healthy_inner_loop();
+  inner_loop.fault = crane_supervisor::Fault::NotCommissioned;
+  inner_loop.feedforward_free_joints = {"q9_left_rail_joint"};
+  return inner_loop;
+}
+
+/// The same loop with one of its own codes, and no axis to name for it.
+crane_supervisor::ControllerHealthReport inner_loop_fault(crane_supervisor::Fault fault)
+{
+  crane_supervisor::ControllerHealthReport inner_loop = healthy_inner_loop();
+  inner_loop.fault = fault;
+  return inner_loop;
+}
+
+/// All four inputs arriving, in time, trusted, with the operator holding the
+/// button and the inner loop reporting nothing wrong with itself.
 crane_supervisor::SupervisorInput healthy_input()
 {
   crane_supervisor::SupervisorInput input;
@@ -103,6 +140,7 @@ crane_supervisor::SupervisorInput healthy_input()
   input.pendulum_state.status = "complementary filter on the two bracketing IMUs";
   input.remote_ctrl = held_remote();
   input.controller_state = tracking_controller();
+  input.controller_health = healthy_inner_loop();
   return input;
 }
 
@@ -147,6 +185,14 @@ TEST(SupervisorCore, RejectsAMarginThatCannotSeparateArrivingFromStopped)
   EXPECT_FALSE(reason.empty());
 
   config.controller_state_timeout = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_FALSE(crane_supervisor::validate(config, reason));
+
+  config = crane_supervisor::SupervisorConfig{};
+  config.controller_health_timeout = 0.0;
+  EXPECT_FALSE(crane_supervisor::validate(config, reason));
+  EXPECT_FALSE(reason.empty());
+
+  config.controller_health_timeout = std::numeric_limits<double>::quiet_NaN();
   EXPECT_FALSE(crane_supervisor::validate(config, reason));
 
   EXPECT_TRUE(crane_supervisor::validate(default_config(), reason));
@@ -765,6 +811,205 @@ TEST(SupervisorCore, AControllerThatStoppedPublishingIsNotACraneTrackingPerfectl
   EXPECT_EQ(crane_supervisor::decide(config, inside).fault, crane_supervisor::Fault::None);
 }
 
+TEST(SupervisorCore, AnInnerLoopThatStoppedReportingIsNotAnInnerLoopWithNothingToReport)
+{
+  // §5.3 applied to the fourth input.  It is the one absence with a consequence
+  // the other three do not have: an uncommissioned axis reported to nobody is
+  // the state this whole stream exists to end, so a report that is not arriving
+  // must not read as a loop that is saying nothing is wrong.
+  const auto config = default_config();
+
+  auto never = healthy_input();
+  never.controller_health = crane_supervisor::ControllerHealthReport{};
+
+  auto stopped = healthy_input();
+  stopped.controller_health = uncommissioned_gripper();
+  stopped.controller_health.age = 10.0;
+
+  auto ahead = healthy_input();
+  ahead.controller_health.age = -10.0;
+
+  std::vector<std::string> messages;
+  for (const auto & input : {never, stopped, ahead}) {
+    const auto decision = crane_supervisor::decide(config, input);
+    EXPECT_EQ(decision.fault, crane_supervisor::Fault::StateHealth);
+    EXPECT_FALSE(decision.message.empty());
+    messages.push_back(decision.message);
+  }
+  EXPECT_NE(messages[0], messages[1]);
+  EXPECT_NE(messages[1], messages[2]);
+  EXPECT_NE(messages[0], messages[2]);
+  // The stale report's own code is not republished as if it were current: what
+  // is reported is that nobody knows, not what the loop last said.
+  EXPECT_EQ(messages[1].find("not commissioned"), std::string::npos) << messages[1];
+  EXPECT_NE(messages[1].find("10.000"), std::string::npos) << messages[1];
+  EXPECT_NE(messages[2].find("future"), std::string::npos) << messages[2];
+
+  // A margin's worth of age is still arriving, on both sides of now, exactly as
+  // the other three inputs are read.
+  auto inside = healthy_input();
+  inside.controller_health.age = config.controller_health_timeout;
+  EXPECT_EQ(crane_supervisor::decide(config, inside).fault, crane_supervisor::Fault::None);
+  inside.controller_health.age = -config.controller_health_timeout;
+  EXPECT_EQ(crane_supervisor::decide(config, inside).fault, crane_supervisor::Fault::None);
+}
+
+TEST(SupervisorCore, TheInnerLoopsOwnCodesAreCarriedRatherThanTranslated)
+{
+  // The loop computes its verdict from the state interfaces it claims itself
+  // and from the identified map of the tool it is driving, and nothing above
+  // the controller manager can see either.  So the code arrives as a
+  // `crane_msgs/SupervisorStatus` constant and is merged, not translated.
+  const auto config = default_config();
+  auto input = healthy_input();
+
+  input.controller_health = inner_loop_fault(crane_supervisor::Fault::StateHealth);
+  const auto degraded = crane_supervisor::decide(config, input);
+  EXPECT_EQ(degraded.fault, crane_supervisor::Fault::StateHealth);
+  EXPECT_NE(degraded.message.find("inner velocity loop"), std::string::npos) << degraded.message;
+
+  input.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
+  const auto expired = crane_supervisor::decide(config, input);
+  EXPECT_EQ(expired.fault, crane_supervisor::Fault::ReferenceStale);
+  EXPECT_NE(expired.message.find("horizon"), std::string::npos) << expired.message;
+  // A horizon that ran out is not a measurement that went bad, and the two are
+  // separate constants for the same reason the commissioning code is its own.
+  EXPECT_NE(degraded.message, expired.message);
+
+  // A fourth code would mean the controller's own `static_assert` block and the
+  // frozen message have drifted apart.  Inventing a cause here would hide the
+  // drift, so the value is carried through unedited and the report says so.
+  input.controller_health = inner_loop_fault(crane_supervisor::Fault::Sway);
+  const auto drifted = crane_supervisor::decide(config, input);
+  EXPECT_EQ(drifted.fault, crane_supervisor::Fault::Sway);
+  EXPECT_NE(drifted.message.find("not supposed to be able to raise"), std::string::npos)
+    << drifted.message;
+}
+
+TEST(SupervisorCore, AMissingCalibrationNamesTheAxisItIsMissingFor)
+{
+  // The point of carrying the flags per axis with the joint names beside them:
+  // a panel that says "q9_left_rail_joint" tells an operator which calibration
+  // to run, and one that says "one axis" does not.
+  const auto config = default_config();
+  auto input = healthy_input();
+  input.controller_health = uncommissioned_gripper();
+
+  const auto decision = crane_supervisor::decide(config, input);
+  EXPECT_EQ(decision.fault, crane_supervisor::Fault::NotCommissioned);
+  EXPECT_NE(decision.message.find("q9_left_rail_joint"), std::string::npos) << decision.message;
+  // And it says what it is asking for, because a calibration and a sensor check
+  // are the two different things this constant exists to separate
+  // (wiki/implementation/commissioning_prerequisites.md §2).
+  EXPECT_NE(decision.message.find("calibration"), std::string::npos) << decision.message;
+  // Nothing was acted on here either.
+  EXPECT_NE(decision.message.find("Nothing was stopped"), std::string::npos) << decision.message;
+
+  // Two axes, both named: a tool whose sixth valve channel is uncalibrated and
+  // an axis that lost its map is one report, not a count of two.
+  input.controller_health.feedforward_free_joints = {"theta8_rotator_joint", "q9_left_rail_joint"};
+  const auto both = crane_supervisor::decide(config, input);
+  EXPECT_NE(both.message.find("theta8_rotator_joint"), std::string::npos) << both.message;
+  EXPECT_NE(both.message.find("q9_left_rail_joint"), std::string::npos) << both.message;
+
+  // A commissioning code with no axis behind it is a defect in the report, and
+  // is reported as one rather than as a fault with nothing to act on.
+  input.controller_health.feedforward_free_joints.clear();
+  const auto unnamed = crane_supervisor::decide(config, input);
+  EXPECT_EQ(unnamed.fault, crane_supervisor::Fault::NotCommissioned);
+  EXPECT_NE(unnamed.message.find("named no axis"), std::string::npos) << unnamed.message;
+}
+
+TEST(SupervisorCore, TheHealthCodeIsReportedInPreferenceToTheCommissioningCode)
+{
+  // wiki/implementation/commissioning_prerequisites.md §2, which is what this
+  // ordering is and not this package's preference: the missing calibration will
+  // still be missing next cycle, while a state that just went stale is the one
+  // an operator has to act on now.
+  const auto config = default_config();
+
+  // On its own the commissioning code is what is reported.
+  auto only_commissioning = healthy_input();
+  only_commissioning.controller_health = uncommissioned_gripper();
+  EXPECT_EQ(
+    crane_supervisor::decide(config, only_commissioning).fault,
+    crane_supervisor::Fault::NotCommissioned);
+
+  // Beside a health cause of the supervisor's own it is not.  Every one of the
+  // health causes wins, whichever input raised it.
+  auto degraded_state = only_commissioning;
+  degraded_state.pendulum_state.valid = false;
+  degraded_state.pendulum_state.status = "the upstream IMU on K5 does not report itself healthy";
+  const auto against_state = crane_supervisor::decide(config, degraded_state);
+  EXPECT_EQ(against_state.fault, crane_supervisor::Fault::StateHealth);
+  EXPECT_NE(against_state.message.find(degraded_state.pendulum_state.status), std::string::npos)
+    << against_state.message;
+
+  auto dead_controller = only_commissioning;
+  dead_controller.controller_state.age = 10.0;
+  EXPECT_EQ(
+    crane_supervisor::decide(config, dead_controller).fault, crane_supervisor::Fault::StateHealth);
+
+  // Including the health code the *same* loop raises: a report can carry only
+  // one code, so this is the cycle where the loop found a measurement of its
+  // own bad while an axis was still uncalibrated.  It reports the measurement.
+  auto inner_health = only_commissioning;
+  inner_health.controller_health.fault = crane_supervisor::Fault::StateHealth;
+  const auto against_inner = crane_supervisor::decide(config, inner_health);
+  EXPECT_EQ(against_inner.fault, crane_supervisor::Fault::StateHealth);
+  EXPECT_NE(against_inner.message.find("inner velocity loop"), std::string::npos)
+    << against_inner.message;
+
+  // And a horizon that expired is a health cause in this ordering too: it is
+  // the producer that is gone, and that is also this cycle's news.
+  auto stale_reference = only_commissioning;
+  stale_reference.controller_health.fault = crane_supervisor::Fault::ReferenceStale;
+  EXPECT_EQ(
+    crane_supervisor::decide(config, stale_reference).fault,
+    crane_supervisor::Fault::ReferenceStale);
+
+  // Below it sits only the interlock, and deliberately: on the `hardware`
+  // profile the commissioning condition is *standing*, while a released deadman
+  // is the ordinary resting state of the machine.  Nothing is lost by it --
+  // `deadman_held` is a field of its own on every report and the commissioning
+  // code has none.
+  auto released = only_commissioning;
+  released.remote_ctrl.deadman_held = false;
+  const auto over_interlock = crane_supervisor::decide(config, released);
+  EXPECT_EQ(over_interlock.fault, crane_supervisor::Fault::NotCommissioned);
+  EXPECT_FALSE(over_interlock.deadman_held);
+}
+
+TEST(SupervisorCore, TheProfileSwitchIsTheControllersAndThisPackageAddsNoSecondOne)
+{
+  // wiki/implementation/commissioning_prerequisites.md §3: only the `hardware`
+  // profile reports a missing calibration, and the thing that decides it is
+  // `crane_velocity_controller`'s own `profile` parameter.  This package holds
+  // no profile, no rig name and no second switch -- it reports the code it was
+  // sent -- so the two rigs are two different reports on the wire and nothing
+  // else.
+  const auto config = default_config();
+
+  // What the `hardware` profile publishes today.
+  auto hardware = healthy_input();
+  hardware.controller_health = uncommissioned_gripper();
+  const auto reported = crane_supervisor::decide(config, hardware);
+  EXPECT_EQ(reported.fault, crane_supervisor::Fault::NotCommissioned);
+
+  // What the `fake` profile publishes for the very same machine state: the
+  // gripper axis still ran PI only and the flag still says which axis, and the
+  // loop still raises no commissioning fault because a rig with no hydraulics
+  // has nothing to commission.
+  auto fake = healthy_input();
+  fake.controller_health = healthy_inner_loop();
+  fake.controller_health.feedforward_free_joints = {"q9_left_rail_joint"};
+  const auto quiet = crane_supervisor::decide(config, fake);
+  EXPECT_EQ(quiet.fault, crane_supervisor::Fault::None);
+  // And the clear report does not go looking for the axis and raise the fault
+  // on its own: the flags are not a second switch either.
+  EXPECT_EQ(quiet.message.find("not commissioned"), std::string::npos) << quiet.message;
+}
+
 TEST(SupervisorCore, TheStopAndTheStateOutrankTrackingAndTrackingOutranksTheInterlock)
 {
   // Precedence, stated once.  A tracking excess is a defect and a released
@@ -809,6 +1054,24 @@ TEST(SupervisorCore, NothingHereActs)
   EXPECT_NE(decision.message.find("not protection"), std::string::npos) << decision.message;
 }
 
+/// Every shape the fourth input can arrive in, absence included.
+/**
+ * The three codes the loop can raise plus the clear one, and the report that
+ * never came at all. The commissioning one carries a named axis, because the
+ * branch that reports it reads the names and the one that reports a defect in
+ * the report is asserted where it can be told apart from this.
+ */
+std::vector<crane_supervisor::ControllerHealthReport> every_inner_loop_report()
+{
+  std::vector<crane_supervisor::ControllerHealthReport> reports{
+    crane_supervisor::ControllerHealthReport{},
+    healthy_inner_loop(),
+    inner_loop_fault(crane_supervisor::Fault::StateHealth),
+    inner_loop_fault(crane_supervisor::Fault::ReferenceStale),
+    uncommissioned_gripper()};
+  return reports;
+}
+
 /// The whole reachable input space of this slice, one struct per combination.
 /**
  * Swept rather than enumerated by hand, because the cases that go wrong are the
@@ -829,24 +1092,28 @@ std::vector<crane_supervisor::SupervisorInput> every_input()
                 for (const bool latched : {false, true}) {
                   for (const bool controller_received : {false, true}) {
                     for (const double velocity_error : {0.0, 100.0}) {
-                      crane_supervisor::SupervisorInput input;
-                      input.pendulum_state.received = received;
-                      input.pendulum_state.valid = valid;
-                      input.pendulum_state.age = age;
-                      input.pendulum_state.status = status;
-                      input.remote_ctrl.received = remote_received;
-                      input.remote_ctrl.em_stop = em_stop;
-                      input.remote_ctrl.deadman_held = deadman;
-                      input.remote_ctrl.age = age;
-                      input.estop_latched = latched;
-                      input.controller_state = tracking_controller();
-                      input.controller_state.received = controller_received;
-                      input.controller_state.age = age;
-                      for (auto & axis : input.controller_state.axes) {
-                        axis.velocity_error = velocity_error;
-                        axis.position_error = velocity_error;
+                      for (const auto & inner_loop : every_inner_loop_report()) {
+                        crane_supervisor::SupervisorInput input;
+                        input.pendulum_state.received = received;
+                        input.pendulum_state.valid = valid;
+                        input.pendulum_state.age = age;
+                        input.pendulum_state.status = status;
+                        input.remote_ctrl.received = remote_received;
+                        input.remote_ctrl.em_stop = em_stop;
+                        input.remote_ctrl.deadman_held = deadman;
+                        input.remote_ctrl.age = age;
+                        input.estop_latched = latched;
+                        input.controller_state = tracking_controller();
+                        input.controller_state.received = controller_received;
+                        input.controller_state.age = age;
+                        for (auto & axis : input.controller_state.axes) {
+                          axis.velocity_error = velocity_error;
+                          axis.position_error = velocity_error;
+                        }
+                        input.controller_health = inner_loop;
+                        input.controller_health.age = age;
+                        inputs.push_back(input);
                       }
-                      inputs.push_back(input);
                     }
                   }
                 }
@@ -902,11 +1169,16 @@ TEST(SupervisorCore, NoTrackingFaultIsReachableWithoutATolerance)
   }
 }
 
-TEST(SupervisorCore, TheFaultsThisSliceRaisesAreStateHealthTrackingEStopAndInterlock)
+TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFourAndTheInnerLoopsThree)
 {
   // Every other cause of the §5 table belongs to a later issue.  A supervisor
   // that raised one of them from an input it does not have would be reporting a
   // check it never made.
+  //
+  // Two of the seven are not this package's verdicts at all: FAULT_REFERENCE_STALE
+  // and FAULT_NOT_COMMISSIONED are the inner velocity loop's, merged as the loop
+  // numbered them.  Working cell, solver and sway stay unreachable -- nothing on
+  // any of the four inputs can produce them, and neither can this supervisor.
   for (const auto & config : {default_config(), config_with_tolerances()}) {
     for (const auto & input : every_input()) {
       const auto fault = crane_supervisor::decide(config, input).fault;
@@ -914,9 +1186,19 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreStateHealthTrackingEStopAndInter
         fault == crane_supervisor::Fault::None ||
         fault == crane_supervisor::Fault::StateHealth ||
         fault == crane_supervisor::Fault::Tracking ||
+        fault == crane_supervisor::Fault::ReferenceStale ||
         fault == crane_supervisor::Fault::EStop ||
-        fault == crane_supervisor::Fault::Interlock)
+        fault == crane_supervisor::Fault::Interlock ||
+        fault == crane_supervisor::Fault::NotCommissioned)
         << static_cast<int>(fault);
+      // And the two that are not this package's are reported only when the loop
+      // sent them: neither is derivable from anything else this supervisor holds.
+      if (fault == crane_supervisor::Fault::ReferenceStale ||
+        fault == crane_supervisor::Fault::NotCommissioned)
+      {
+        EXPECT_EQ(fault, input.controller_health.fault);
+        EXPECT_TRUE(input.controller_health.received);
+      }
     }
   }
 }

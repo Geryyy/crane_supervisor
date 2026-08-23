@@ -11,10 +11,11 @@ it: **status and mode only**.  It watches, it reports, and it does not act.
   else.  It publishes `crane_msgs/SupervisorStatus` on `/crane/supervisor/status`
   at 20 Hz, reliable, depth 1, the stream ROS 2 Interfaces §2 and §4 fix and
   `crane_msgs`' own ROS contract test already asserts.
-- three **inputs carried end to end** — `crane_msgs/PendulumState` on
+- four **inputs carried end to end** — `crane_msgs/PendulumState` on
   `/crane/pendulum_state`, `epsilon_crane_msgs/RemoteCtrlStates` on
-  `/crane/remote_ctrl_states`, and `control_msgs/JointTrajectoryControllerState`
-  on `/crane/controller_state`.
+  `/crane/remote_ctrl_states`, `control_msgs/JointTrajectoryControllerState`
+  on `/crane/controller_state`, and `crane_msgs/VelocityControllerHealth` on
+  `/crane/velocity_controller/health`.
 - one **service** — `/crane/clear_fault` (`std_srvs/Trigger`, ROS 2 Interfaces
   §5), which acknowledges a latched emergency stop and does nothing else.
 
@@ -56,8 +57,14 @@ stand-in for `trajectory_msgs`, the package a *commanded* trajectory is typed
 with — and it also matched `control_msgs/JointTrajectoryControllerState`, which
 is a controller describing itself.  The ban is now on `trajectory_msgs` by name,
 so a publisher of the command type still cannot appear, and the guard pins the
-exact three message types this node subscribes to rather than trusting a
+exact four message types this node subscribes to rather than trusting a
 substring.
+
+Reading the inner loop's health cost the guard nothing.
+`/crane/velocity_controller/health` is a **subscription** and stays one — a topic
+named for a controller is exactly the shape a status node would grow a command
+path in, so the guard names it among the five ROS names this package may hold and
+pins it to the subscription list.
 
 The status stream is worth having on its own terms: health and mode become
 visible while the safety path is still being commissioned (PRD user story 64),
@@ -70,7 +77,9 @@ inferred abort §5.0 describes.
 words an operator can act on.  Every report carries a cause (PRD user story 53) —
 a status with `fault != FAULT_NONE` and an empty `message` is a test failure.
 
-Only five of the ten constants are ever reported here, and they are resolved in
+Seven of the ten constants are reported here, and two of the seven are not this
+package's verdicts at all — `FAULT_REFERENCE_STALE` and `FAULT_NOT_COMMISSIONED`
+are the inner velocity loop's, merged as it numbered them.  They are resolved in
 this order:
 
 | Report | When |
@@ -78,9 +87,12 @@ this order:
 | `FAULT_ESTOP` | `em_stop` is asserted on `/crane/remote_ctrl_states`, **or** that stream is not arriving at all, **or** a stop that was one of those is latched and not yet acknowledged |
 | `FAULT_STATE_HEALTH` | nothing has arrived on `/crane/pendulum_state` yet, or the stream stopped, or its stamp is further in this node's future than the margin, or `pendulum_state_broadcaster` marked the sample unusable |
 | `FAULT_STATE_HEALTH` | the trajectory controller's own state has never arrived on `/crane/controller_state`, or it stopped, or its stamp is too far ahead — a controller that stopped publishing is not a crane that is tracking perfectly |
+| `FAULT_STATE_HEALTH` | the inner velocity loop's own health has never arrived on `/crane/velocity_controller/health`, or it stopped, or its stamp is too far ahead — an uncommissioned axis reported to nobody is the state that stream exists to end |
+| `FAULT_STATE_HEALTH`, `FAULT_REFERENCE_STALE` | the inner velocity loop raised one of its own **health** codes, carried through unedited |
 | `FAULT_TRACKING` | an actuated axis is outside **its own** velocity-tracking tolerance |
+| `FAULT_NOT_COMMISSIONED` | the inner velocity loop raised the **commissioning** code — an axis has no identified valve map and ran PI only |
 | `FAULT_INTERLOCK` | the remote is arriving, the stop is clear, and the configured deadman button is not held |
-| `FAULT_NONE` | all three streams are arriving inside their margins, the broadcaster reports the sample usable, no axis is outside its tolerance, nothing is latched and the deadman is held |
+| `FAULT_NONE` | all four streams are arriving inside their margins, the broadcaster reports the sample usable, the inner loop reports nothing wrong with itself, no axis is outside its tolerance, nothing is latched and the deadman is held |
 
 **The order is not arbitrary.**  The stop is first because it is the only one of
 them with no field of its own: a cycle that reported something else instead
@@ -88,11 +100,18 @@ would not report it at all.  The passive state comes before tracking because a
 supervisor whose own view of the crane is stale should say that before it says
 anything derived.  The controller state's freshness is judged immediately before
 the comparison that consumes it, since an error that is not arriving cannot be
-compared to anything.  The interlock is last because the deadman *does* have a
-field — `deadman_held` is filled on every report whatever `fault` says — so
-putting a released button, which is the ordinary resting state of the machine,
-above a defect would hide the defect behind a routine.  One consequence to know
-before reading a panel: a supervisor started before `gpio_controller` sits in
+compared to anything.  The **health** codes are reported in preference to the
+**commissioning** code because [[commissioning_prerequisites]] §2 says so and not
+because this package prefers it: a missing calibration will still be missing next
+cycle, while a state that just went stale is the one an operator has to act on
+now.  The commissioning code nonetheless sits *above* the interlock, because on
+the `hardware` profile that condition is standing — prerequisite 4 holds until
+someone records a calibration — while a released deadman is the ordinary resting
+state of the machine, and putting the routine first would hide the report.  The
+interlock is last because the deadman *does* have a field — `deadman_held` is
+filled on every report whatever `fault` says — so putting a released button above
+a defect would hide the defect behind a routine.  One consequence to know before
+reading a panel: a supervisor started before `gpio_controller` sits in
 `FAULT_ESTOP` until the remote arrives, which is what treating absence as
 asserted means in practice.
 
@@ -161,9 +180,9 @@ read-only, because which button stops the machine is not a runtime adjustment.
 **Absence is not health.**  §5.3 allows no input to stop arriving without a
 defined consequence, so an input that never arrived and one that stopped are both
 faults rather than a quiet `FAULT_NONE`.  The general staleness policy — per
-input, per consequence — is a later issue; what is owed here is that neither
-input this package carries can be silently missing, and that the stop signal's
-absence is read as asserted rather than merely reported.
+input, per consequence — is a later issue; what is owed here is that none of the
+four inputs this package carries can be silently missing, and that the stop
+signal's absence is read as asserted rather than merely reported.
 
 **The broadcaster's own cause is carried through, not restated.**
 `pendulum_state_broadcaster` separates six causes behind `valid == false` and
@@ -225,6 +244,48 @@ clamp, the MPC's constraint margin and this supervisor read the same six rows ou
 of the same file.  `test/test_no_tolerance_of_its_own.py` asserts that no copy
 lives here, because a copy is how one number becomes three.
 
+## The inner loop's fault, carried and not re-derived
+
+`crane_velocity_controller` computes a `SupervisorStatus` fault code on every one
+of its 100 Hz cycles.  Until `/crane/velocity_controller/health` existed the only
+way to read it was `CraneVelocityController::fault()`, an accessor whose own
+documentation says it is there for the S5 harness and is never on the control
+path — so the fault stopped at the controller manager and reached nobody.  The
+concrete consequence: prerequisite 4, the uncalibrated PZS100 gripper axis, is
+reported as `FAULT_NOT_COMMISSIONED` on the `hardware` profile, and that report
+was going nowhere.
+
+**This supervisor could not have re-derived it, and did not try.**  Which axes
+the active tool has an identified valve map for is in neither `/joint_states` nor
+the trajectory controller's state; the controller is the only element that knows.
+So the fault stays where it is computed and travels as a message, and this package
+merges a code rather than translating one:
+
+| On the wire | What this package does with it |
+|---|---|
+| `fault` | a `crane_msgs/SupervisorStatus` constant, unrenumbered, reported at the place in the order above that [[commissioning_prerequisites]] §2 fixes |
+| `joint_names` + `feedforward_applied` | the axes that ran PI only, **named** in `message` — a panel that says `q9_left_rail_joint` tells an operator which calibration to run, and one that says "one axis" does not |
+
+A code the loop is not supposed to be able to raise is carried through unedited
+rather than folded into one of the three, because inventing a cause here would
+hide the drift between `crane_velocity_controller`'s `static_assert` block and the
+frozen message.
+
+**Whether a missing prerequisite is reported at all is not decided here.**
+[[commissioning_prerequisites]] §3 puts that on the `hardware` profile only, and
+the switch is `crane_velocity_controller`'s own `profile` parameter.  This package
+holds no profile and no rig name: the `fake` rig's report and the machine's are two
+different messages on the wire, and nothing on the path from the loop to
+`/crane/supervisor/status` looks at anything else.  The per-axis flags are not a
+second switch either — an axis can run PI only on `fake` with no fault raised, and
+this supervisor still reports `FAULT_NONE`.
+
+Staleness of this stream is the one half of the general policy that could not
+wait: "no message yet" must not read as a healthy, commissioned inner loop, so a
+report that never arrived, one that stopped and one whose stamp cannot be placed
+in time are all `FAULT_STATE_HEALTH` with their own account of which they are.
+The rest joins the policy of §5.3 in a later issue.
+
 ## What is not computed
 
 `inside_working_cell` is `false` and is not computed in this slice: the virtual
@@ -237,8 +298,9 @@ an input and reported on every status, whatever `fault` says.
 
 ## Configuration
 
-Four read-only parameters are shipped in `config/crane_supervisor.yaml`:
-`pendulum_state_timeout`, `remote_ctrl_timeout`, `controller_state_timeout` and
+Five read-only parameters are shipped in `config/crane_supervisor.yaml`:
+`pendulum_state_timeout`, `remote_ctrl_timeout`, `controller_state_timeout`,
+`controller_health_timeout` and
 `deadman_button`.  `joints` is declared with the six actuated joints of ROS 2
 Interfaces §3.2 as its default and is not restated in the shipped file — a
 deployment that wrote the list out again could only get it wrong.
@@ -250,7 +312,7 @@ and service names and the 20 Hz rate are constants in the source, so no
 deployment can rename or re-rate a stream the task layer and the operator panel
 subscribe to.
 
-None of the three margins is a safety timing requirement.  By the time
+None of the four margins is a safety timing requirement.  By the time
 `remote_ctrl_timeout` expires the hardware chain has long since acted; what the
 number decides is how far the *diagnosis* lags the event, against how easily a
 slow link raises a false one.
@@ -262,16 +324,20 @@ does not, exactly as it did not for the pendulum broadcaster.  It is a node
 beside the controller manager, not a controller inside it: it claims no
 interface, no spawner names it, and the launch gives it no remapping.
 
-Two inputs have producers that do not already publish on the contract name.  The
-retained `gpio_controller` publishes `RemoteCtrlStates` on its own private
-`~/remote_ctrl_states`, and ROS 2 Interfaces §4 fixes the cross-node name as
-`/crane/remote_ctrl_states`.  The trajectory controller likewise publishes
+Two of the four inputs have producers that do not already publish on the contract
+name.  The retained `gpio_controller` publishes `RemoteCtrlStates` on its own
+private `~/remote_ctrl_states`, and ROS 2 Interfaces §4 fixes the cross-node name
+as `/crane/remote_ctrl_states`.  The trajectory controller likewise publishes
 `JointTrajectoryControllerState` on its private `~/controller_state`, which
 resolves under whatever the profile named that controller —
 `trajectory_controller_a2b` today.  Lining either of them up is a remap in
 `crane_bringup` and belongs to whoever composes the profile; this node subscribes
 to the contract name and to nothing else, because §1 makes cross-node contracts
 absolute and this package may not rely on a namespace.
+
+`/crane/velocity_controller/health` needs no remap: `crane_velocity_controller`
+creates the publisher with that absolute name itself, and ROS 2 Interfaces §4
+carries the row.
 
 **Two things are owed outside this package** and neither is in it: ROS 2
 Interfaces §4 has no row for `/crane/controller_state` yet, and no profile

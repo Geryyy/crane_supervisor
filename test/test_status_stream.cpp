@@ -23,6 +23,7 @@
 #include "control_msgs/msg/joint_trajectory_controller_state.hpp"
 #include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
+#include "crane_msgs/msg/velocity_controller_health.hpp"
 #include "crane_supervisor/supervisor_node.hpp"
 #include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -34,6 +35,7 @@ namespace
 using control_msgs::msg::JointTrajectoryControllerState;
 using crane_msgs::msg::PendulumState;
 using crane_msgs::msg::SupervisorStatus;
+using crane_msgs::msg::VelocityControllerHealth;
 using epsilon_crane_msgs::msg::RemoteCtrlStates;
 using std_srvs::srv::Trigger;
 
@@ -42,6 +44,11 @@ using std_srvs::srv::Trigger;
 const std::vector<std::string> kActuatedJoints{
   "theta1_slewing_joint", "theta2_boom_joint", "theta3_arm_joint",
   "q4_big_telescope", "theta8_rotator_joint", "q9_left_rail_joint"};
+
+/// The gripper axis: the one the active tool has no valve calibration for
+/// (commissioning_prerequisites §1 row 4).  Index 5 of the six, and the axis
+/// `crane_control`'s own S5 harness asserts the loop runs PI only.
+constexpr std::size_t kGripperAxis = 5;
 
 /// Shorter than the shipped margin so that "the stream stopped" is reachable
 /// inside a test budget.  It is an override of the declared parameter, not a
@@ -52,6 +59,34 @@ constexpr double kTestTimeout = 0.2;
 /// it bounds a failure rather than a success: every wait returns as soon as its
 /// predicate holds.
 constexpr double kBudget = 10.0;
+
+/// The domain this binary runs on: one step off the one it was given.
+/**
+ * `verify.sh` already puts each issue's run on a domain of its own, which keeps
+ * these nodes off the machine's live graph and off another issue's.  What it
+ * cannot do is separate this package's tests from `crane_control`'s, and this
+ * issue is the first whose `packages:` names both: colcon runs the two suites at
+ * the same time, and they meet on the contract names.  This fixture publishes
+ * `/crane/pendulum_state` and `/crane/velocity_controller/health`, and
+ * `crane_control`'s harnesses are the real producers of both -- so each suite
+ * reads the other's fixture and neither is testing what it thinks it is.
+ *
+ * The step is taken here rather than in the harness for the same reason the two
+ * variables below are cleared here: an isolation a bare `colcon test` does not
+ * get is an isolation that comes back the first time somebody runs one.
+ * `1 + (given + 50) % 101` lands in 1..101 -- the range ROS 2 keeps clear of the
+ * Linux ephemeral ports -- never returns the domain it was given, and sends two
+ * different given domains to two different ones, so two issues running at once
+ * stay apart here as well.
+ */
+std::string stepped_domain()
+{
+  const char * const given = ::getenv("ROS_DOMAIN_ID");
+  // A domain that is absent or is not a number at all is domain 0, which is what
+  // rclcpp itself would have used.
+  const int base = (given == nullptr) ? 0 : std::atoi(given);
+  return std::to_string(1 + ((base % 101) + 101) % 101);
+}
 
 /// One `rclcpp` context for the whole binary.  Bringing one up and down per
 /// test would be five DDS participants' worth of discovery for no assertion.
@@ -69,6 +104,7 @@ public:
     ::unsetenv("CYCLONEDDS_URI");
     ::unsetenv("FASTRTPS_DEFAULT_PROFILES_FILE");
     ::setenv("ROS_LOCALHOST_ONLY", "1", 1);
+    ::setenv("ROS_DOMAIN_ID", stepped_domain().c_str(), 1);
     rclcpp::init(0, nullptr);
   }
   void TearDown() override {rclcpp::shutdown();}
@@ -89,7 +125,8 @@ protected:
     options.parameter_overrides(
       {rclcpp::Parameter("pendulum_state_timeout", kTestTimeout),
         rclcpp::Parameter("remote_ctrl_timeout", kTestTimeout),
-        rclcpp::Parameter("controller_state_timeout", kTestTimeout)});
+        rclcpp::Parameter("controller_state_timeout", kTestTimeout),
+        rclcpp::Parameter("controller_health_timeout", kTestTimeout)});
     return options;
   }
 
@@ -108,6 +145,8 @@ protected:
       crane_supervisor::kRemoteCtrlStatesTopic, qos);
     controller_state_ = observer_->create_publisher<JointTrajectoryControllerState>(
       crane_supervisor::kControllerStateTopic, qos);
+    controller_health_ = observer_->create_publisher<VelocityControllerHealth>(
+      crane_supervisor::kControllerHealthTopic, qos);
     clear_fault_ = observer_->create_client<Trigger>(crane_supervisor::kClearFaultService);
 
     executor_.add_node(supervisor_);
@@ -188,10 +227,79 @@ protected:
     return message;
   }
 
-  /// Publish all three inputs once, stamped now.
+  /// What `crane_velocity_controller` publishes when it has nothing to report.
+  /**
+   * Six axes named on the wire and the feedforward applied on every one of them.
+   * The names are carried rather than assumed because the sixth valve channel
+   * drives a different joint per tool, and the controller is the one that knows
+   * which tool it is driving.
+   */
+  VelocityControllerHealth healthy_inner_loop() const
+  {
+    VelocityControllerHealth message;
+    message.header.stamp = observer_->now();
+    message.fault = SupervisorStatus::FAULT_NONE;
+    for (std::size_t i = 0; i < kActuatedJoints.size(); ++i) {
+      message.joint_names[i] = kActuatedJoints[i];
+      message.feedforward_applied[i] = true;
+    }
+    return message;
+  }
+
+  /// What it publishes on the `hardware` profile today.
+  /**
+   * Prerequisite 4 is missing, so the gripper axis runs with the feedforward
+   * disabled and PI only, and the loop raises `FAULT_NOT_COMMISSIONED`
+   * (commissioning_prerequisites §1 row 4).  `crane_control`'s own S5 harness
+   * asserts that this is the message that leaves the controller manager; what is
+   * asserted here is that it reaches `/crane/supervisor/status`.
+   */
+  VelocityControllerHealth uncommissioned_gripper() const
+  {
+    VelocityControllerHealth message = healthy_inner_loop();
+    message.fault = SupervisorStatus::FAULT_NOT_COMMISSIONED;
+    message.feedforward_applied[kGripperAxis] = false;
+    return message;
+  }
+
+  /// What the same loop publishes on `fake`, for the same machine state.
+  /**
+   * A rig with no hydraulics has nothing to commission (§3), so the loop raises
+   * no fault -- while the calibration is no less missing, and the flag that says
+   * which axis ran PI only is still false.  The switch between this report and
+   * the one above is `crane_velocity_controller`'s own `profile` parameter, and
+   * this package has no second one.
+   */
+  VelocityControllerHealth fake_profile_inner_loop() const
+  {
+    VelocityControllerHealth message = healthy_inner_loop();
+    message.feedforward_applied[kGripperAxis] = false;
+    return message;
+  }
+
+  /// Publish the trajectory controller's state and the inner loop's health,
+  /// both healthy and stamped now.
+  /**
+   * What a test about one of the *other* two inputs has to keep alive, so that
+   * the absence it is about is the only one in the report.  Four streams that
+   * all stop at once would still raise a fault, and the test would pass without
+   * ever showing which of them produced it.
+   */
+  void publish_controllers()
+  {
+    JointTrajectoryControllerState controller = tracking_controller_state();
+    controller.header.stamp = observer_->now();
+    controller_state_->publish(controller);
+
+    VelocityControllerHealth health = healthy_inner_loop();
+    health.header.stamp = observer_->now();
+    controller_health_->publish(health);
+  }
+
+  /// Publish all four inputs once, stamped now.
   void publish(
     const PendulumState & state, const RemoteCtrlStates & remote,
-    const JointTrajectoryControllerState & controller)
+    const JointTrajectoryControllerState & controller, const VelocityControllerHealth & health)
   {
     PendulumState fresh_state = state;
     fresh_state.header.stamp = observer_->now();
@@ -204,6 +312,17 @@ protected:
     JointTrajectoryControllerState fresh_controller = controller;
     fresh_controller.header.stamp = observer_->now();
     controller_state_->publish(fresh_controller);
+
+    VelocityControllerHealth fresh_health = health;
+    fresh_health.header.stamp = observer_->now();
+    controller_health_->publish(fresh_health);
+  }
+
+  void publish(
+    const PendulumState & state, const RemoteCtrlStates & remote,
+    const JointTrajectoryControllerState & controller)
+  {
+    publish(state, remote, controller, healthy_inner_loop());
   }
 
   void publish(const PendulumState & state, const RemoteCtrlStates & remote)
@@ -214,13 +333,22 @@ protected:
   /// Spin, publishing every input every pass, until the newest report is `fault`.
   bool drive_to(
     std::uint8_t fault, const PendulumState & state, const RemoteCtrlStates & remote,
-    const JointTrajectoryControllerState & controller)
+    const JointTrajectoryControllerState & controller, const VelocityControllerHealth & health)
   {
     return spin_until(
       [this, fault]() {
         return !received_.empty() && received_.back().fault == fault;
       },
-      [this, &state, &remote, &controller]() {publish(state, remote, controller);});
+      [this, &state, &remote, &controller, &health]() {
+        publish(state, remote, controller, health);
+      });
+  }
+
+  bool drive_to(
+    std::uint8_t fault, const PendulumState & state, const RemoteCtrlStates & remote,
+    const JointTrajectoryControllerState & controller)
+  {
+    return drive_to(fault, state, remote, controller, healthy_inner_loop());
   }
 
   bool drive_to(std::uint8_t fault, const PendulumState & state, const RemoteCtrlStates & remote)
@@ -277,6 +405,7 @@ protected:
   rclcpp::Publisher<PendulumState>::SharedPtr pendulum_state_;
   rclcpp::Publisher<RemoteCtrlStates>::SharedPtr remote_ctrl_;
   rclcpp::Publisher<JointTrajectoryControllerState>::SharedPtr controller_state_;
+  rclcpp::Publisher<VelocityControllerHealth>::SharedPtr controller_health_;
   rclcpp::Client<Trigger>::SharedPtr clear_fault_;
   std::vector<SupervisorStatus> received_;
 };
@@ -487,6 +616,7 @@ TEST_F(StatusStream, TheRemoteStoppingIsAssertedRatherThanReleased)
         PendulumState state = trusted_state();
         state.header.stamp = observer_->now();
         pendulum_state_->publish(state);
+        publish_controllers();
       }))
     << received_.back().message;
   EXPECT_NE(received_.back().message.find("stopped arriving"), std::string::npos)
@@ -578,6 +708,9 @@ TEST_F(StatusStream, AControllerThatStopsPublishingIsAFaultAndNotAZeroError)
         RemoteCtrlStates remote = held_remote();
         remote.header.stamp = observer_->now();
         remote_ctrl_->publish(remote);
+        VelocityControllerHealth health = healthy_inner_loop();
+        health.header.stamp = observer_->now();
+        controller_health_->publish(health);
       }))
     << received_.back().message;
   EXPECT_NE(received_.back().message.find("stopped publishing its own state"), std::string::npos)
@@ -684,8 +817,156 @@ TEST_F(StatusStream, TheStreamStoppingBringsTheFaultBackRatherThanLeavingItClear
         RemoteCtrlStates remote = held_remote();
         remote.header.stamp = observer_->now();
         remote_ctrl_->publish(remote);
+        publish_controllers();
       }));
   EXPECT_NE(received_.back().message.find("stopped arriving"), std::string::npos)
+    << received_.back().message;
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStream, TheInnerLoopsFaultReachesTheStreamAndNamesTheAxisItIsAbout)
+{
+  // The whole point of the issue.  `crane_velocity_controller` computes the
+  // fault every control cycle and, until this stream existed, the only way to
+  // read it was an accessor for the S5 harness: prerequisite 4 -- the
+  // uncalibrated PZS100 gripper axis -- was reported to nobody.  This is the
+  // path from the controller's publication to the constant an operator panel
+  // renders at 20 Hz (commissioning_prerequisites §2).
+  ASSERT_TRUE(
+    drive_to(
+      SupervisorStatus::FAULT_NONE, trusted_state(), held_remote(),
+      tracking_controller_state(), healthy_inner_loop()))
+    << received_.back().message;
+
+  ASSERT_TRUE(
+    drive_to(
+      SupervisorStatus::FAULT_NOT_COMMISSIONED, trusted_state(), held_remote(),
+      tracking_controller_state(), uncommissioned_gripper()))
+    << received_.back().message;
+  // Which axis, by name.  A panel that says "gripper" tells an operator which
+  // calibration to run; a count does not.
+  EXPECT_NE(received_.back().message.find("q9_left_rail_joint"), std::string::npos)
+    << received_.back().message;
+  EXPECT_NE(received_.back().message.find("calibration"), std::string::npos)
+    << received_.back().message;
+  // And no other axis is named: the other five apply the valve inverse normally.
+  EXPECT_EQ(received_.back().message.find("theta1_slewing_joint"), std::string::npos)
+    << received_.back().message;
+
+  // The supervisor reports it and does nothing else in this slice.
+  EXPECT_NE(received_.back().message.find("Nothing was stopped"), std::string::npos)
+    << received_.back().message;
+
+  // commissioning_prerequisites §2's precedence, end to end: with a health cause
+  // holding as well, the health code is what the panel is shown.  The missing
+  // calibration will still be missing next cycle; the degraded estimate is what
+  // an operator has to act on now.
+  PendulumState degraded = trusted_state();
+  degraded.valid = false;
+  degraded.status = "not to be trusted: the upstream IMU on K5 does not report itself healthy";
+  ASSERT_TRUE(
+    drive_to(
+      SupervisorStatus::FAULT_STATE_HEALTH, degraded, held_remote(),
+      tracking_controller_state(), uncommissioned_gripper()))
+    << received_.back().message;
+  EXPECT_NE(received_.back().message.find(degraded.status), std::string::npos)
+    << received_.back().message;
+
+  // It is not a latch either: the loop is the owner of the code, so the report
+  // follows what the loop is saying right now.
+  ASSERT_TRUE(
+    drive_to(
+      SupervisorStatus::FAULT_NONE, trusted_state(), held_remote(),
+      tracking_controller_state(), healthy_inner_loop()))
+    << received_.back().message;
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStream, ARigWithNoHydraulicsReportsNothingAndTheOneSwitchIsTheControllers)
+{
+  // commissioning_prerequisites §3: only the `hardware` profile reports a
+  // missing prerequisite, and a fault raised in every developer's session is a
+  // fault nobody reads.  What decides it is `crane_velocity_controller`'s own
+  // `profile` parameter -- `crane_control`'s S5 harness asserts both sides of
+  // that switch -- and this package adds no second one: it reports the code it
+  // was sent, and the per-axis flags are not a switch either.
+  ASSERT_TRUE(
+    drive_to(
+      SupervisorStatus::FAULT_NONE, trusted_state(), held_remote(),
+      tracking_controller_state(), fake_profile_inner_loop()))
+    << received_.back().message;
+
+  // The calibration is no less missing here: the gripper axis still ran PI only
+  // and the flag still says which axis it was.  What is absent is the verdict.
+  EXPECT_FALSE(fake_profile_inner_loop().feedforward_applied[kGripperAxis]);
+  for (const SupervisorStatus & status : received_) {
+    EXPECT_NE(status.fault, SupervisorStatus::FAULT_NOT_COMMISSIONED) << status.message;
+  }
+
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStream, AnInnerLoopThatIsNotReportingIsAFaultRatherThanAClearReport)
+{
+  // §5.3 applied to the fourth input, and the half of the general staleness
+  // policy that cannot wait for issue 023: an uncommissioned axis reported to
+  // nobody is the state this stream exists to end, so a report that is not
+  // arriving must never read as a loop that is saying nothing is wrong.
+  //
+  // First the absence that is there from the start.  Everything else arrives.
+  ASSERT_TRUE(
+    spin_until(
+      [this]() {
+        return !received_.empty() && received_.back().fault == SupervisorStatus::FAULT_STATE_HEALTH;
+      },
+      [this]() {
+        PendulumState state = trusted_state();
+        state.header.stamp = observer_->now();
+        pendulum_state_->publish(state);
+        RemoteCtrlStates remote = held_remote();
+        remote.header.stamp = observer_->now();
+        remote_ctrl_->publish(remote);
+        JointTrajectoryControllerState controller = tracking_controller_state();
+        controller.header.stamp = observer_->now();
+        controller_state_->publish(controller);
+      }))
+    << received_.back().message;
+  EXPECT_NE(
+    received_.back().message.find("/crane/velocity_controller/health"), std::string::npos)
+    << received_.back().message;
+  const std::string never_arrived = received_.back().message;
+
+  // Then the loop comes up and the report clears.
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
+    << received_.back().message;
+
+  // Then it stops, with the other three still arriving.  "The controller never
+  // came up" and "the controller died" are different things to tell an operator,
+  // so the two reports do not read the same.
+  ASSERT_TRUE(
+    spin_until(
+      [this]() {return received_.back().fault == SupervisorStatus::FAULT_STATE_HEALTH;},
+      [this]() {
+        PendulumState state = trusted_state();
+        state.header.stamp = observer_->now();
+        pendulum_state_->publish(state);
+        RemoteCtrlStates remote = held_remote();
+        remote.header.stamp = observer_->now();
+        remote_ctrl_->publish(remote);
+        JointTrajectoryControllerState controller = tracking_controller_state();
+        controller.header.stamp = observer_->now();
+        controller_state_->publish(controller);
+      }))
+    << received_.back().message;
+  EXPECT_NE(received_.back().message.find("stopped reporting its own health"), std::string::npos)
+    << received_.back().message;
+  EXPECT_NE(received_.back().message, never_arrived);
+
+  // And it recovers on its own when the loop comes back: a stale input is not a
+  // latch.
+  ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state(), held_remote()))
     << received_.back().message;
 
   expect_contract_of_every_report();

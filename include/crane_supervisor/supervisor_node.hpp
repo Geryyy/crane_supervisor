@@ -10,8 +10,8 @@
 // wiki/implementation/commissioning_prerequisites.md row 3 makes that path
 // conditional on a verification only a safety reviewer on the machine can
 // perform. Until it is performed the system must not advertise a safety function
-// it cannot deliver (PRD user story 54), so this package publishes a status
-// stream, serves two services, and holds no publisher on any command topic and
+// it cannot deliver (PRD user story 54), so this package publishes two status
+// streams, serves two services, and holds no publisher on any command topic and
 // nothing that writes a setpoint. A static guard test asserts it, because the
 // absence is the feature. That the emergency stop is among the inputs changes
 // none of it: §6.1 makes the software's relationship to the stop chain
@@ -100,6 +100,7 @@
 #include "controller_manager_msgs/srv/switch_controller.hpp"
 #include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
+#include "crane_msgs/msg/sway_settled.hpp"
 #include "crane_msgs/msg/velocity_controller_health.hpp"
 #include "crane_msgs/srv/set_mode.hpp"
 #include "crane_supervisor/supervisor_core.hpp"
@@ -118,6 +119,19 @@ namespace crane_supervisor
  * nothing above may rely on a remapping.
  */
 inline constexpr char kStatusTopic[] = "/crane/supervisor/status";
+/// The second stream of §4, and the reason it is a stream rather than a field.
+/**
+ * The settled predicate of wiki/control_architecture.md §5 row 7 is what a
+ * behaviour tree gates a grip action on instead of on a timeout, and
+ * `crane_msgs/SupervisorStatus` has no field for it. Widening that message is a
+ * **field add**, which PRD §15 makes a slice of its own; a new message is
+ * additive and has no ceremony, so the predicate rides on one of its own.
+ *
+ * It is published from the same `update()` call as the status, off the same
+ * decision, with the same `header.stamp` -- so the two streams cannot describe
+ * two different cycles, and the sentence on one is the clause the other ends in.
+ */
+inline constexpr char kSwaySettledTopic[] = "/crane/sway_settled";
 inline constexpr char kClearFaultService[] = "/crane/clear_fault";
 inline constexpr char kSetModeService[] = "/crane/set_mode";
 inline constexpr double kStatusRate = 20.0;
@@ -379,6 +393,15 @@ private:
   std::optional<PendingSnapshot> pending_snapshot_;
 
   rclcpp::Publisher<crane_msgs::msg::SupervisorStatus>::SharedPtr status_publisher_;
+  /// The settled predicate, as a field rather than as a sentence.
+  /**
+   * The second publisher this node holds and the last one it may hold without
+   * `test_no_command_path.py` gaining a line: the guard names every publisher
+   * one at a time, because a second publisher is how a status node becomes a
+   * command node. This one carries a verdict, two rates and a sentence, and
+   * nothing a controller could act on.
+   */
+  rclcpp::Publisher<crane_msgs::msg::SwaySettled>::SharedPtr sway_settled_publisher_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_fault_service_;
   rclcpp::Service<crane_msgs::srv::SetMode>::SharedPtr set_mode_service_;
   rclcpp::TimerBase::SharedPtr status_timer_;

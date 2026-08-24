@@ -17,6 +17,7 @@
 
 #include "crane_model/testing/mock_model.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
+#include "crane_msgs/msg/sway_settled.hpp"
 #include "crane_supervisor/supervisor_core.hpp"
 #include "crane_supervisor/supervisor_node.hpp"
 #include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
@@ -55,6 +56,27 @@ TEST(CraneSupervisorContract, TheCoreIsNumberedAsTheMessageIsNumbered)
   EXPECT_EQ(static_cast<std::uint8_t>(Fault::EStop), Status::FAULT_ESTOP);
   EXPECT_EQ(static_cast<std::uint8_t>(Fault::Interlock), Status::FAULT_INTERLOCK);
   EXPECT_EQ(static_cast<std::uint8_t>(Fault::NotCommissioned), Status::FAULT_NOT_COMMISSIONED);
+}
+
+TEST(CraneSupervisorContract, TheSettledPredicateIsNumberedAsItsOwnMessageNumbersIt)
+{
+  // Same argument as the modes and the faults above, for the second stream: the
+  // core is ROS-free and cannot say this about itself, so the adapter's cast is
+  // held to the wire here rather than becoming a table that can drift from it.
+  using Wire = crane_msgs::msg::SwaySettled;
+  using Predicate = crane_supervisor::SwaySettled;
+
+  EXPECT_EQ(static_cast<std::uint8_t>(Predicate::Unknown), Wire::SETTLED_UNKNOWN);
+  EXPECT_EQ(static_cast<std::uint8_t>(Predicate::NotSettled), Wire::SETTLED_NO);
+  EXPECT_EQ(static_cast<std::uint8_t>(Predicate::Settled), Wire::SETTLED_YES);
+
+  // And the value both sides start from is the unknown one.  A core whose dwell
+  // began at `Settled`, or a message whose zero meant it, would answer "the load
+  // is hanging still" before anything had been observed at all -- which is the
+  // one answer the three-valued design exists to refuse.
+  EXPECT_EQ(
+    static_cast<std::uint8_t>(crane_supervisor::SwayState{}.settled), Wire::SETTLED_UNKNOWN);
+  EXPECT_EQ(Wire{}.settled, Wire::SETTLED_UNKNOWN);
 }
 
 TEST(CraneSupervisorContract, TheRealCoreStartsFromAbsenceRatherThanFromHealth)

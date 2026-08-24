@@ -12,6 +12,12 @@ decides is which controller holds the claim.
   else.  It publishes `crane_msgs/SupervisorStatus` on `/crane/supervisor/status`
   at 20 Hz, reliable, depth 1, the stream ROS 2 Interfaces §2 and §4 fix and
   `crane_msgs`' own ROS contract test already asserts.
+- a **second status stream** — `crane_msgs/SwaySettled` on `/crane/sway_settled`,
+  same rate and same QoS, carrying the three-valued settled predicate as a field
+  a behaviour tree branches on.  It is a stream of its own because
+  `SupervisorStatus` is frozen and widening it is a slice of its own (PRD §15);
+  it is published from the same cycle, off the same decision, with the same
+  `header.stamp`.
 - four **inputs carried end to end** — `crane_msgs/PendulumState` on
   `/crane/pendulum_state`, `epsilon_crane_msgs/RemoteCtrlStates` on
   `/crane/remote_ctrl_states`, `control_msgs/JointTrajectoryControllerState`
@@ -95,6 +101,24 @@ is a controller describing itself.  The ban is now on `trajectory_msgs` by name,
 so a publisher of the command type still cannot appear, and the guard pins the
 exact four message types this node subscribes to rather than trusting a
 substring.
+
+Putting the settled predicate on the wire cost the guard its **publisher count**,
+and that is the one number in it that was doing the most work — a second
+publisher is how a status node becomes a command node, since the topic would be
+new, the QoS would be new and nothing else about the package would look
+different.  So it was relaxed the way the other three were: by *naming the second
+stream*, by type and in source order, rather than by counting differently.  Three
+things carry the argument.  `crane_msgs/SwaySettled` is a **report** — a `uint8`
+verdict, the two rates it was decided from and a sentence, with no joint, no
+duration and no setpoint, so it is not a shape a motion command fits in.  Its
+consumer is the **task layer** and not a controller: nothing in this stack
+subscribes to it inside the real-time cycle, and the refusal §5 row 7 asks for
+happens at the goal, which this package still has no authority over.  And the
+ban that would actually stop a command path is untouched — `trajectory_msgs` is
+still banned outright, so a publisher of the *command* type cannot appear
+whatever the topic were called.  What did not change is everything else: the four
+subscriptions, the two services, the two clients, and the set of ROS names this
+package may know, which gained exactly one entry.
 
 Reading the inner loop's health cost the guard nothing.
 `/crane/velocity_controller/health` is a **subscription** and stays one — a topic
@@ -484,7 +508,7 @@ Two different things come off the passive rate and they are not interchangeable:
 | | What it is | Where it goes |
 |---|---|---|
 | the bound | a configured rate per passive coordinate, crossed or not | `FAULT_SWAY`, naming which of `theta6_tip_joint` and `theta7_tilt_joint` crossed it, with the rate and the bound |
-| the predicate | **three-valued** — settled, not settled, unknown — held over a dwell and released through a hysteresis | the clause every report ends in; see the gap below |
+| the predicate | **three-valued** — settled, not settled, unknown — held over a dwell and released through a hysteresis | `crane_msgs/SwaySettled` on `/crane/sway_settled`, **and** the clause every status report ends in |
 
 **Both are on the rate and neither is on the angle.**  Two independent reasons,
 either of which would be enough on its own.  `pendulum_state_broadcaster` reads
@@ -528,33 +552,39 @@ restart every time the operator let go of the deadman.
 - a **hysteresis** on the way out — the release bound is 1.5× the settle bound, so
   one noise sample past the bound does not cost a whole dwell at 20 Hz.
 
-### The gap: the predicate has no field of its own
+### The predicate is a field, and it is a stream of its own
 
 `crane_msgs/SupervisorStatus` carries `mode`, `fault`, `tracking_error`,
 `inside_working_cell`, `deadman_held` and `message`, and none of them is a
 three-valued sway predicate.  **`crane_msgs` is frozen**, and PRD §15's amendment
-rule makes a *field add* a slice of its own that has to name every consumer;
-`crane_msgs` is also outside this issue's scope, and no message package already in
-this node's dependency whitelist carries a stamped tri-state.  So what the
-predicate rides on today is the `message` string, in a clause every report ends
-in and whose prefix is a constant (`kSettledClausePrefix`) rather than a literal
-somebody greps for.
+rule makes a *field add* a slice of its own that has to name every consumer —
+while a *new message* is additive and has no ceremony.  So the predicate got a
+message rather than a field: `crane_msgs/SwaySettled` on `/crane/sway_settled`,
+`SETTLED_UNKNOWN=0`/`SETTLED_NO=1`/`SETTLED_YES=2`, the two rates the verdict was
+decided from, and the sentence.  `SupervisorStatus` was not touched.
 
 The `fault` field is **not** an alternative and was rejected rather than
 overlooked: it carries one cause per cycle in a fixed precedence, so a cycle
 reporting `FAULT_ESTOP` says nothing about the sway, and "no `FAULT_SWAY`" would
 read as "settled" — which is exactly the two-valued defect the three states exist
-to prevent.
+to prevent.  `diagnostic_msgs/DiagnosticArray` was the other candidate and is
+recorded as settled in `crane_msgs`' own README, not re-opened here.
 
-**What closes it** is one additive amendment, which is *not* a field add and
-therefore not a slice: a new `crane_msgs/SwaySettled` message
-(`std_msgs/Header header`, `uint8 SETTLED_UNKNOWN=0`/`SETTLED_NO=1`/`SETTLED_YES=2`,
-`uint8 settled`, `float64[2] velocity`, `string message`) published on
-`/crane/sway_settled` at the status rate, with the ROS 2 Interfaces §4 row in the
-same commit.  The core is already shaped for it: `SwaySettled` is the enum,
-`SupervisorDecision::sway` is the value, and the adapter change is a second
-publisher and four assignments.  It needs the `crane_msgs` repo, which this
-issue's `repos:` does not carry.
+**The clause stayed.**  `kSettledClausePrefix` still ends every status report,
+and the two cannot disagree because they are not two compositions of the same
+verdict: `SwaySettled.message` is the bytes `decide()` already appended to the
+report, lifted out of it by the adapter, and `SwaySettled.settled` is a cast of
+the value that produced them.  Nothing about the predicate is recomputed in the
+node.  `test_status_stream.cpp` pairs the two streams by the `header.stamp` they
+share and asserts, cycle by cycle, that the field names the verdict the sentence
+opens with — starts-with and not contains, because "not settled" contains
+"settled" and a containment test would pass on the one disagreement worth
+catching.
+
+What is still owed is the *acting*: §5 row 7's action is "refuse to **start** a
+motion that depends on sway being settled", and the refusal belongs at the goal,
+which this package has no authority over.  The signal is now a field somebody
+else can branch on, which is what it was for.
 
 ## The inner loop's fault, carried and not re-derived
 

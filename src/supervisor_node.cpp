@@ -45,6 +45,32 @@ std::string deadline_summary(const SupervisorConfig & config)
   return text;
 }
 
+/// The settled clause of one report, which is the sentence that report ends in.
+/**
+ * The seam between the two streams, and the whole of why they cannot disagree:
+ * the clause on `/crane/sway_settled` is not composed a second time here, it is
+ * the bytes `decide()` already appended to the status report. Nothing about the
+ * predicate is recomputed in this adapter -- the verdict, the dwell and the
+ * sentence are all the core's.
+ *
+ * `rfind` and not `find`: a cause message is free to mention the sway in its own
+ * words, and the clause is appended last, so the last occurrence is the clause
+ * and it runs to the end of the report.
+ */
+std::string settled_clause_of(const std::string & report)
+{
+  const std::size_t start = report.rfind(kSettledClausePrefix);
+  if (start == std::string::npos) {
+    // Unreachable through `decide()`, which appends the clause to every report
+    // whatever its fault is. The report itself is the fallback rather than an
+    // empty string, because ROS 2 Interfaces §1 admits no empty explanation.
+    return report;
+  }
+  // The clause opens with the space that separated it from the sentence before
+  // it. That space belongs to the report, not to the clause.
+  return report.substr(start + 1);
+}
+
 /// Seconds as a `std::chrono` duration, for the two blocking waits.
 std::chrono::nanoseconds budget(double seconds)
 {
@@ -170,6 +196,14 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   status_publisher_ =
     create_publisher<crane_msgs::msg::SupervisorStatus>(kStatusTopic, contract_qos());
 
+  // The settled predicate, on a stream of its own because `SupervisorStatus` has
+  // no field for it and widening a frozen message is a slice of its own (PRD
+  // §15). Same QoS as the status and published from the same cycle: a task layer
+  // that branches on the field and an operator reading the sentence are looking
+  // at one decision.
+  sway_settled_publisher_ =
+    create_publisher<crane_msgs::msg::SwaySettled>(kSwaySettledTopic, contract_qos());
+
   // Every subscription below goes through `subscribe()` and names its `Input`,
   // which is what gives it a freshness deadline and a policy row to be reported
   // from. None of them takes a topic name of its own.
@@ -274,8 +308,10 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
 
   RCLCPP_INFO(
     get_logger(),
-    "crane_supervisor: publishing %s at %.1f Hz. Every input it holds has a freshness deadline of "
-    "its own and none is exempt -- %s -- and an input that stops arriving is reported as a fault "
+    "crane_supervisor: publishing %s and %s at %.1f Hz -- the second carries the settled predicate "
+    "as a field, because the first is frozen and has no room for one. Every input it holds has a "
+    "freshness deadline of its own and none is exempt -- %s -- and an input that stops arriving is "
+    "reported as a fault "
     "rather than left at FAULT_NONE. Button %d of the remote is the deadman. It serves %s and %s. "
     "The mode it reports is re-derived from %s every cycle and never remembered, and %s is the one "
     "call this package makes that reaches the machine -- narrowly: it decides which controller "
@@ -283,7 +319,8 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
     "is an unverified commissioning prerequisite, so releasing a claim on MODE_IDLE is a mode "
     "change somebody asked for and not a way to bring the machine to rest, and what it does with "
     "the emergency stop is diagnosis and recovery rather than protection.",
-    kStatusTopic, kStatusRate, deadline_summary(config_).c_str(), config_.deadman_button,
+    kStatusTopic, kSwaySettledTopic, kStatusRate, deadline_summary(config_).c_str(),
+    config_.deadman_button,
     kClearFaultService, kSetModeService, kListControllersService, kSwitchControllerService);
 }
 
@@ -572,7 +609,12 @@ void SupervisorNode::update()
   // newest answer the manager has given rather than from the one before it.
   poll_controller_manager();
 
-  const SupervisorDecision decision = decide(config_, observe());
+  // The observation is held rather than handed straight to `decide()`: the
+  // settled stream carries the two rates the predicate was decided from, and
+  // they have to be the rates *this* decision saw. Reading the held message a
+  // second time would publish a rate that arrived after the verdict.
+  const SupervisorInput observed = observe();
+  const SupervisorDecision decision = decide(config_, observed);
   // The two things a cycle carries into the next one. `decide()` raises the
   // latch and only an acknowledged `/crane/clear_fault` lowers it; the sway dwell
   // is advanced on every cycle whatever the report said, so that a fault
@@ -580,8 +622,13 @@ void SupervisorNode::update()
   estop_latched_ = decision.estop_latched;
   sway_state_ = decision.sway;
 
+  // One reading of the clock for both publications. They are two streams of one
+  // decision, so a consumer pairs them by stamp; two readings would put the same
+  // cycle on the wire under two different times.
+  const rclcpp::Time stamp = now();
+
   crane_msgs::msg::SupervisorStatus status;
-  status.header.stamp = now();
+  status.header.stamp = stamp;
   // Status data has no geometric expression frame, so the header value is the
   // empty string rather than an invented one (ROS 2 Interfaces §1, §4).
   status.header.frame_id = "";
@@ -592,6 +639,23 @@ void SupervisorNode::update()
   status.deadman_held = decision.deadman_held;
   status.message = decision.message;
   status_publisher_->publish(status);
+
+  // The same verdict, as a field a behaviour tree can branch on rather than an
+  // English clause it would have to parse (wiki/control_architecture.md §5 row
+  // 7). Four assignments and no decision: `settled` is the value the core
+  // decided, `velocity` is what it decided it from, and `message` is the clause
+  // the report above already carries -- so the stream and the sentence agree by
+  // construction rather than by two functions being kept in step.
+  crane_msgs::msg::SwaySettled settled;
+  settled.header.stamp = stamp;
+  settled.header.frame_id = "";
+  // A cast and not a lookup table, the way the mode and the fault are: the core's
+  // `SwaySettled` and the message's `SETTLED_*` constants share one numbering,
+  // and `test_contract.cpp` asserts every pair of them.
+  settled.settled = static_cast<std::uint8_t>(decision.sway.settled);
+  settled.velocity = observed.pendulum_state.velocity;
+  settled.message = settled_clause_of(decision.message);
+  sway_settled_publisher_->publish(settled);
 
   // On the transition only. The stream already carries the cause twenty times a
   // second; what a log adds is the moment it changed, and repeating it every

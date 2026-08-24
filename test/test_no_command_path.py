@@ -8,8 +8,20 @@ Until it is performed the system must not advertise a safety function it cannot
 deliver (PRD user story 54).  So the absence below is the feature, and a feature
 that is not asserted is a feature that comes back by accident.
 
-**Since issue 026 the guard has exactly one exception, and it is named rather
-than removed.**  ROS 2 Interfaces 5 puts `/controller_manager/switch_controller`
+**Since issue 028 the publisher list has two entries, and the second is named
+rather than the rule loosened.**  The settled predicate of
+wiki/control_architecture.md 5 row 7 is what a behaviour tree gates a grip action
+on, and `crane_msgs/SupervisorStatus` has no field for it, so it rides on a
+second stream (`crane_msgs/SwaySettled` on `/crane/sway_settled`).  The assertion
+below still pins every publisher *by type and in source order* -- what changed is
+that the list is two long instead of one.  It is a status stream by every test
+the first one passes: reliable depth 1 at 20 Hz, `header.frame_id` empty, and a
+payload of one `uint8`, two rates and a sentence.  Nothing on it is a setpoint,
+and no controller subscribes to it -- the consumer is the task layer, which is
+where the *refusal* half of that row belongs.
+
+**Since issue 026 the guard has one service-call exception, and it is named
+rather than removed.**  ROS 2 Interfaces 5 puts `/controller_manager/switch_controller`
 behind the supervisor -- mode changes go through it, not from the behaviour
 tree -- so this package holds two clients on the controller manager and nothing
 else does.  The guard was updated for that and not weakened: the blanket bans on
@@ -40,11 +52,12 @@ PACKAGE_XML = PACKAGE_ROOT / "package.xml"
 
 NON_SOURCE_DIRECTORIES = {".git", "__pycache__", "build", "install", "log"}
 
-# The contract names of ROS 2 Interfaces 4 and 5 this package may know: the
-# status stream it owns, the four inputs it carries end to end, the two services
+# The contract names of ROS 2 Interfaces 4 and 5 this package may know: the two
+# status streams it owns, the four inputs it carries end to end, the two services
 # it serves, and the two it calls on the controller manager.  Any other ROS name
 # in the sources is a reach this package does not have.
 STATUS_TOPIC = "/crane/supervisor/status"
+SWAY_SETTLED_TOPIC = "/crane/sway_settled"
 PENDULUM_STATE_TOPIC = "/crane/pendulum_state"
 REMOTE_CTRL_STATES_TOPIC = "/crane/remote_ctrl_states"
 CONTROLLER_STATE_TOPIC = "/crane/controller_state"
@@ -62,6 +75,7 @@ SWITCH_CONTROLLER_SERVICE = "/controller_manager/switch_controller"
 
 PERMITTED_ROS_NAMES = {
     STATUS_TOPIC,
+    SWAY_SETTLED_TOPIC,
     PENDULUM_STATE_TOPIC,
     REMOTE_CTRL_STATES_TOPIC,
     CONTROLLER_STATE_TOPIC,
@@ -135,6 +149,23 @@ FORBIDDEN_IDENTIFIERS = (
     "Twist",
     "create_generic_publisher",
 )
+
+# Every publisher this package holds, by type and in source order.  A publisher
+# is how a status node becomes a command node -- the topic would be new, the QoS
+# would be new, and nothing else about the package would look different -- so the
+# list is enumerated one entry at a time and never widened by a pattern.
+#
+# `crane_msgs/SwaySettled` was added in issue 028 and is the second and last
+# entry.  The argument for it is the one the README records: the settled
+# predicate is a *report*, its consumer is the task layer rather than a
+# controller, and the message carries a `uint8`, two rates and a sentence -- no
+# joint, no duration, no setpoint, so it is not a shape a motion command fits in.
+# What would *not* be admitted here is a publisher of a type that carries one,
+# whatever the topic were called: `trajectory_msgs` is banned outright above.
+PERMITTED_PUBLISHER_TYPES = [
+    "crane_msgs::msg::SupervisorStatus",
+    "crane_msgs::msg::SwaySettled",
+]
 
 # The two services this package serves, and the only types it may serve them
 # with, in source order.  `std_srvs/Trigger` takes no arguments at all;
@@ -277,15 +308,20 @@ def test_no_source_reaches_a_controller_or_a_command_interface():
             assert identifier not in body, f"{path.name}: {identifier}"
 
 
-def test_the_package_publishes_one_stream_and_only_reads_its_inputs():
-    """One publisher, four subscriptions, two services, two clients.
+def test_the_package_publishes_two_status_streams_and_only_reads_its_inputs():
+    """Two publishers, four subscriptions, two services, two clients.
 
-    A second publisher is how a status node becomes a command node: the topic
-    would be new, the QoS would be new, and nothing else about the package would
-    look different.  The publisher list is what did *not* change when the switch
-    client landed, and it is the load-bearing half of this guard: whatever this
+    A publisher nobody enumerated is how a status node becomes a command node:
+    the topic would be new, the QoS would be new, and nothing else about the
+    package would look different.  So the list is pinned by type and in source
+    order, and it did *not* change when the switch client landed -- whatever this
     package can now ask the controller manager to do, it still cannot emit a
     setpoint.
+
+    It grew by one in issue 028, and by naming the entry rather than by relaxing
+    the rule: the settled predicate had nowhere to go on a frozen
+    `SupervisorStatus`, and `crane_msgs/SwaySettled` carries a verdict, the two
+    rates it was decided from and a sentence.  Both entries are reports.
 
     `/crane/velocity_controller/health` is a subscription and stays one.  The
     inner loop's fault reaches this node because the controller publishes it;
@@ -300,7 +336,7 @@ def test_the_package_publishes_one_stream_and_only_reads_its_inputs():
         services += re.findall(r"create_service<([A-Za-z0-9_:]+)>", body)
         clients += re.findall(r"create_client<([A-Za-z0-9_:]+)>", body)
 
-    assert publishers == ["crane_msgs::msg::SupervisorStatus"], publishers
+    assert publishers == PERMITTED_PUBLISHER_TYPES, publishers
     # The exception, pinned by type.  A third client -- or either of these two
     # replaced by something that carries a command -- is a reach this package
     # does not have and a line this file has to gain.

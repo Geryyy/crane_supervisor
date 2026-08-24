@@ -11,19 +11,23 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "control_msgs/msg/joint_trajectory_controller_state.hpp"
 #include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
+#include "crane_msgs/msg/sway_settled.hpp"
 #include "crane_msgs/msg/velocity_controller_health.hpp"
 #include "crane_supervisor/supervisor_node.hpp"
 #include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
@@ -39,6 +43,12 @@ using crane_msgs::msg::SupervisorStatus;
 using crane_msgs::msg::VelocityControllerHealth;
 using epsilon_crane_msgs::msg::RemoteCtrlStates;
 using std_srvs::srv::Trigger;
+
+/// The message, spelled apart from `crane_supervisor::SwaySettled` -- which is
+/// the ROS-free core's enum of the same name, and the thing the field is a cast
+/// of.  Two names for two sides of one contract is the point; one identifier for
+/// both would read as if the core knew about the wire.
+using SwaySettledMsg = crane_msgs::msg::SwaySettled;
 
 /// The six actuated joints of ROS 2 Interfaces §3.2, as the trajectory
 /// controller publishes them in `joint_names`.
@@ -140,6 +150,11 @@ protected:
     status_ = observer_->create_subscription<SupervisorStatus>(
       crane_supervisor::kStatusTopic, qos,
       [this](SupervisorStatus::ConstSharedPtr message) {received_.push_back(*message);});
+    // The second stream, on the same profile: the settled predicate as a field a
+    // behaviour tree branches on rather than a clause it would have to parse.
+    sway_settled_ = observer_->create_subscription<SwaySettledMsg>(
+      crane_supervisor::kSwaySettledTopic, qos,
+      [this](SwaySettledMsg::ConstSharedPtr message) {settled_.push_back(*message);});
     pendulum_state_ = observer_->create_publisher<PendulumState>(
       crane_supervisor::kPendulumStateTopic, qos);
     remote_ctrl_ = observer_->create_publisher<RemoteCtrlStates>(
@@ -406,16 +421,73 @@ protected:
     }
   }
 
+  /// Every cycle both streams carried, paired by the stamp they share.
+  /**
+   * The node stamps the two publications from one reading of its own clock, so
+   * the stamp *is* the cycle and not an approximation of it.  A cycle that
+   * reached only one of the two subscriptions -- the reports published before
+   * both endpoints had matched -- is absent from the pairing rather than
+   * asserted against nothing.
+   */
+  std::vector<std::pair<SupervisorStatus, SwaySettledMsg>> paired_reports() const
+  {
+    std::map<std::int64_t, SwaySettledMsg> by_stamp;
+    for (const SwaySettledMsg & message : settled_) {
+      by_stamp.emplace(rclcpp::Time(message.header.stamp).nanoseconds(), message);
+    }
+    std::vector<std::pair<SupervisorStatus, SwaySettledMsg>> paired;
+    for (const SupervisorStatus & status : received_) {
+      const auto found = by_stamp.find(rclcpp::Time(status.header.stamp).nanoseconds());
+      if (found != by_stamp.end()) {
+        paired.emplace_back(status, found->second);
+      }
+    }
+    return paired;
+  }
+
+  /// The invariant the second stream exists to keep: one decision, two carriers.
+  /**
+   * The field and the clause are not two compositions of the same verdict that
+   * have to be kept in step -- the sentence on `/crane/sway_settled` is the bytes
+   * `decide()` already appended to the report, and the field is a cast of the
+   * value that produced them.  This is where that is asserted rather than
+   * assumed.
+   */
+  void expect_the_field_and_the_sentence_agree() const
+  {
+    const auto paired = paired_reports();
+    EXPECT_FALSE(paired.empty()) << "no cycle reached both streams";
+    // "Sway: " -- the exported clause prefix without the space that separated it
+    // from the sentence it was appended to.
+    const std::string head = std::string(crane_supervisor::kSettledClausePrefix).substr(1);
+    for (const auto & [status, verdict] : paired) {
+      EXPECT_EQ(verdict.header.frame_id, "");
+      EXPECT_NE(rclcpp::Time(verdict.header.stamp).nanoseconds(), 0);
+      EXPECT_FALSE(verdict.message.empty());
+      // The same bytes, not a second sentence about the same thing.
+      EXPECT_NE(status.message.find(verdict.message), std::string::npos)
+        << status.message << "\n---\n" << verdict.message;
+      // And the field names the verdict that clause opens with.  Starts-with and
+      // not contains: "not settled" contains "settled", so a containment test
+      // would pass on precisely the disagreement worth catching.
+      const auto predicate = static_cast<crane_supervisor::SwaySettled>(verdict.settled);
+      EXPECT_EQ(verdict.message.rfind(head + crane_supervisor::settled_word(predicate), 0), 0u)
+        << verdict.message;
+    }
+  }
+
   rclcpp::executors::SingleThreadedExecutor executor_;
   std::shared_ptr<crane_supervisor::SupervisorNode> supervisor_;
   rclcpp::Node::SharedPtr observer_;
   rclcpp::Subscription<SupervisorStatus>::SharedPtr status_;
+  rclcpp::Subscription<SwaySettledMsg>::SharedPtr sway_settled_;
   rclcpp::Publisher<PendulumState>::SharedPtr pendulum_state_;
   rclcpp::Publisher<RemoteCtrlStates>::SharedPtr remote_ctrl_;
   rclcpp::Publisher<JointTrajectoryControllerState>::SharedPtr controller_state_;
   rclcpp::Publisher<VelocityControllerHealth>::SharedPtr controller_health_;
   rclcpp::Client<Trigger>::SharedPtr clear_fault_;
   std::vector<SupervisorStatus> received_;
+  std::vector<SwaySettledMsg> settled_;
 };
 
 /// The same node, handed the six numbers out of a file in the shape
@@ -822,6 +894,112 @@ TEST_F(StatusStreamWithShortDwell, TheSettledPredicateIsOnEveryReportAndPassesTh
       << status.message;
   }
 
+  expect_contract_of_every_report();
+}
+
+TEST_F(StatusStream, TheSettledPredicateIsAFieldOnAStreamOfItsOwn)
+{
+  // The additive amendment of PRD §15: the predicate a behaviour tree gates a
+  // grip action on, as a field rather than as English it would have to parse.
+  // The endpoint is the one `crane_msgs`' own ROS contract test asserts for
+  // `/crane/sway_settled` -- status data, reliable, depth 1, `frame_id` empty.
+  ASSERT_TRUE(
+    spin_until(
+      [this]() {
+        return !observer_->get_publishers_info_by_topic(crane_supervisor::kSwaySettledTopic)
+        .empty();
+      }));
+
+  const auto endpoints =
+    observer_->get_publishers_info_by_topic(crane_supervisor::kSwaySettledTopic);
+  ASSERT_EQ(endpoints.size(), 1u);
+  EXPECT_EQ(endpoints[0].node_name(), "crane_supervisor");
+  EXPECT_EQ(endpoints[0].topic_type(), "crane_msgs/msg/SwaySettled");
+
+  const rclcpp::QoS & qos = endpoints[0].qos_profile();
+  EXPECT_EQ(qos.reliability(), rclcpp::ReliabilityPolicy::Reliable);
+  EXPECT_EQ(qos.durability(), rclcpp::DurabilityPolicy::Volatile);
+  // The same allowance the status endpoint gets: some Humble RMWs report an
+  // endpoint's history depth as 0/UNKNOWN though the entity kept the request.
+  if (qos.depth() != 0) {
+    EXPECT_EQ(qos.depth(), 1u);
+  }
+
+  // Before an estimate has ever arrived the question is not answerable, and the
+  // field says so instead of defaulting to either of the two useful answers.
+  ASSERT_TRUE(spin_until([this]() {return !settled_.empty();}));
+  EXPECT_EQ(settled_.front().settled, SwaySettledMsg::SETTLED_UNKNOWN);
+  EXPECT_EQ(settled_.front().header.frame_id, "");
+  EXPECT_NE(rclcpp::Time(settled_.front().header.stamp).nanoseconds(), 0);
+  EXPECT_FALSE(settled_.front().message.empty());
+  // And the rates are absent rather than zero: a rate nobody reported is not a
+  // crane that is hanging still.
+  EXPECT_TRUE(std::isnan(settled_.front().velocity[0])) << settled_.front().velocity[0];
+  EXPECT_TRUE(std::isnan(settled_.front().velocity[1])) << settled_.front().velocity[1];
+}
+
+TEST_F(StatusStreamWithShortDwell, TheFieldAndTheSentenceAreOneDecisionAndCannotDisagree)
+{
+  // The whole path, through all three values of the predicate, with the clause
+  // that used to be its only carrier still on every report beside it.  The dwell
+  // is the fixture's shortened one for the reason that fixture gives; what the
+  // shipped 2.0 s is derived from is asserted offline in `test_sway_monitor.cpp`.
+  ASSERT_TRUE(spin_until([this]() {return !settled_.empty();}));
+  EXPECT_EQ(settled_.front().settled, SwaySettledMsg::SETTLED_UNKNOWN);
+
+  // The remote comes back and the latch is acknowledged, so that what follows is
+  // about the sway rather than about the stop.
+  const auto cleared = acknowledge(trusted_state(), held_remote());
+  ASSERT_NE(cleared, nullptr);
+  EXPECT_TRUE(cleared->success) << cleared->message;
+
+  // A still crane, held long enough for the dwell.  The rates are not zero: what
+  // the field carries is what the verdict was decided from, and a consumer that
+  // disagrees with the verdict can see the numbers behind it.
+  PendulumState still = trusted_state();
+  still.velocity[0] = 0.01;
+  still.velocity[1] = -0.005;
+  ASSERT_TRUE(
+    spin_until(
+      [this]() {
+        return !settled_.empty() && settled_.back().settled == SwaySettledMsg::SETTLED_YES;
+      },
+      [this, &still]() {publish(still, held_remote());}))
+    << settled_.back().message;
+  EXPECT_DOUBLE_EQ(settled_.back().velocity[0], 0.01);
+  EXPECT_DOUBLE_EQ(settled_.back().velocity[1], -0.005);
+
+  // A rate past the settle bound and well inside the fault bound: not settled,
+  // and no fault at all.  The two are separate answers, which is the whole reason
+  // the predicate is not read off `fault` -- "no FAULT_SWAY" is not "settled".
+  PendulumState swinging = trusted_state();
+  swinging.velocity[0] = 0.2;
+  ASSERT_TRUE(
+    spin_until(
+      [this]() {
+        return !settled_.empty() && settled_.back().settled == SwaySettledMsg::SETTLED_NO;
+      },
+      [this, &swinging]() {publish(swinging, held_remote());}))
+    << settled_.back().message;
+  EXPECT_EQ(received_.back().fault, SupervisorStatus::FAULT_NONE) << received_.back().message;
+
+  // The estimate goes bad while the crane is demonstrably still.  `SETTLED_YES`
+  // does not survive it, and it does not become `SETTLED_NO` either: it becomes
+  // unknowable, which is a third thing, and the fault names the sensor.
+  PendulumState degraded = still;
+  degraded.valid = false;
+  degraded.status = "not to be trusted: no filter state";
+  ASSERT_TRUE(
+    spin_until(
+      [this]() {
+        return !settled_.empty() && settled_.back().settled == SwaySettledMsg::SETTLED_UNKNOWN &&
+        !received_.empty() && received_.back().fault == SupervisorStatus::FAULT_STATE_HEALTH;
+      },
+      [this, &degraded]() {publish(degraded, held_remote());}))
+    << settled_.back().message;
+
+  // Every cycle that reached both streams carried one decision on two carriers.
+  expect_the_field_and_the_sentence_agree();
   expect_contract_of_every_report();
 }
 

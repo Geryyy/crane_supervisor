@@ -1443,10 +1443,13 @@ TEST(SupervisorCore, TheDwellRunsThroughCyclesThatReportSomethingElseEntirely)
 
 TEST(SupervisorCore, NothingHereActs)
 {
-  // The whole action of this supervisor is to report.  There is no stop, no
-  // ramp, no deactivation and no command in the decision it returns -- on a
-  // tracking fault least of all, which is the whole of §5.0: the signal is
-  // fixed and the decision stays in the task layer.
+  // The whole action of `decide()` is to report.  There is no stop, no ramp, no
+  // deactivation and no command in the decision it returns -- on a tracking
+  // fault least of all, which is the whole of §5.0: the signal is fixed and the
+  // decision stays in the task layer.  `solver_handback()` is the one function
+  // in this core that answers a question about an action, and it is still only
+  // an answer: `TheHandBackIsAPredicateAndActsOnNothing` below asserts that, and
+  // the switch itself needs a controller manager this binary does not link.
   const auto config = config_with_tolerances();
   auto input = healthy_input();
   input.controller_state = with_error("theta3_arm_joint", 0.2, 1.0);
@@ -1476,6 +1479,95 @@ std::vector<crane_supervisor::ControllerHealthReport> every_inner_loop_report()
     inner_loop_fault(crane_supervisor::Fault::ReferenceStale),
     uncommissioned_gripper()};
   return reports;
+}
+
+/// The two things outside the four inputs that the solver branch reads.
+/**
+ * Which mode holds the claim, and what the horizon producer last said about
+ * itself. They are swept together because the branch depends on both at once:
+ * the same `FAULT_SOLVER` is the live command path having stopped in `MODE_MPC`
+ * and a shadow solve that drove nothing in `MODE_FOLLOW`.
+ */
+struct HorizonContext
+{
+  crane_supervisor::ControllerManagerReport manager;
+  crane_supervisor::HorizonReport horizon;
+};
+
+/// One row of what the controller manager would have answered.
+crane_supervisor::ControllerManagerReport claim_held_by(
+  const std::vector<std::string> & active_controllers)
+{
+  crane_supervisor::ControllerManagerReport report;
+  report.answer.received = true;
+  report.answer.age = 0.01;
+  for (const char * name : {"crane_velocity_controller", "trajectory_controller_a2b"}) {
+    crane_supervisor::ControllerReport entry;
+    entry.name = name;
+    const bool up = std::find(active_controllers.begin(), active_controllers.end(), name) !=
+      active_controllers.end();
+    entry.state = up ? "active" : "inactive";
+    if (up) {
+      entry.claimed_interfaces = {"theta1_slewing_joint/velocity"};
+    }
+    report.controllers.push_back(std::move(entry));
+  }
+  return report;
+}
+
+/// What the horizon producer last said, `age` seconds ago.
+crane_supervisor::HorizonReport reported(
+  double age, crane_supervisor::SolveOutcome outcome, crane_supervisor::Fault fault,
+  bool applied_previous_solution)
+{
+  crane_supervisor::HorizonReport report;
+  report.health.received = true;
+  report.health.age = age;
+  report.outcome = outcome;
+  report.fault = fault;
+  report.solve_time = 0.012;
+  report.solve_budget = 0.03;
+  report.applied_previous_solution = applied_previous_solution;
+  report.status = "the producer's own account of the cycle";
+  return report;
+}
+
+/// The five combinations of mode and producer the solver branch turns on.
+std::vector<HorizonContext> every_horizon_context()
+{
+  const std::vector<std::string> follow{
+    "crane_velocity_controller", "trajectory_controller_a2b"};
+  const std::vector<std::string> mpc{"crane_velocity_controller"};
+  return {
+    // No manager on the graph and no producer ever heard from: the state a
+    // supervisor is in on a stack that composed neither, and the one every case
+    // below this file's solver branch was written for departs from.
+    HorizonContext{},
+    // The producer failing while the *trajectory* controller drives. This is
+    // shadow, it is the state every switch into MODE_MPC is made from, and a
+    // fault reported here would stand on every profile from the day crane_mpc
+    // was composed.
+    HorizonContext{
+      claim_held_by(follow),
+      reported(0.01, crane_supervisor::SolveOutcome::Failed, crane_supervisor::Fault::Solver,
+      false)},
+    // MODE_MPC with the optimizer converging: the mode this slice makes real.
+    HorizonContext{
+      claim_held_by(mpc),
+      reported(0.01, crane_supervisor::SolveOutcome::Converged, crane_supervisor::Fault::None,
+      false)},
+    // MODE_MPC with wiki/mpc.md §6's repeated-failure escalation: nothing went
+    // out on the horizon at all.
+    HorizonContext{
+      claim_held_by(mpc),
+      reported(0.01, crane_supervisor::SolveOutcome::Failed, crane_supervisor::Fault::Solver,
+      false)},
+    // MODE_MPC with a producer whose newest verdict is older than its own
+    // deadline. A code nobody has heard since is not an observation.
+    HorizonContext{
+      claim_held_by(mpc),
+      reported(100.0, crane_supervisor::SolveOutcome::Failed, crane_supervisor::Fault::Solver,
+      false)}};
 }
 
 /// The whole reachable input space of this slice, one struct per combination.
@@ -1544,7 +1636,26 @@ std::vector<crane_supervisor::SupervisorInput> every_input()
       swept.push_back(std::move(input));
     }
   }
-  return swept;
+
+  // And the mode and the producer, applied the same way rather than as two more
+  // nested loops. Five combinations and not a full product: what the solver
+  // branch turns on is *which* of the two producers holds the command path and
+  // whether the newest verdict is one this supervisor can still observe, and
+  // each of those questions has a small answer set. Without this the sweep would
+  // carry no controller-manager answer at all and could not reach the branch --
+  // an untested branch that the sweep silently declared unreachable is exactly
+  // what "the cases that go wrong are the ones nobody thought to name" is about.
+  std::vector<crane_supervisor::SupervisorInput> composed;
+  const std::vector<HorizonContext> contexts = every_horizon_context();
+  composed.reserve(swept.size() * contexts.size());
+  for (const HorizonContext & context : contexts) {
+    for (crane_supervisor::SupervisorInput input : swept) {
+      input.controller_manager = context.manager;
+      input.horizon = context.horizon;
+      composed.push_back(std::move(input));
+    }
+  }
+  return composed;
 }
 
 }  // namespace
@@ -1560,14 +1671,14 @@ TEST(SupervisorCore, EveryReachableDecisionCarriesACause)
       EXPECT_FALSE(decision.message.empty());
       // The mode is re-derived from the controller manager's own answer on
       // every cycle, so what is asserted here is that `decide()` reports what
-      // `active_mode()` read rather than anything of its own. None of these
-      // inputs carries an answer, which is the state a supervisor with no
-      // manager on the graph is in: the mode is not known and MODE_IDLE -- the
-      // reading that claims the least -- is what goes on the wire.
+      // `active_mode()` read rather than anything of its own. A view this
+      // supervisor does not have reads as MODE_IDLE -- the reading that claims
+      // the least -- and never as the last mode it happened to see.
       const auto active = crane_supervisor::active_mode(config, input.controller_manager);
       EXPECT_EQ(decision.mode, active.mode);
-      EXPECT_EQ(decision.mode, crane_supervisor::Mode::Idle);
-      EXPECT_FALSE(active.known);
+      if (!active.known) {
+        EXPECT_EQ(decision.mode, crane_supervisor::Mode::Idle);
+      }
       // And the clause that says so is on every one of them, whatever the fault
       // is: MODE_IDLE on a report whose manager is silent and MODE_IDLE on one
       // whose arm claim is free are the same byte and different facts.
@@ -1646,18 +1757,18 @@ TEST(SupervisorCore, NoTrackingFaultIsReachableWithoutATolerance)
   }
 }
 
-TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheInnerLoopsThree)
+TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheOtherLoopsFour)
 {
-  // Every other cause of the §5 table belongs to a later issue.  A supervisor
-  // that raised one of them from an input it does not have would be reporting a
-  // check it never made.
+  // The working cell is the one cause of the §5 table this stack still cannot
+  // raise: nothing on any input can produce it, and a supervisor that raised it
+  // anyway would be reporting a check it never made.
   //
-  // Two of the eight are not this package's verdicts at all: FAULT_REFERENCE_STALE
-  // and FAULT_NOT_COMMISSIONED are the inner velocity loop's, merged as the loop
-  // numbered them.  Working cell and solver stay unreachable -- nothing on any of
-  // the four inputs can produce them, and neither can this supervisor.  FAULT_SWAY
-  // is reachable now, and from exactly one place: the passive rate past its own
-  // configured bound.
+  // Three of the nine are not this package's verdicts at all.  FAULT_REFERENCE_STALE
+  // and FAULT_NOT_COMMISSIONED are the inner velocity loop's and FAULT_SOLVER is
+  // the horizon producer's, and all three are merged as their producer numbered
+  // them (wiki/implementation/ros2_interfaces.md §4).  FAULT_SWAY is this
+  // package's and is reachable from exactly one place: the passive rate past its
+  // own configured bound.
   for (const auto & config : {default_config(), config_with_tolerances()}) {
     for (const auto & input : every_input()) {
       const auto fault = crane_supervisor::decide(config, input).fault;
@@ -1666,6 +1777,7 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheInnerLoopsThree)
         fault == crane_supervisor::Fault::StateHealth ||
         fault == crane_supervisor::Fault::Tracking ||
         fault == crane_supervisor::Fault::Sway ||
+        fault == crane_supervisor::Fault::Solver ||
         fault == crane_supervisor::Fault::ReferenceStale ||
         fault == crane_supervisor::Fault::EStop ||
         fault == crane_supervisor::Fault::Interlock ||
@@ -1679,6 +1791,19 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheInnerLoopsThree)
         EXPECT_EQ(fault, input.controller_health.fault);
         EXPECT_TRUE(input.stream(Input::ControllerHealth).received);
       }
+      // FAULT_SOLVER the same way, and with the one condition that is not about
+      // the stream: the producer only owns the command path in MODE_MPC, so its
+      // verdict is reported there and nowhere else.  A failed *shadow* solve is
+      // a solve that drove nothing.
+      if (fault == crane_supervisor::Fault::Solver) {
+        EXPECT_EQ(fault, input.horizon.fault);
+        const auto active = crane_supervisor::active_mode(config, input.controller_manager);
+        EXPECT_TRUE(active.known);
+        EXPECT_EQ(active.mode, crane_supervisor::Mode::Mpc);
+        EXPECT_EQ(
+          crane_supervisor::freshness_of(config.horizon_deadline, input.horizon.health),
+          Staleness::Fresh);
+      }
       // And FAULT_SWAY is reachable only from a rate this supervisor was
       // entitled to believe.  A degraded estimate is FAULT_STATE_HEALTH, never
       // this: a sensor that stopped saying anything is a different fact from a
@@ -1689,6 +1814,279 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheInnerLoopsThree)
       }
     }
   }
+}
+
+// --------------------------------------------------------------------------
+// The horizon producer's verdict on the operator's stream, and the hand-back it
+// can end in (wiki/control_architecture.md §5 row 3, wiki/mpc.md §6,
+// wiki/implementation/ros2_interfaces.md §4).
+// --------------------------------------------------------------------------
+
+namespace
+{
+
+/// A healthy machine with a named mode holding the claim and a named producer.
+crane_supervisor::SupervisorInput driving(
+  const std::vector<std::string> & active_controllers, crane_supervisor::HorizonReport horizon)
+{
+  crane_supervisor::SupervisorInput input = healthy_input();
+  input.controller_manager = claim_held_by(active_controllers);
+  input.horizon = std::move(horizon);
+  return input;
+}
+
+const std::vector<std::string> & mpc_claim()
+{
+  static const std::vector<std::string> claim{"crane_velocity_controller"};
+  return claim;
+}
+
+const std::vector<std::string> & follow_claim()
+{
+  static const std::vector<std::string> claim{
+    "crane_velocity_controller", "trajectory_controller_a2b"};
+  return claim;
+}
+
+/// wiki/mpc.md §6's escalation as it reaches this supervisor: FAULT_SOLVER with
+/// nothing published, which is the producer saying it stopped rather than that
+/// it shifted.
+crane_supervisor::HorizonReport escalated()
+{
+  return reported(
+    0.01, crane_supervisor::SolveOutcome::Failed, crane_supervisor::Fault::Solver, false);
+}
+
+/// The defined fallback of the same page: one solve did not converge and the
+/// previous solution shifted by one step went out in its place.
+crane_supervisor::HorizonReport shifted()
+{
+  return reported(
+    0.01, crane_supervisor::SolveOutcome::BudgetExceeded, crane_supervisor::Fault::Solver, true);
+}
+
+/// The active mode of an observation, read the way `decide()` reads it.
+crane_supervisor::ActiveMode mode_of(
+  const crane_supervisor::SupervisorConfig & config,
+  const crane_supervisor::SupervisorInput & input)
+{
+  return crane_supervisor::active_mode(config, input.controller_manager);
+}
+
+}  // namespace
+
+TEST(SupervisorSolver, TheProducersCodeIsCarriedRatherThanTranslated)
+{
+  // wiki/implementation/ros2_interfaces.md §4's rule for VelocityControllerHealth,
+  // applied to the second stream that carries a SupervisorStatus code: merged,
+  // not renumbered and not re-derived.  This is what "FAULT_SOLVER reaches the
+  // operator" means -- the value on /crane/supervisor/status is the value
+  // crane_mpc put on /crane/mpc/solver_health.
+  const auto config = default_config();
+  const auto decision = crane_supervisor::decide(config, driving(mpc_claim(), escalated()));
+
+  EXPECT_EQ(decision.fault, crane_supervisor::Fault::Solver);
+  EXPECT_EQ(static_cast<std::uint8_t>(decision.fault), 3U) << "the code was renumbered on the way";
+  // And the producer's own account of the cycle is carried through rather than
+  // restated, for the reason the broadcaster's `status` is: crane_mpc separates
+  // an escalation from a shifted fallback from a cold start in that string, and
+  // a supervisor that rewrote it would flatten the distinction.
+  EXPECT_NE(decision.message.find("the producer's own account"), std::string::npos)
+    << decision.message;
+  // The escalation's own half of the sentence: nothing went out at all, which is
+  // a different fact from a plan having gone out that the optimizer no longer
+  // believes.
+  EXPECT_NE(decision.message.find("nothing went out on the horizon"), std::string::npos)
+    << decision.message;
+  EXPECT_EQ(decision.mode, crane_supervisor::Mode::Mpc);
+}
+
+TEST(SupervisorSolver, AShiftedPreviousSolutionSaysSoRatherThanClaimingSilence)
+{
+  // The same code and a different sentence.  wiki/mpc.md §6 gives one
+  // non-convergent solve a defined fallback -- the previous solution shifted by
+  // one step -- and an operator reading FAULT_SOLVER is owed which of the two
+  // happened, because only one of them means the horizon has stopped.
+  const auto config = default_config();
+  const auto decision = crane_supervisor::decide(config, driving(mpc_claim(), shifted()));
+
+  EXPECT_EQ(decision.fault, crane_supervisor::Fault::Solver);
+  EXPECT_NE(decision.message.find("shifted by one step"), std::string::npos) << decision.message;
+  EXPECT_EQ(decision.message.find("nothing went out on the horizon"), std::string::npos)
+    << decision.message;
+}
+
+TEST(SupervisorSolver, AFailedShadowSolveDroveNothingAndIsNotReported)
+{
+  // The one condition that is about the mode rather than about the stream.  In
+  // MODE_FOLLOW crane_mpc is shadowing (issue 053): it solves, it publishes its
+  // verdict, and it drives nothing.  Reporting FAULT_SOLVER there would put a
+  // standing fault on the operator's stream on every profile from the day the
+  // producer was composed, which is exactly why `HorizonReport` is not an
+  // `Input` -- and why its *code* being merged is a different question from its
+  // absence being watched.
+  const auto config = default_config();
+  const auto decision = crane_supervisor::decide(config, driving(follow_claim(), escalated()));
+
+  EXPECT_EQ(decision.fault, crane_supervisor::Fault::None);
+  EXPECT_EQ(decision.mode, crane_supervisor::Mode::Follow);
+  EXPECT_FALSE(crane_supervisor::solver_handback(
+      config, driving(follow_claim(), escalated()), mode_of(config, driving(follow_claim(),
+      escalated()))).required);
+}
+
+TEST(SupervisorSolver, AVerdictNobodyHasHeardSinceIsNotAnObservation)
+{
+  // Judged on a *fresh* report, against the producer's own margin.  A code off a
+  // report this supervisor has not heard since is a fault it cannot still
+  // observe, and standing by it would be the latch §5.3 spends its whole table
+  // avoiding.  What an operator gets when the producer goes silent altogether is
+  // the receiver running out of plan, which is the only thing either node can
+  // still see.
+  const auto config = default_config();
+  crane_supervisor::HorizonReport old = escalated();
+  old.health.age = 10.0 * config.horizon_deadline;
+  const auto input = driving(mpc_claim(), old);
+
+  EXPECT_EQ(crane_supervisor::decide(config, input).fault, crane_supervisor::Fault::None);
+  EXPECT_FALSE(crane_supervisor::solver_handback(config, input, mode_of(config, input)).required);
+}
+
+TEST(SupervisorSolver, TheProducersCauseOutranksTheReceiversSymptom)
+{
+  // §5.0, as a precedence.  When the optimizer stops, the receiver runs out of
+  // plan and raises FAULT_REFERENCE_STALE -- the consequence, one layer down, of
+  // this cause.  A supervisor that reported the symptom while the cause went
+  // unread would be handing the task layer exactly the inferred signal §5.0
+  // exists to replace.
+  const auto config = default_config();
+  auto input = driving(mpc_claim(), escalated());
+  input.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
+
+  EXPECT_EQ(crane_supervisor::decide(config, input).fault, crane_supervisor::Fault::Solver);
+
+  // And with the producer healthy the receiver's own verdict is what is reported:
+  // the branch above outranks it, it does not replace it.
+  auto stale_only = driving(
+    mpc_claim(),
+    reported(
+      0.01, crane_supervisor::SolveOutcome::Converged, crane_supervisor::Fault::None, false));
+  stale_only.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
+  EXPECT_EQ(
+    crane_supervisor::decide(config, stale_only).fault, crane_supervisor::Fault::ReferenceStale);
+}
+
+TEST(SupervisorSolver, TheStopAndTheDegradedEstimateStillOutrankIt)
+{
+  // The solver sits below everything that removes part of this supervisor's own
+  // view of the crane, for the reason sway and tracking do: a stack that cannot
+  // see the machine should say so before it says anything derived from what it
+  // cannot see.  The stop outranks all of them because it is the only cause with
+  // no field of its own.
+  const auto config = default_config();
+
+  auto stopped = driving(mpc_claim(), escalated());
+  stopped.remote_ctrl.em_stop = true;
+  EXPECT_EQ(crane_supervisor::decide(config, stopped).fault, crane_supervisor::Fault::EStop);
+
+  auto blind = driving(mpc_claim(), escalated());
+  blind.stream(Input::PendulumState).received = false;
+  EXPECT_EQ(crane_supervisor::decide(config, blind).fault, crane_supervisor::Fault::StateHealth);
+}
+
+TEST(SupervisorSolver, TheHandBackWaitsForTheReceiverToRunOutOfPlan)
+{
+  // The ordering of wiki/control_architecture.md §5 row 3 -- "fall back, *then*
+  // stop and report" -- as a condition and not as a comment.  The fall back is
+  // crane_velocity_controller's `horizon_expiry_ramp`; releasing the claim on
+  // the escalation itself would take the command interface off a receiver that
+  // still had a second of good plan in hand, and put on it exactly the commanded
+  // step §5.2 step 3 and wiki/mpc.md §6 both refuse.
+  const auto config = default_config();
+
+  const auto still_executing = driving(mpc_claim(), escalated());
+  EXPECT_FALSE(
+    crane_supervisor::solver_handback(
+      config, still_executing, mode_of(config, still_executing)).required)
+    << "the claim was released while the receiver still had plan to run";
+
+  auto ran_out = still_executing;
+  ran_out.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
+  const auto handback =
+    crane_supervisor::solver_handback(config, ran_out, mode_of(config, ran_out));
+  ASSERT_TRUE(handback.required);
+  EXPECT_NE(handback.message.find("handed control back"), std::string::npos) << handback.message;
+  EXPECT_NE(handback.message.find("MODE_IDLE"), std::string::npos) << handback.message;
+  // And why it is not MODE_FOLLOW, on the sentence rather than only in a header:
+  // resuming a motion is the task layer's decision (§5) and PRD §10 step 4 needs
+  // a reference this supervisor cannot produce.
+  EXPECT_NE(handback.message.find("task layer"), std::string::npos) << handback.message;
+}
+
+TEST(SupervisorSolver, AShiftedFallbackIsNotAHandBack)
+{
+  // One non-convergent solve with the previous solution shifted into its place is
+  // the defined behaviour of wiki/mpc.md §6, not a producer handing control back.
+  // A supervisor that released the claim on it would end a motion on the first
+  // budget miss, which is the opposite of what requirement 3 is for.
+  const auto config = default_config();
+  auto input = driving(mpc_claim(), shifted());
+  input.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
+
+  EXPECT_FALSE(crane_supervisor::solver_handback(config, input, mode_of(config, input)).required);
+}
+
+TEST(SupervisorSolver, AnInnerLoopThatStoppedReportingAsksForNoHandBack)
+{
+  // The receiver's verdict is the condition, so a receiver that stopped
+  // publishing is not one that ran out of plan.  §5.3's rule read the safe way
+  // round: the absence is reported as FAULT_STATE_HEALTH by the chain above, and
+  // it does not authorise this supervisor to take the claim off a controller it
+  // can no longer hear from.
+  const auto config = default_config();
+  auto input = driving(mpc_claim(), escalated());
+  input.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
+  input.stream(Input::ControllerHealth).received = false;
+
+  EXPECT_FALSE(crane_supervisor::solver_handback(config, input, mode_of(config, input)).required);
+}
+
+TEST(SupervisorSolver, NoHandBackFromAModeThatIsNotMpcOrFromAViewNobodyHas)
+{
+  // Two more of the four conditions.  In MODE_FOLLOW the escalation stops a
+  // horizon nobody is executing, and with no answer from the controller manager
+  // there is no mode to leave -- `arbitrate_mode()` would refuse the release for
+  // want of a view anyway, and asking it to is a switch issued blind.
+  const auto config = default_config();
+
+  auto following = driving(follow_claim(), escalated());
+  following.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
+  EXPECT_FALSE(
+    crane_supervisor::solver_handback(config, following, mode_of(config, following)).required);
+
+  auto unseen = healthy_input();
+  unseen.horizon = escalated();
+  unseen.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
+  EXPECT_FALSE(
+    crane_supervisor::solver_handback(config, unseen, mode_of(config, unseen)).required);
+}
+
+TEST(SupervisorSolver, TheHandBackIsAPredicateAndActsOnNothing)
+{
+  // `NothingHereActs`, for the one function in this core that is about an action.
+  // `solver_handback()` returns whether the claim is owed a release and the
+  // sentence that says why; the switch itself is `SupervisorNode`'s and needs a
+  // controller manager, which this binary does not link.  Called twice on the
+  // same observation it answers the same thing, because it carries no state.
+  const auto config = default_config();
+  auto input = driving(mpc_claim(), escalated());
+  input.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
+
+  const auto first = crane_supervisor::solver_handback(config, input, mode_of(config, input));
+  const auto second = crane_supervisor::solver_handback(config, input, mode_of(config, input));
+  EXPECT_TRUE(first.required);
+  EXPECT_EQ(first.required, second.required);
+  EXPECT_EQ(first.message, second.message);
 }
 
 // --------------------------------------------------------------------------

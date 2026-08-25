@@ -418,9 +418,10 @@ def test_the_package_publishes_two_status_streams_and_only_reads_its_inputs():
     # own status stream, which *cannot* go through the helper: an `Input` is by
     # definition a stream whose absence raises a fault on the status, and this
     # one's must not -- an optimizer that is quiet while the machine is in
-    # MODE_FOLLOW is the ordinary state of this stack, and ROS 2 Interfaces 4
-    # records that the supervisor merging `FAULT_SOLVER` onto its status stream
-    # is a slice of its own.  What stays pinned here is the set of message
+    # MODE_FOLLOW is the ordinary state of this stack.  Its `fault` is merged
+    # onto the status stream since issue 055 and that changes nothing here: a
+    # code that travels is not a command, and the merge is scoped by the mode
+    # rather than by the stream.  What stays pinned here is the set of message
     # *types* this node consumes, because a command path would have to change it.
     assert subscriptions == ["MessageT", "crane_msgs::msg::SolverHealth"], subscriptions
     assert subscribed == [

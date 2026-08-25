@@ -29,8 +29,12 @@ decides is which controller holds the claim.
   changes (ROS 2 Interfaces §5).
 - a **fifth stream, watched but not swept** — `crane_msgs/SolverHealth` on
   `/crane/mpc/solver_health`.  It is deliberately not one of the four `Input`s:
-  its absence raises no fault on the status stream, and the whole of what it
-  decides is whether `MODE_MPC` may be entered (PRD §10 step 2).
+  its *absence* raises no fault on the status stream, because an optimizer that
+  is quiet while the machine is in `MODE_FOLLOW` is the ordinary state of this
+  stack.  Its *content* decides three things: whether `MODE_MPC` may be entered
+  (PRD §10 step 2), the `FAULT_SOLVER` this package merges while `MODE_MPC` is
+  live (ROS 2 Interfaces §4), and whether [[mpc]] §6's repeated-failure
+  escalation has taken the command path away.
 - two **clients on the controller manager** — `list_controllers`, which is where
   the reported mode comes from, and `switch_controller`, which is the one call
   this package makes that reaches the machine.  ROS 2 Interfaces §5 puts that
@@ -65,15 +69,30 @@ asserts the absence, because an absence nobody checks is one that comes back by
 accident.  It is withheld, not unfinished.
 
 **A mode change is not a stop, and the difference is the whole of what is still
-withheld.**  A mode change is *asked for*, on `/crane/set_mode`, by an operator
-or by the task layer, and is answered — performed, or refused with a reason.  A
-stop would be this supervisor deactivating a claim *on its own*, on a fault, and
-zeroing at the driver boundary.  Nothing here does the second, and no code path
-below reaches a switch except from a request.  `MODE_IDLE` is the closest the two
-come, and the report on that switch says outright that releasing the arm claim is
-not a way to bring the machine to rest: nothing is zeroed at the driver boundary,
-and §7.2 measured that a manual controller which deactivates leaves its last
-velocity latched on the interface it just released.
+withheld.**  §5.2 gives the stop three steps: deactivate the claim, *zero at the
+driver boundary regardless*, and ramp rather than step.  The second is the one
+that makes it a path to zero, it belongs to the driver, and it is blocked on
+prerequisite row 3 — so nothing here zeroes anything, and this package still
+holds no publisher on a command topic.
+
+The first step happens in exactly **one** place that is not a request, and it
+arrived with issue 055: [[mpc]] §6's repeated-failure escalation, where the
+horizon producer has stopped publishing and `crane_velocity_controller` has run
+out of plan.  That is [[control_architecture]] §5 row 3's "fall back, *then* stop
+and report", and the section
+*[The escalation, and the stop that follows the fall
+back](#the-escalation-and-the-stop-that-follows-the-fall-back)*
+is where the four conditions are written down.  It releases to `MODE_IDLE`, it
+goes through the same `arbitrate_mode()` an operator's request goes through, and
+it is still not §5.2's stop: the machine reaches zero because the *receiver's*
+`horizon_expiry_ramp` took it there before the claim moved, not because anything
+in this package commanded it.
+
+`MODE_IDLE` is the closest the two come, and the report on that switch says
+outright that releasing the arm claim is not a way to bring the machine to rest:
+nothing is zeroed at the driver boundary, and §7.2 measured that a manual
+controller which deactivates leaves its last velocity latched on the interface it
+just released.
 
 The guard was **updated rather than relaxed** each time this package grew a
 reach, and each time what replaced a blanket ban was narrower.
@@ -146,10 +165,10 @@ inferred abort §5.0 describes.
 words an operator can act on.  Every report carries a cause (PRD user story 53) —
 a status with `fault != FAULT_NONE` and an empty `message` is a test failure.
 
-Eight of the ten constants are reported here, and two of the eight are not this
+Nine of the ten constants are reported here, and three of the nine are not this
 package's verdicts at all — `FAULT_REFERENCE_STALE` and `FAULT_NOT_COMMISSIONED`
-are the inner velocity loop's, merged as it numbered them.  They are resolved in
-this order:
+are the inner velocity loop's and `FAULT_SOLVER` is the horizon producer's, each
+merged as its producer numbered it.  They are resolved in this order:
 
 | Report | When |
 |---|---|
@@ -157,12 +176,13 @@ this order:
 | `FAULT_STATE_HEALTH` | nothing has arrived on `/crane/pendulum_state` yet, or the stream stopped, or its stamp is further in this node's future than the margin, or `pendulum_state_broadcaster` marked the sample unusable |
 | `FAULT_STATE_HEALTH` | the trajectory controller's own state has never arrived on `/crane/controller_state`, or it stopped, or its stamp is too far ahead — a controller that stopped publishing is not a crane that is tracking perfectly |
 | `FAULT_STATE_HEALTH` | the inner velocity loop's own health has never arrived on `/crane/velocity_controller/health`, or it stopped, or its stamp is too far ahead — an uncommissioned axis reported to nobody is the state that stream exists to end |
+| `FAULT_SOLVER` | `MODE_MPC` is the live mode and the horizon producer's newest report — inside `horizon_timeout` — carries a fault, carried through unedited |
 | `FAULT_STATE_HEALTH`, `FAULT_REFERENCE_STALE` | the inner velocity loop raised one of its own **health** codes, carried through unedited |
 | `FAULT_SWAY` | a passive joint **rate** is past its own configured bound, and the report names which of the two coordinates crossed it |
 | `FAULT_TRACKING` | an actuated axis is outside **its own** velocity-tracking tolerance |
 | `FAULT_NOT_COMMISSIONED` | the inner velocity loop raised the **commissioning** code — an axis has no identified valve map and ran PI only |
 | `FAULT_INTERLOCK` | the remote is arriving, the stop is clear, and the configured deadman button is not held |
-| `FAULT_NONE` | all four streams are arriving inside their margins, the broadcaster reports the sample usable, neither passive rate is past its sway bound, the inner loop reports nothing wrong with itself, no axis is outside its tolerance, nothing is latched and the deadman is held |
+| `FAULT_NONE` | all four streams are arriving inside their margins, the broadcaster reports the sample usable, the horizon producer is not faulting where it drives, neither passive rate is past its sway bound, the inner loop reports nothing wrong with itself, no axis is outside its tolerance, nothing is latched and the deadman is held |
 
 **The order is not arbitrary.**  The stop is first because it is the only one of
 them with no field of its own: a cycle that reported something else instead
@@ -170,7 +190,11 @@ would not report it at all.  The passive state comes before tracking because a
 supervisor whose own view of the crane is stale should say that before it says
 anything derived.  The controller state's freshness is judged immediately before
 the comparison that consumes it, since an error that is not arriving cannot be
-compared to anything.  Sway sits below every health cause — a degraded estimate
+compared to anything.  The solver sits below all of those and *above* the inner
+loop's own codes, because when the optimizer stops the receiver runs out of plan
+and raises `FAULT_REFERENCE_STALE` — the consequence of this cause, one layer
+down — and §5.0 is explicit that the task layer is owed the typed cause rather
+than a symptom it has to infer.  Sway sits below every health cause — a degraded estimate
 cannot reach it at all, by construction — and above tracking, because of the two
 it is the one with no field of its own: `tracking_error` is filled on every
 report whatever `fault` says, so a tracking excess stays visible in a cycle sway
@@ -191,8 +215,10 @@ reading a panel: a supervisor started before `gpio_controller` sits in
 asserted means in practice.
 
 `FAULT_NONE` from this supervisor means *nothing it watches is wrong*, not *the
-machine is safe*, and the `message` on a clear report says so.  Working cell and
-solver are later issues.  `mode` is the section below.
+machine is safe*, and the `message` on a clear report says so.  The working cell
+is the one constant of the ten that stays unreachable — it needs the virtual
+envelope of §5.1, which nothing in this stack computes.  `mode` is the section
+below.
 
 ## The mode, and the one authority this supervisor has
 
@@ -304,11 +330,15 @@ refusing costs one more request.
 
 That stream is deliberately **not** an `Input`.  An optimizer that is quiet while
 the machine is in `MODE_FOLLOW` is the ordinary state of this stack rather than a
-defect, and ROS 2 Interfaces §4 records that the supervisor merging
-`FAULT_SOLVER` onto `/crane/supervisor/status` is a slice of its own.  §5.3's
-rule is met the way `ControllerManagerReport` meets it — its own configured
-margin, refused by `validate()` when it is missing, and a defined, narrow
-consequence stated where it matters: no freshness, no switch.
+defect, so its *absence* raises nothing.  §5.3's rule is met the way
+`ControllerManagerReport` meets it — its own configured margin, refused by
+`validate()` when it is missing, and a defined, narrow consequence stated where
+it matters: no freshness, no switch.
+
+Its `fault` is merged onto `/crane/supervisor/status` all the same, and the two
+are different questions — see *[The optimizer's verdict, and the one mode this
+supervisor leaves on its own](#the-optimizers-verdict-and-the-one-mode-this-supervisor-leaves-on-its-own)*
+below.
 
 **The producer's own mode, and the order is not symmetric.**  ROS 2 Interfaces
 §4's "One command path" ends by saying that which of the two producers is live is
@@ -397,6 +427,25 @@ observe is which calls this node makes and in what order.  One of its tests take
 the manager off the graph entirely, which is what turns "freshness is checked
 first" into an observation: a supervisor that consulted the manager first would
 have exactly one thing to say, and the refusal that comes back names the horizon.
+
+The same spy is what makes the escalation's *timing* assertable.  "The claim was
+not released yet" is a switch that must **not** have happened, which no outcome
+can show, so `TheRepeatedFailureEscalationTakesTheModeOutOfMpc` drives the
+escalation with the receiver still executing, asserts the call count did not
+move, then reports the reference stale and asserts it moved by exactly one.  That
+last "exactly one" is also how the once-per-episode rule is checked: it keeps
+publishing the escalation for another half second and asserts the count is still
+one.
+
+**And the two streams, not only the two responses.**  A `/crane/set_mode`
+response says what one caller was told; `/crane/supervisor/status` is what the
+task layer branches on.  `TheStatusStreamCarriesModeMpcAndTheProducersOwnCode`
+drives all four inputs healthy — which the older tests in that file do not need
+to, and which `FAULT_SOLVER` does need, since it sits below every cause that
+removes part of this supervisor's own view — and reads the mode and the fault off
+**one** report, because a stream that showed `MODE_MPC` on one cycle and
+`FAULT_SOLVER` on another would satisfy two separate waits without either having
+been true at once.
 
 **One cost is known and is not fixed here.**  `/crane/set_mode` and the status
 timer share this node's default callback group, so while a switch is in flight
@@ -506,9 +555,12 @@ button is pressed again: an interlock is a fact about the operator, not a latch.
 | `false` | nothing is latched | an acknowledgement of nothing is reported as a no-op rather than as a clear, so `success == true` always means *a latch existed and is now down* |
 | `true` | a latch existed and the condition behind it is gone | and if the stop recurs the latch is raised again on the next cycle, which is the specified behaviour and not a failed clear |
 
-**Nothing here acts on its own.**  No stop, no ramp, no command — on the
+**Nothing on this path acts on its own.**  No stop, no ramp, no command — on the
 emergency stop least of all, since §6.1 makes the software's relationship to the
-stop chain supplementary and one-directional.  What the latch *does* reach is the
+stop chain supplementary and one-directional.  (The one thing in this package
+that does act unasked is the escalation hand-back, and it is on a different
+signal entirely: the horizon producer's, not the stop chain's.)  What the latch
+*does* reach is the
 arbitration: a latched fault refuses a switch into a motion mode, with the
 latched cause as the reason, and `MODE_IDLE` stays reachable.  That is a refusal
 of something asked for, not an action taken; the latch still lowers only through
@@ -741,6 +793,88 @@ Staleness of this stream is judged by the same policy as every other input's:
 "no message yet" must not read as a healthy, commissioned inner loop, so a
 report that never arrived, one that stopped and one whose stamp cannot be placed
 in time are all `FAULT_STATE_HEALTH` with their own account of which they are.
+
+## The optimizer's verdict, and the one mode this supervisor leaves on its own
+
+`/crane/mpc/solver_health` carries a `SupervisorStatus` code for the same reason
+`/crane/velocity_controller/health` does, and it is merged the same way: the
+value on `/crane/supervisor/status` is the value `crane_mpc` put on its own
+stream, unrenumbered and un-restated, with the producer's account of the cycle
+carried into `message` (ROS 2 Interfaces §4).  `FAULT_SOLVER` is the one code that
+producer raises.
+
+**The merge is scoped by the mode, not by the stream.**  In `MODE_FOLLOW`
+`crane_mpc` is shadowing: it solves, it publishes its verdict, and it drives
+nothing, so a failed shadow solve is not a fault of the machine — and reporting
+it would put a standing fault on the operator's stream on every profile from the
+day the producer was composed.  In `MODE_MPC` the same report is the command path
+having stopped producing.  That is why this stream is not an `Input` (an `Input`
+is a stream whose *silence* raises a fault, and this one's must not) while its
+*code* travels all the same.  Two more conditions: the report has to be inside
+`horizon_timeout`, because a code nobody has heard since is not an observation;
+and a producer that goes silent altogether raises no solver fault at all — what
+an operator gets then is the receiver running out of plan, which is the only
+thing either node can still see.
+
+It sits **above** the inner loop's codes in the order of *[What one report
+says](#what-one-report-says)* and below everything that removes part of this
+supervisor's own view.  Above the inner loop because when the optimizer stops,
+the receiver runs out of plan and raises `FAULT_REFERENCE_STALE` — the
+consequence, one layer down, of this cause — and §5.0 is explicit that what the
+task layer is owed is the typed cause rather than a symptom it has to infer.  The
+cost is that the inner loop's own `FAULT_STATE_HEALTH` is outranked while the
+optimizer is failing in `MODE_MPC`; it is a real cost and it is the smaller of
+the two.
+
+### The escalation, and the stop that follows the fall back
+
+[[mpc]] §6 ends with "on repeated failure, stop and hand control back to the
+supervisor", and [[control_architecture]] §5 row 3 is the only duty in that table
+whose action has two halves: *fall back*, and **then** *stop and report*.  The
+fall back is not this package's.  `crane_mpc` shifts its previous solution while
+it still believes it; past `max_consecutive_failures` it stops publishing
+altogether and says so; `crane_velocity_controller` then runs out of plan and
+takes the velocity command to zero over its own `horizon_expiry_ramp`.  Three
+mechanisms, none of them here.
+
+The stop is this package's, and it is §5.2 step 1: deactivate the claim.  Four
+conditions, and `solver_handback()` is where they are written down:
+
+| | What it reads | Why |
+|---|---|---|
+| the mode | `active_mode()` is `MODE_MPC` | in `MODE_FOLLOW` the escalation stops a horizon nobody is executing |
+| freshness | the report is inside `horizon_timeout` | a verdict nobody has heard since is not an observation |
+| the escalation | `FAULT_SOLVER` **and** `applied_previous_solution == false` | the producer saying nothing went out, rather than that a shifted plan did |
+| the fall back | the inner loop is reporting `FAULT_REFERENCE_STALE` | the receiver saying it has run out of plan, so the ramp has engaged |
+
+The last one is the whole reason this is a predicate and not a branch in
+`resolve()`.  Releasing the claim on the escalation *itself* would take the
+command interface off a receiver that still had a second of good plan in hand and
+put on it exactly the commanded step §5.2 step 3 and [[mpc]] §6 both refuse.  What
+it cannot wait for is the ramp *finishing*: neither `VelocityControllerHealth` nor
+`SolverHealth` carries a field for that, and adding one is a `crane_msgs` field
+add, which PRD §15 makes a slice of its own.  So the release lands inside the ramp
+rather than after it, and the residual step is bounded by `horizon_expiry_ramp` —
+0.2 s of a command already on its way down — instead of by the speed the crane
+happened to be moving at.  That bound is stated rather than measured, and it is
+the one loose end in this path.
+
+**It releases to `MODE_IDLE`, never to `MODE_FOLLOW`.**  §5's `[!important]` box
+is the reason: the supervisor stops, it does not decide what happens next.
+Resuming a motion is the task layer's decision, and PRD §10 step 4 needs a
+reference that starts at the current MPC setpoint, which no supervisor can
+produce.  The release goes through `arbitrate_mode()` exactly as an operator's
+`MODE_IDLE` request does — same preconditions, same single strict switch call,
+same exclusion of a controller the incoming mode also wants — and the producer
+goes back to `shadow` **after** the claim has moved, because it is the same
+handover run by a different caller.
+
+It is attempted **once** per episode.  The calls block this node's status timer
+for as long as a mode switch does, and a release the controller manager refused
+will be refused again next cycle; retrying it every 50 ms would take the 20 Hz
+stream down with it.  A failure is logged at `ERROR` with the manager's own
+account, and `FAULT_SOLVER` goes on standing on the stream — which is the signal
+the task layer branches on.
 
 ## What is not computed
 

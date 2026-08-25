@@ -281,6 +281,56 @@ constexpr char kHorizonNoAccount[] =
 constexpr char kHorizonProducerFault[] =
   " It is also raising FAULT_SOLVER on that stream, which is the one code it raises.";
 
+// ------------------------------------------------------------------------
+// FAULT_SOLVER on the status stream, and the hand-back it can end in
+// (wiki/control_architecture.md 5 row 3, wiki/mpc.md 6,
+// wiki/implementation/ros2_interfaces.md 4).
+// ------------------------------------------------------------------------
+
+constexpr char kSolverFaultHead[] =
+  "solver: the horizon producer is the live command path and it is reporting a fault on "
+  "/crane/mpc/solver_health. The code is merged as crane_mpc numbered it, not translated, exactly "
+  "as the inner loop's is (wiki/implementation/ros2_interfaces.md 4). Its newest solve says ";
+
+constexpr char kSolverFaultShifted[] =
+  ", and what went out on the horizon was the previous solution shifted by one step rather than "
+  "this solve (wiki/mpc.md 6, requirement 3). One such cycle is the defined fallback and not a "
+  "reason to leave the mode; what is not a plan any more is a run of them, which crane_mpc counts "
+  "and escalates on.";
+
+constexpr char kSolverFaultNothingPublished[] =
+  ", and **nothing went out on the horizon at all** -- either wiki/mpc.md 6's repeated-failure "
+  "escalation has stopped the publisher, or there was no previous solution to shift. Either way "
+  "the receiver is executing the last plan it was given and will run out of it, at which point "
+  "crane_velocity_controller ramps the velocity command to zero over its own horizon_expiry_ramp "
+  "and reports FAULT_REFERENCE_STALE. That ramp is the fallback of wiki/control_architecture.md 5 "
+  "row 3; this supervisor's stop follows it rather than replacing it.";
+
+constexpr char kSolverFaultAccount[] =
+  " The producer's own account of the cycle, carried rather than restated: ";
+
+constexpr char kSolverFaultNoAccount[] =
+  " The producer set no message on that report, which is itself worth chasing: "
+  "crane_msgs/SolverHealth carries one for exactly this.";
+
+constexpr char kHandbackHead[] =
+  "the horizon producer has handed control back and the receiver has run out of plan: ";
+
+constexpr char kHandbackMid[] =
+  " Nothing is arriving on /crane/mpc/horizon and crane_velocity_controller is reporting "
+  "FAULT_REFERENCE_STALE, so MODE_MPC is a mode with no command path behind it. "
+  "wiki/control_architecture.md 5 row 3 ends in \"fall back, then stop and report\": the fall back "
+  "is the receiver's expiry ramp and it has already engaged, and the stop is this supervisor's -- "
+  "5.2 step 1, deactivate the claim. The claim is released to MODE_IDLE and the producer is put "
+  "back into shadow.";
+
+constexpr char kHandbackNotFollow[] =
+  " It is released to MODE_IDLE and **not** to MODE_FOLLOW, deliberately: choosing to resume a "
+  "motion is the task layer's decision and not this one's "
+  "(wiki/control_architecture.md 5), and PRD 10 step 4 needs a reference that starts at the "
+  "current MPC setpoint, which only the planner can produce. What is owed here is the typed cause, "
+  "which is on this stream.";
+
 constexpr char kModeRefusedNoView[] =
   "refused: this supervisor cannot see the controller manager, so it does not know which "
   "controller holds the claim and will not switch blind. A precondition cannot be checked against "
@@ -959,7 +1009,8 @@ namespace
  */
 SupervisorDecision resolve(
   const SupervisorConfig & config, const SupervisorInput & input,
-  const std::array<Staleness, kInputCount> & staleness, const SwayVerdict & sway)
+  const std::array<Staleness, kInputCount> & staleness, const SwayVerdict & sway,
+  const ActiveMode & active)
 {
   SupervisorDecision decision;
   // `mode` is filled by `decide()` from the controller manager's own answer,
@@ -1046,6 +1097,49 @@ SupervisorDecision resolve(
         staleness_message(config, stream_input, cause, input.stream(stream_input), {});
       return decision;
     }
+  }
+
+  // The horizon producer's own code, merged as `crane_mpc` numbered it, exactly
+  // as the inner loop's is below (wiki/implementation/ros2_interfaces.md §4).
+  // `FAULT_SOLVER` is the one code that producer raises.
+  //
+  // **Scoped to the mode and not to the stream.** In `MODE_FOLLOW` this producer
+  // is shadowing: it solves, it publishes its verdict, and it drives nothing, so
+  // a failed shadow solve is not a fault of the machine and would stand on the
+  // operator's stream on every profile from the moment `crane_mpc` was composed.
+  // In `MODE_MPC` the same failure is the command path having stopped producing.
+  // That is why `HorizonReport` is not an `Input` and its code is merged all the
+  // same: absence and content are different questions.
+  //
+  // **Above the inner loop's codes, and that is the whole point of the branch.**
+  // When the producer stops, the receiver runs out of plan and raises
+  // `FAULT_REFERENCE_STALE` -- the consequence, one layer down, of this cause.
+  // §5.0 is explicit that what the task layer is owed is the typed cause rather
+  // than a symptom it has to infer, and reporting the receiver's verdict while
+  // the producer's went unread would be exactly the inferred signal the
+  // supervisor exists to replace. The cost is that the inner loop's own
+  // `FAULT_STATE_HEALTH` is outranked for as long as the optimizer is failing in
+  // `MODE_MPC`; it is a real cost, it is bounded by the escalation clearing the
+  // moment a solve converges again, and it is the smaller of the two losses.
+  //
+  // Judged on a **fresh** report, against the producer's own margin and by the
+  // same `freshness_of()` every stream here is judged by. A code off a report
+  // nobody has heard since is a fault this supervisor cannot still observe, and
+  // reporting it would be the latch §5.3 spends its whole table avoiding. A
+  // producer that goes silent altogether in `MODE_MPC` is therefore *not*
+  // reported as a solver fault: what the operator gets is the receiver running
+  // out of plan, which is the only thing either node can actually still see.
+  const HorizonReport & horizon = input.horizon;
+  const bool horizon_fresh =
+    freshness_of(config.horizon_deadline, horizon.health) == Staleness::Fresh;
+  if (active.known && active.mode == Mode::Mpc && horizon_fresh && horizon.fault != Fault::None) {
+    decision.fault = horizon.fault;
+    decision.message = std::string(kSolverFaultHead) + solve_outcome_name(horizon.outcome) +
+      (horizon.applied_previous_solution ? kSolverFaultShifted : kSolverFaultNothingPublished);
+    decision.message += horizon.status.empty()
+      ? std::string(kSolverFaultNoAccount)
+      : kSolverFaultAccount + horizon.status;
+    return decision;
   }
 
   // The inner loop's *health* codes, merged as the loop numbered them. Above
@@ -1164,9 +1258,15 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
   // admits it does not know, and a remembered mode is exactly that drift: a
   // controller that died, was never spawned, or was switched by something else
   // would leave the last remembered mode standing on the wire for ever.
+  //
+  // Read **before** the precedence chain and handed to it, because one branch
+  // depends on it: the horizon producer's fault is the command path's only while
+  // the MPC is the command path, and in `MODE_FOLLOW` the same report describes a
+  // shadow solve that drove nothing. It is still assigned once, below, so no
+  // branch can set the field.
   const ActiveMode active = active_mode(config, input.controller_manager);
 
-  SupervisorDecision decision = resolve(config, input, staleness, sway);
+  SupervisorDecision decision = resolve(config, input, staleness, sway, active);
   decision.mode = active.mode;
   decision.sway = sway.state;
   // Both clauses are on every report, whatever `fault` says, and both are
@@ -1464,6 +1564,67 @@ std::string mpc_horizon_refusal(
       : kHorizonCarried + horizon.status;
   }
   return text;
+}
+
+SolverHandback solver_handback(
+  const SupervisorConfig & config, const SupervisorInput & input, const ActiveMode & active)
+{
+  SolverHandback handback;
+
+  // 1. The MPC has to be the live command path. In `MODE_FOLLOW` this producer
+  //    is shadowing and an escalation there costs nothing: it stops publishing a
+  //    horizon nobody is executing.
+  if (!active.known || active.partial || active.mode != Mode::Mpc) {
+    return handback;
+  }
+
+  // 2. Judged on a fresh report and on the producer's own margin, for the reason
+  //    `resolve()` is: a verdict nobody has heard since is not an observation.
+  const HorizonReport & horizon = input.horizon;
+  if (freshness_of(config.horizon_deadline, horizon.health) != Staleness::Fresh) {
+    return handback;
+  }
+
+  // 3. The escalation's observable. `crane_msgs/SolverHealth` has no field of
+  //    its own for wiki/mpc.md §6's repeated-failure escalation -- crane_mpc's
+  //    README says outright that a supervisor's action on it is the same as on a
+  //    standing `FAULT_SOLVER` with no horizon arriving, and that adding a field
+  //    would be a `crane_msgs` change, which PRD §15 makes a slice of its own.
+  //    So it is read off the two fields that do carry it: the code, and
+  //    `applied_previous_solution == false`, which is the producer saying that
+  //    **nothing went out** rather than that a shifted plan did.
+  if (horizon.fault != Fault::Solver || horizon.applied_previous_solution) {
+    return handback;
+  }
+
+  // 4. And the receiver has run out of plan. This is the ordering of
+  //    wiki/control_architecture.md §5 row 3 -- "fall back, *then* stop and
+  //    report" -- as a condition rather than as a comment. The fall back is
+  //    `crane_velocity_controller`'s `horizon_expiry_ramp`, which takes the
+  //    velocity command to zero over its own configured time and raises
+  //    `FAULT_REFERENCE_STALE` while it does; the stop is this supervisor's, and
+  //    a stop issued the instant the escalation is first seen would cut a plan
+  //    the receiver still had and put on the command interface exactly the step
+  //    §5.2 step 3 and wiki/mpc.md §6 both refuse.
+  //
+  //    What it cannot wait for is the ramp *finishing*: neither
+  //    `VelocityControllerHealth` nor `SolverHealth` carries a field for it, and
+  //    inventing one is a field add. So the release lands inside the ramp rather
+  //    than after it, and what bounds the residual step is `horizon_expiry_ramp`
+  //    -- 0.2 s of a command already on its way down -- instead of the speed the
+  //    crane happened to be moving at.
+  if (
+    freshness_of(config.deadline(Input::ControllerHealth), input.stream(Input::ControllerHealth)) !=
+    Staleness::Fresh || input.controller_health.fault != Fault::ReferenceStale)
+  {
+    return handback;
+  }
+
+  handback.required = true;
+  handback.message = std::string(kHandbackHead) +
+    (horizon.status.empty() ? std::string("the producer set no message on that report") :
+    horizon.status) + "." + kHandbackMid + kHandbackNotFollow;
+  return handback;
 }
 
 ModeArbitration arbitrate_mode(

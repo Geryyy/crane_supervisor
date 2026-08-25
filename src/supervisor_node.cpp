@@ -827,6 +827,81 @@ void SupervisorNode::update()
       RCLCPP_WARN(get_logger(), "%s", decision.message.c_str());
     }
   }
+
+  // wiki/control_architecture.md §5 row 3's second half, and the last thing this
+  // cycle does. Both streams have already gone out carrying FAULT_SOLVER and the
+  // account of why, so the report an operator reads arrives *before* the claim
+  // moves rather than after it; the calls below block this timer for as long as
+  // a `/crane/set_mode` request does, and the mode reads MODE_IDLE on the next
+  // cycle.
+  //
+  // The active mode is re-derived from the same held snapshot `decide()` used --
+  // no service call, no second view -- so the predicate and the report cannot
+  // disagree about which mode the machine was in when the escalation was seen.
+  const SolverHandback handback =
+    solver_handback(config_, observed, active_mode(config_, observe_controller_manager()));
+  if (!handback.required) {
+    handback_attempted_ = false;
+    return;
+  }
+  if (handback_attempted_) {
+    return;
+  }
+  handback_attempted_ = true;
+  hand_back_from_mpc(handback);
+}
+
+std::string SupervisorNode::hand_back_from_mpc(const SolverHandback & handback)
+{
+  // Truth about the machine, taken now, exactly as `set_mode()` takes it before
+  // it arbitrates. The held snapshot was good enough to decide *that* the claim
+  // must be released; it is not good enough to plan the release from, because a
+  // plan is built against controller states and those may have moved since the
+  // last poll.
+  refresh_controller_manager(kControllerManagerCallBudget);
+
+  // Through `arbitrate_mode()` and not around it. Every precondition an
+  // operator's MODE_IDLE request passes is one this release passes too -- that
+  // the view is known, that the controllers are loaded and switchable, that the
+  // plan never names a controller the incoming mode also wants -- so there is
+  // one set of rules for the claim and not a second, quieter one for the
+  // supervisor's own stop. The latch does not refuse this direction: releasing
+  // the claim is the one thing a latched stop does not argue against.
+  const ModeArbitration arbitration =
+    arbitrate_mode(config_, static_cast<std::uint8_t>(Mode::Idle), observe());
+  if (!arbitration.accepted || !arbitration.switch_required) {
+    const std::string account = handback.message + " " + arbitration.message;
+    RCLCPP_ERROR(get_logger(), "%s", account.c_str());
+    return account;
+  }
+
+  std::string carried;
+  const bool switched = switch_controllers(arbitration.activate, arbitration.deactivate, carried);
+
+  // Read back, never assumed, for the reason `set_mode()` reads it back: a
+  // switch the manager accepted can still land somewhere else, and the producer
+  // is settled from where the claim actually is.
+  refresh_controller_manager(kControllerManagerCallBudget);
+  const ActiveMode reached = active_mode(config_, observe_controller_manager());
+
+  // Out of MODE_MPC the producer goes back to shadow **after** the claim has
+  // moved (PRD §10). The condition is the same one `set_mode()` uses and for the
+  // same reason: it is settled off the mode that was read back, so a release the
+  // manager refused leaves the producer where the claim still is.
+  ProducerSwitch producer;
+  const bool mpc_holds_the_claim = reached.known && !reached.partial && reached.mode == Mode::Mpc;
+  if (!mpc_holds_the_claim) {
+    producer = set_horizon_producer_mode(false);
+  }
+
+  const std::string account = handback.message + " " +
+    mode_switch_message(config_, Mode::Idle, arbitration, switched, carried, reached, producer);
+  if (switched && !mpc_holds_the_claim) {
+    RCLCPP_WARN(get_logger(), "%s", account.c_str());
+  } else {
+    RCLCPP_ERROR(get_logger(), "%s", account.c_str());
+  }
+  return account;
 }
 
 }  // namespace crane_supervisor

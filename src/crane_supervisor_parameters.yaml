@@ -154,11 +154,13 @@ crane_supervisor:
       Like the controller manager's answer this is deliberately not an Input of
       the registry above, and for a stronger reason than the shape of the
       failure: an optimizer that is quiet while the machine is in MODE_FOLLOW is
-      the ordinary state of this stack rather than a defect, and
-      wiki/implementation/ros2_interfaces.md 4 records that the supervisor
-      merging FAULT_SOLVER onto /crane/supervisor/status is a slice of its own.
-      5.3's rule is met the way ControllerManagerReport meets it -- a defined,
-      narrow consequence stated where it matters. Derived like the margins
+      the ordinary state of this stack rather than a defect, so its absence
+      raises nothing. 5.3's rule is met the way ControllerManagerReport meets it
+      -- a defined, narrow consequence stated where it matters. Its fault code
+      is merged onto /crane/supervisor/status all the same, unrenumbered, the way
+      the inner loop's is (wiki/implementation/ros2_interfaces.md 4), and this
+      margin is what that merge is judged against as well: only a report inside
+      it can carry a fault this supervisor can still observe. Derived like the margins
       above: /crane/mpc/solver_health is a 12.5 Hz contract -- one rate down off
       the 25 Hz solve, decimated to the supervisor's own 20 Hz consumers -- so a
       healthy report is up to 80 ms of publication period plus 50 ms of status

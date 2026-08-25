@@ -426,6 +426,34 @@ private:
    */
   ProducerSwitch set_horizon_producer_mode(bool active);
 
+  /// The stop half of wiki/control_architecture.md §5 row 3, once it is owed.
+  /**
+   * Runs on the status cycle when `solver_handback()` says so, and does what a
+   * `/crane/set_mode(MODE_IDLE)` request would do: read the machine, build the
+   * plan through `arbitrate_mode()` so that every precondition and every
+   * exclusion is the same one an operator's request goes through, issue the one
+   * strict `switch_controller` call, read the mode back, and put the producer
+   * into `shadow` **after** the claim has moved -- PRD §10's order out of
+   * `MODE_MPC`, unchanged because it is the same handover.
+   *
+   * It runs at the **end** of the cycle, after both streams have gone out. The
+   * calls it makes block this node's status timer for as long as a mode switch
+   * does, and the report an operator is owed is the one that says why -- so the
+   * cycle that discovers the escalation publishes `FAULT_SOLVER` and its account
+   * first, and the mode reads `MODE_IDLE` on the next one.
+   *
+   * It is attempted **once** per episode, not retried every 50 ms: a switch the
+   * controller manager refused will be refused again next cycle, and retrying it
+   * in a loop would take the 20 Hz stream down with it. A failure is logged at
+   * `ERROR` with the manager's own account, and `FAULT_SOLVER` goes on standing
+   * on the stream, which is the signal the task layer branches on (§5.0).
+   * `handback_attempted_` is cleared on the first cycle `solver_handback()` no
+   * longer asks for one, so a later episode gets its own attempt.
+   *
+   * Returns the account, or an empty string when nothing was attempted.
+   */
+  std::string hand_back_from_mpc(const SolverHandback & handback);
+
   SupervisorConfig config_;
   /// Which inputs a subscription was created for, indexed by `Input`. Checked
   /// once, at construction: an enumerator with no subscription behind it is an
@@ -451,12 +479,19 @@ private:
   /// to end.
   crane_msgs::msg::VelocityControllerHealth::ConstSharedPtr controller_health_;
   /// The newest message on `/crane/mpc/solver_health`, or null before the first
-  /// one. Held for the reason the four above are, and read in exactly one
-  /// place: PRD §10 step 2's precondition on a switch into `MODE_MPC`. It is
-  /// **not** an `Input` and raises no fault of its own -- an optimizer that is
-  /// quiet while the machine is in `MODE_FOLLOW` is the ordinary state of this
-  /// stack, and ROS 2 Interfaces §4 makes merging `FAULT_SOLVER` onto the status
-  /// stream a slice of its own.
+  /// one. Held for the reason the four above are, and read in three places: PRD
+  /// §10 step 2's precondition on a switch into `MODE_MPC`, the `FAULT_SOLVER`
+  /// merge on the status stream, and `solver_handback()`.
+  /**
+   * It is **not** an `Input`, and that is about its *absence* rather than its
+   * content: an `Input` is a stream whose silence raises a fault, and an
+   * optimizer that is quiet while the machine is in `MODE_FOLLOW` is the
+   * ordinary state of this stack rather than a defect. Its `fault` field is
+   * merged all the same, unrenumbered, exactly as `VelocityControllerHealth`'s
+   * is (ROS 2 Interfaces §4) -- what scopes the merge is the mode, not the
+   * stream: `resolve()` reports the code only while `MODE_MPC` is the live
+   * command path.
+   */
   crane_msgs::msg::SolverHealth::ConstSharedPtr solver_health_;
   /// The emergency-stop latch, carried from one decision into the next. Raised
   /// by `decide()`, lowered only by an acknowledged `/crane/clear_fault`.
@@ -474,6 +509,10 @@ private:
   /// instead of the same line twenty times a second.
   Fault reported_fault_{Fault::None};
   bool ever_reported_{false};
+  /// Whether the hand-back of this episode has already been attempted. Cleared
+  /// on the first cycle `solver_handback()` no longer asks for one, so a second
+  /// escalation gets a second attempt and a standing one gets exactly one.
+  bool handback_attempted_{false};
 
   rclcpp::Subscription<crane_msgs::msg::PendulumState>::SharedPtr pendulum_state_subscription_;
   rclcpp::Subscription<epsilon_crane_msgs::msg::RemoteCtrlStates>::SharedPtr

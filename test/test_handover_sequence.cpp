@@ -22,6 +22,15 @@
 //     *before* the claim moves into `MODE_MPC` and back to shadow *after* it has
 //     moved out -- and that a producer which refuses is reported rather than
 //     assumed.
+//   * that `MODE_MPC` and `FAULT_SOLVER` reach **the status stream** and not only
+//     a `/crane/set_mode` response. A response says what one caller was told;
+//     `/crane/supervisor/status` is what the task layer branches on and what an
+//     operator panel renders, and until issue 055 the mode on it had never been
+//     `MODE_MPC` on any profile.
+//   * that wiki/mpc.md §6's repeated-failure escalation takes the mode out of
+//     `MODE_MPC`, and that it does so *after* the receiver has run out of plan
+//     rather than the instant the escalation is seen. Both halves need a spy: the
+//     switch that must not happen yet is not observable from an outcome.
 //
 // So the controller manager here is a **spy**: it serves the two service names
 // ROS 2 Interfaces §5 puts behind the supervisor, answers `list_controllers`
@@ -60,10 +69,13 @@
 #include <thread>
 #include <vector>
 
+#include "control_msgs/msg/joint_trajectory_controller_state.hpp"
 #include "controller_manager_msgs/srv/list_controllers.hpp"
 #include "controller_manager_msgs/srv/switch_controller.hpp"
+#include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/msg/solver_health.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
+#include "crane_msgs/msg/velocity_controller_health.hpp"
 #include "crane_msgs/srv/set_mode.hpp"
 #include "crane_supervisor/supervisor_node.hpp"
 #include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
@@ -264,7 +276,14 @@ public:
   }
 
   /// One `SolverHealth`, stamped now, as a producer that solved would publish it.
-  void publish_health(std::uint8_t outcome)
+  /**
+   * `applied_previous_solution` is the field that separates wiki/mpc.md §6's two
+   * non-convergent outcomes, and it defaults to the ordinary one: a solve that
+   * did not converge and whose previous solution went out shifted by one step.
+   * `false` beside `FAULT_SOLVER` is the repeated-failure escalation -- nothing
+   * was published at all -- which is the state the supervisor hands back from.
+   */
+  void publish_health(std::uint8_t outcome, bool applied_previous_solution = true)
   {
     SolverHealth message;
     message.header.stamp = now();
@@ -274,6 +293,8 @@ public:
       : SupervisorStatus::FAULT_SOLVER;
     message.solve_time = 0.012;
     message.solve_budget = 0.03;
+    message.applied_previous_solution =
+      outcome != SolverHealth::SOLVE_CONVERGED && applied_previous_solution;
     message.message = "the stub reports one solve";
     health_->publish(message);
   }
@@ -343,6 +364,13 @@ protected:
       });
     remote_ctrl_ = observer_->create_publisher<RemoteCtrlStates>(
       crane_supervisor::kRemoteCtrlStatesTopic, crane_supervisor::contract_qos());
+    pendulum_state_ = observer_->create_publisher<crane_msgs::msg::PendulumState>(
+      crane_supervisor::kPendulumStateTopic, crane_supervisor::contract_qos());
+    controller_state_ =
+      observer_->create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
+      crane_supervisor::kControllerStateTopic, rclcpp::SystemDefaultsQoS());
+    controller_health_ = observer_->create_publisher<crane_msgs::msg::VelocityControllerHealth>(
+      crane_supervisor::kControllerHealthTopic, crane_supervisor::contract_qos());
     set_mode_ = observer_->create_client<SetMode>(crane_supervisor::kSetModeService);
     clear_fault_ = observer_->create_client<Trigger>(crane_supervisor::kClearFaultService);
 
@@ -371,6 +399,9 @@ protected:
     clear_fault_.reset();
     status_.reset();
     remote_ctrl_.reset();
+    pendulum_state_.reset();
+    controller_state_.reset();
+    controller_health_.reset();
     observer_.reset();
     supervisor_.reset();
     producer_.reset();
@@ -412,20 +443,53 @@ protected:
       if (ready()) {
         return true;
       }
-      publish_remote();
+      publish_inputs();
       std::this_thread::sleep_for(kPollPeriod);
     }
     return ready();
   }
 
-  /// A remote with the stop released and the deadman held, stamped now.
-  void publish_remote()
+  /// All four of the supervisor's inputs, healthy and stamped now.
+  /**
+   * The three beside the remote are here because `FAULT_SOLVER` sits **below**
+   * every cause that removes part of this supervisor's own view of the crane.  A
+   * fixture that left the passive state and the two controller streams unpublished
+   * would report `FAULT_STATE_HEALTH` on every cycle, and a test asserting that
+   * the producer's code reaches the operator would be asserting it against a
+   * report that could never carry it.  `inner_loop_fault_` is what a test moves:
+   * it is the receiver's own verdict, and `FAULT_REFERENCE_STALE` on it is the
+   * receiver saying it has run out of plan.
+   */
+  void publish_inputs()
   {
+    const rclcpp::Time stamp = observer_->now();
+
     RemoteCtrlStates message;
-    message.header.stamp = observer_->now();
+    message.header.stamp = stamp;
     message.button12 = true;
     message.em_stop = false;
     remote_ctrl_->publish(message);
+
+    crane_msgs::msg::PendulumState pendulum;
+    pendulum.header.stamp = stamp;
+    pendulum.valid = true;
+    pendulum.status = "complementary filter on the two bracketing IMUs";
+    // A still crane. NaN would be the absence of a measurement, which leaves the
+    // settled predicate unknowable and is not what this fixture is about.
+    pendulum.velocity = {0.0, 0.0};
+    pendulum_state_->publish(pendulum);
+
+    control_msgs::msg::JointTrajectoryControllerState controller_state;
+    controller_state.header.stamp = stamp;
+    controller_state.joint_names = {kInnerLoop};
+    controller_state.error.positions = {0.0};
+    controller_state.error.velocities = {0.0};
+    controller_state_->publish(controller_state);
+
+    crane_msgs::msg::VelocityControllerHealth health;
+    health.header.stamp = stamp;
+    health.fault = inner_loop_fault_;
+    controller_health_->publish(health);
   }
 
   /// Bring the supervisor out of the stop every freshly started one may be in.
@@ -482,6 +546,25 @@ protected:
     return answered ? future.get() : nullptr;
   }
 
+  /// The newest status this observer has seen, or nothing before the first.
+  std::optional<SupervisorStatus> status()
+  {
+    const std::lock_guard<std::mutex> lock(status_mutex_);
+    return latest_;
+  }
+
+  /// Whether the supervisor's own stream is reporting `mode` **and** `fault`.
+  /**
+   * Both at once, because a report is one cycle's verdict: a stream that showed
+   * `MODE_MPC` on one cycle and `FAULT_SOLVER` on another would satisfy two
+   * separate waits without either ever having been true of the same report.
+   */
+  bool saw(std::uint8_t mode, std::uint8_t fault)
+  {
+    const std::lock_guard<std::mutex> lock(status_mutex_);
+    return latest_.has_value() && latest_->mode == mode && latest_->fault == fault;
+  }
+
   /// The mode the supervisor's own stream reports, re-derived from the spy.
   /**
    * The poll is asynchronous by design -- a 20 Hz contract with a service call
@@ -504,6 +587,13 @@ protected:
   rclcpp::Node::SharedPtr observer_;
   rclcpp::Subscription<SupervisorStatus>::SharedPtr status_;
   rclcpp::Publisher<RemoteCtrlStates>::SharedPtr remote_ctrl_;
+  rclcpp::Publisher<crane_msgs::msg::PendulumState>::SharedPtr pendulum_state_;
+  rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
+    controller_state_;
+  rclcpp::Publisher<crane_msgs::msg::VelocityControllerHealth>::SharedPtr controller_health_;
+  /// What the inner velocity loop is saying about itself. Written from the test
+  /// thread and read from `publish_inputs()` on it too, so no lock is owed.
+  std::uint8_t inner_loop_fault_{SupervisorStatus::FAULT_NONE};
   rclcpp::Client<SetMode>::SharedPtr set_mode_;
   rclcpp::Client<Trigger>::SharedPtr clear_fault_;
   mutable std::mutex status_mutex_;
@@ -711,6 +801,127 @@ TEST_F(HandoverSequence, AProducerThatRefusesTheModeIsReportedRatherThanAssumed)
     << to_mpc->message;
   EXPECT_EQ(producer_->mode(), "shadow");
   EXPECT_TRUE(producer_->changes().empty());
+}
+
+TEST_F(HandoverSequence, TheStatusStreamCarriesModeMpcAndTheProducersOwnCode)
+{
+  // The half a `/crane/set_mode` response cannot carry.  A response says what
+  // one caller was told; `/crane/supervisor/status` is what the task layer
+  // branches on and what an operator panel renders, and until this issue the
+  // mode on it had never been `MODE_MPC` on any profile.
+  clear_the_starting_latch();
+  manager_->set_state(kInnerLoop, "active");
+  manager_->set_state(kFollower, "active");
+  ASSERT_TRUE(wait_until([this]() {return saw_mode(SupervisorStatus::MODE_FOLLOW);}));
+
+  const auto to_mpc =
+    request_while_solving(SupervisorStatus::MODE_MPC, SolverHealth::SOLVE_CONVERGED);
+  ASSERT_NE(to_mpc, nullptr);
+  ASSERT_TRUE(to_mpc->success) << to_mpc->message;
+
+  // Live, and with nothing wrong: every one of the supervisor's four inputs is
+  // arriving inside its deadline and the optimizer is converging, so the mode is
+  // MODE_MPC and the fault is none.  The two are read off one report.
+  ASSERT_TRUE(
+    solve_until(
+      SolverHealth::SOLVE_CONVERGED, [this]() {
+        return saw(SupervisorStatus::MODE_MPC, SupervisorStatus::FAULT_NONE);
+      }))
+    << "the stream never carried MODE_MPC with a clear report";
+
+  // And the producer's own code reaches the same stream, merged as crane_mpc
+  // numbered it (ROS 2 Interfaces §4).  One solve that did not converge is
+  // wiki/mpc.md §6's defined fallback -- the previous solution shifted by one
+  // step went out -- so the mode does **not** leave: what is owed is the report.
+  ASSERT_TRUE(
+    solve_until(
+      SolverHealth::SOLVE_BUDGET_EXCEEDED, [this]() {
+        return saw(SupervisorStatus::MODE_MPC, SupervisorStatus::FAULT_SOLVER);
+      }))
+    << "FAULT_SOLVER never reached /crane/supervisor/status";
+  const auto reported = status();
+  ASSERT_TRUE(reported.has_value());
+  EXPECT_NE(reported->message.find("shifted by one step"), std::string::npos)
+    << reported->message;
+  EXPECT_NE(reported->message.find("the stub reports one solve"), std::string::npos)
+    << "the producer's own account was restated rather than carried: " << reported->message;
+  EXPECT_EQ(manager_->switch_calls(), 1) << "a shifted fallback moved the claim";
+  EXPECT_EQ(producer_->mode(), "active");
+}
+
+TEST_F(HandoverSequence, TheRepeatedFailureEscalationTakesTheModeOutOfMpc)
+{
+  // wiki/mpc.md §6's last line -- "on repeated failure, stop and hand control
+  // back to the supervisor" -- as the supervisor's own half of it.  crane_mpc
+  // stops publishing and says so on its health stream (issue 052); this is what
+  // the supervisor does about it.
+  clear_the_starting_latch();
+  manager_->set_state(kInnerLoop, "active");
+  manager_->set_state(kFollower, "active");
+  ASSERT_TRUE(wait_until([this]() {return saw_mode(SupervisorStatus::MODE_FOLLOW);}));
+
+  ASSERT_NE(
+    request_while_solving(SupervisorStatus::MODE_MPC, SolverHealth::SOLVE_CONVERGED), nullptr);
+  ASSERT_TRUE(wait_until([this]() {return saw_mode(SupervisorStatus::MODE_MPC);}));
+  ASSERT_EQ(producer_->mode(), "active");
+  const int switches_before = manager_->switch_calls();
+
+  // The escalation: FAULT_SOLVER with `applied_previous_solution` false, which is
+  // the producer saying **nothing went out** rather than that a shifted plan did.
+  // The receiver is still executing the last horizon it was given, so the claim
+  // must not move yet -- releasing it here would take the command interface off a
+  // controller that still has plan to run, which is the commanded step §5.2 step
+  // 3 refuses.
+  const auto escalate = [this]() {
+      producer_->publish_health(SolverHealth::SOLVE_FAILED, false);
+    };
+  ASSERT_TRUE(
+    wait_until([this, &escalate]() {
+      escalate();
+      return saw(SupervisorStatus::MODE_MPC, SupervisorStatus::FAULT_SOLVER);
+    }))
+    << "the escalation never reached the status stream";
+  EXPECT_EQ(manager_->switch_calls(), switches_before)
+    << "the claim was released while the receiver still had plan to run";
+  EXPECT_EQ(producer_->mode(), "active");
+
+  // Now the receiver says it has run out: `horizon_expiry_ramp` has engaged and
+  // the inner loop is reporting FAULT_REFERENCE_STALE.  The fall back has
+  // happened, so the stop is the part that is owed -- and it is MODE_IDLE,
+  // because choosing to resume a motion is the task layer's decision.
+  inner_loop_fault_ = SupervisorStatus::FAULT_REFERENCE_STALE;
+  ASSERT_TRUE(
+    wait_until([this, &escalate]() {
+      escalate();
+      return saw_mode(SupervisorStatus::MODE_IDLE);
+    }))
+    << "the mode never left MODE_MPC after the escalation";
+
+  EXPECT_EQ(manager_->switch_calls(), switches_before + 1) << "the release was retried in a loop";
+  EXPECT_EQ(manager_->deactivated().back(), kInnerLoop);
+  EXPECT_EQ(manager_->state_of(kInnerLoop), "inactive");
+  EXPECT_EQ(manager_->state_of(kFollower), "inactive")
+    << "the supervisor chose what happens next instead of stopping";
+
+  // And the producer went back to shadow, **after** the claim moved: the same
+  // asymmetry PRD §10 gives the operator's own MODE_MPC → MODE_FOLLOW request,
+  // because it is the same handover run by a different caller.
+  ASSERT_TRUE(wait_until([this]() {return producer_->mode() == "shadow";}));
+  EXPECT_EQ(producer_->changes().back().mode, "shadow");
+  EXPECT_EQ(producer_->changes().back().switch_calls, switches_before + 1)
+    << "the producer was put back into shadow before the claim moved";
+
+  // One attempt and not one per cycle: the switch blocks this node's status
+  // timer, and a release the manager refused would be refused again.  The count
+  // above is the assertion; this waits long enough for a second to have happened.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  while (std::chrono::steady_clock::now() < deadline) {
+    escalate();
+    publish_inputs();
+    std::this_thread::sleep_for(kPollPeriod);
+  }
+  EXPECT_EQ(manager_->switch_calls(), switches_before + 1)
+    << "the hand-back is being reissued on every status cycle";
 }
 
 int main(int argc, char ** argv)

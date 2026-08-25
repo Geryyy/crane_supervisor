@@ -85,6 +85,16 @@ crane_supervisor:
     # horizon could never pass. Derived from a 12.5 Hz contract sampled here at
     # 20 Hz, the way the margins above are derived; see
     # src/crane_supervisor_parameters.yaml.
+    #
+    # Since issue 055 it is judged against twice more, off the same reading. The
+    # producer's FAULT_SOLVER is merged onto /crane/supervisor/status while
+    # MODE_MPC is the live command path -- ROS 2 Interfaces §4's rule for
+    # VelocityControllerHealth, applied to the second stream that carries a
+    # SupervisorStatus code -- and mpc.md §6's repeated-failure escalation is
+    # read off the same report. Both are taken only from a report inside this
+    # margin: a code nobody has heard since is not a fault this supervisor can
+    # still observe, and standing by one would be the latch §5.3's whole table
+    # exists to avoid.
     horizon_timeout: 0.3
 
     # The node crane_bringup composes the horizon producer under, and whose
@@ -133,6 +143,19 @@ crane_supervisor:
     # `active` -- see mpc_node above -- which is the half of the switch that
     # happens outside the controller manager.
     #
+    # **`mpc` is also the one mode this supervisor leaves without being asked.**
+    # control_architecture.md 5 row 3 ends in "fall back, then stop and report",
+    # and mpc.md 6's repeated-failure escalation is where the fall back has run
+    # out: crane_mpc stops publishing, crane_velocity_controller ramps the
+    # velocity command down over its own horizon_expiry_ramp and reports
+    # FAULT_REFERENCE_STALE, and at that point this node releases the claim --
+    # 5.2 step 1 -- to `idle` and puts the producer back into `shadow`. It is
+    # `idle` and not `follow` deliberately: choosing to resume a motion is the
+    # task layer's decision (5's "the supervisor stops, it does not decide what
+    # happens next"), and PRD 10 step 4 needs a reference that starts at the
+    # current MPC setpoint, which only the planner can produce. So `follow`
+    # below is never entered by anything but a /crane/set_mode request.
+    #
     # The lists are therefore no longer pairwise disjoint. The rule that
     # replaced that one is that no two modes name the same *set*:
     # active_mode() matches by equality rather than containment, which answers a
@@ -158,6 +181,15 @@ crane_supervisor:
     # second claim because the machine has one; the list is empty because this
     # composition does not expose it yet, and a name invented here would be a
     # controller nothing spawns.
+    #
+    # **Slice 6 closing does not change this, and it was never going to.** The
+    # second claim needs a tool controller in a profile, which is a composition
+    # question and belongs to whichever slice exposes the gripper axis
+    # separately; no slice of the CBS migration is that one. What slice 6 did
+    # add is a second reader of the list: active_mode() reports the tool claim on
+    # every status, and neither a /crane/set_mode request nor the escalation
+    # hand-back above ever switches it -- 7.3's second claim is reported and
+    # never moved by a mode change, in both directions.
     tool_controllers: []
 
     # The sway duty of control_architecture.md 5 row 7: a bound on the passive

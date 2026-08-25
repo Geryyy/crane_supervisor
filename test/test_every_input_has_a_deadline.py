@@ -23,9 +23,11 @@ to keep for that to hold:
   freshness check is made against, and it *cannot* be an `Input`: an `Input` is
   by definition a stream whose absence raises a fault on the status stream, and
   an optimizer that is quiet while the machine is in MODE_FOLLOW is the ordinary
-  state of this stack rather than a defect -- wiki/implementation/ros2_interfaces.md 4
-  records that the supervisor merging `FAULT_SOLVER` onto
-  `/crane/supervisor/status` is a slice of its own.  5.3's rule is met the way
+  state of this stack rather than a defect.  Its `fault` **is** merged onto
+  `/crane/supervisor/status` since issue 055 -- unrenumbered, the way
+  `VelocityControllerHealth`'s is -- and that is a different question: what the
+  merge is scoped by is the *mode*, not the stream's presence, so an absent
+  producer still raises nothing here.  5.3's rule is met the way
   the polled controller-manager view meets it: its own configured margin,
   refused by `validate()` when it is missing, and a defined, narrow consequence
   stated where it matters -- no freshness, no switch, with the age and the
@@ -152,11 +154,12 @@ def test_the_stream_that_is_not_an_input_still_has_a_margin_of_its_own():
 
     `/crane/mpc/solver_health` is not an `Input` and must not be: an optimizer
     that is quiet while the machine is in MODE_FOLLOW is the ordinary state of
-    this stack, and merging `FAULT_SOLVER` onto the status stream is a slice of
-    its own.  What it is *not* exempt from is having a deadline at all -- the
-    consequence of it stopping is that PRD 10 step 2 refuses MODE_MPC and says
-    how old the newest report is against what margin, and there is no margin to
-    say without a configured one.
+    this stack, so its *absence* raises nothing.  What it is *not* exempt from
+    is having a deadline at all, and issue 055 gave that margin a second reader:
+    PRD 10 step 2 refuses MODE_MPC and says how old the newest report is against
+    what margin, and `resolve()` merges `FAULT_SOLVER` only off a report inside
+    the same margin -- a code nobody has heard since is not an observation.
+    There is no margin to say either thing without a configured one.
 
     So the same three things the four inputs get are asserted here one at a
     time: a member on the config, a parameter it is read out of, and no default

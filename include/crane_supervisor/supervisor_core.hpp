@@ -810,13 +810,20 @@ struct ControllerManagerReport
 /**
  * PRD §10 step 2's evidence, and the second thing this supervisor watches that
  * is deliberately **not** an `Input`. The registry above is the enum of the
- * inputs whose absence raises a fault on the status stream, and this one's
+ * inputs whose *absence* raises a fault on the status stream, and this one's
  * absence must not: a stack in `MODE_FOLLOW` with no optimizer running is the
- * ordinary state of this machine, not a defect, and
- * wiki/implementation/ros2_interfaces.md §4 records outright that the
- * supervisor merging `FAULT_SOLVER` onto `/crane/supervisor/status` is a slice
- * of its own. A row in `kInputPolicies` would make it a standing fault on every
- * profile the day it was added.
+ * ordinary state of this machine, not a defect. A row in `kInputPolicies` would
+ * make it a standing fault on every profile the day it was added.
+ *
+ * **Its `fault` is merged all the same, and the two are different questions.**
+ * `FAULT_SOLVER` reaching `/crane/supervisor/status` is what
+ * wiki/implementation/ros2_interfaces.md §4 recorded as a slice of its own; this
+ * is that slice, and the merge follows §4's rule for `VelocityControllerHealth`
+ * exactly -- the code travels unrenumbered and is neither translated nor
+ * re-derived. What scopes it is the *mode* and not the stream's presence:
+ * `resolve()` reports the code only while `MODE_MPC` is the live command path,
+ * because a shadow solve that failed drove nothing, and shadow is the state
+ * every switch into `MODE_MPC` is made from.
  *
  * §5.3's rule is met and it is met the way `ControllerManagerReport` meets it:
  * the consequence of this stream stopping is **defined, narrow and stated at
@@ -1417,6 +1424,49 @@ struct HorizonPrecondition
  */
 [[nodiscard]] std::string mpc_horizon_refusal(
   const SupervisorConfig & config, std::uint8_t requested, const SupervisorInput & input);
+
+/// wiki/mpc.md §6's repeated-failure escalation, as the supervisor's own duty.
+/**
+ * `wiki/control_architecture.md` §5 row 3 is the only duty in that table whose
+ * action has two halves: *fall back*, and **then** *stop and report*. The fall
+ * back is not this node's and never was -- `crane_mpc` shifts its previous
+ * solution while it still believes it, and when it stops believing it, it stops
+ * publishing; `crane_velocity_controller` then runs out of plan and ramps the
+ * velocity command to zero over its own `horizon_expiry_ramp`. The stop is this
+ * node's, and it is §5.2 step 1: deactivate the claim.
+ *
+ * `required` is true only when all four hold, in this order:
+ *
+ *   1. `MODE_MPC` is the live mode -- in `MODE_FOLLOW` the producer is
+ *      shadowing and an escalation drives nothing;
+ *   2. the producer's newest report is **fresh**, against `horizon_deadline`;
+ *   3. it carries `FAULT_SOLVER` with `applied_previous_solution` false, which
+ *      is the escalation's observable: nothing went out on `/crane/mpc/horizon`
+ *      at all, rather than a shifted plan having gone out;
+ *   4. the inner loop is reporting `FAULT_REFERENCE_STALE`, which is the
+ *      receiver saying it has run out of plan -- the fall back has happened, so
+ *      the stop is now the part that is owed.
+ *
+ * Condition 4 is the whole reason this is a predicate and not a branch inside
+ * `resolve()`. Releasing the claim on the escalation *itself* would take the
+ * command interface off a receiver that still had a second of good plan in
+ * hand, which is the commanded step §5.2 step 3 and wiki/mpc.md §6 both refuse.
+ *
+ * There is no third field for *which* mode to fall to, because there is only one
+ * answer: `MODE_IDLE`. Resuming a motion is the task layer's decision
+ * (§5's `[!important]`), and PRD §10 step 4 needs a reference starting at the
+ * current MPC setpoint, which no supervisor can produce.
+ */
+struct SolverHandback
+{
+  /// The claim is to be released, now.
+  bool required{false};
+  /// The whole account, ready to be a `message`. Empty when `required` is false.
+  std::string message;
+};
+
+[[nodiscard]] SolverHandback solver_handback(
+  const SupervisorConfig & config, const SupervisorInput & input, const ActiveMode & active);
 
 /// The mode clause, for the end of any report. Never empty.
 [[nodiscard]] std::string mode_clause(const SupervisorConfig & config, const ActiveMode & active);

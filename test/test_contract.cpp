@@ -16,6 +16,7 @@
 #include <cstdint>
 
 #include "crane_model/testing/mock_model.hpp"
+#include "crane_msgs/msg/solver_health.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
 #include "crane_msgs/msg/sway_settled.hpp"
 #include "crane_supervisor/supervisor_core.hpp"
@@ -56,6 +57,35 @@ TEST(CraneSupervisorContract, TheCoreIsNumberedAsTheMessageIsNumbered)
   EXPECT_EQ(static_cast<std::uint8_t>(Fault::EStop), Status::FAULT_ESTOP);
   EXPECT_EQ(static_cast<std::uint8_t>(Fault::Interlock), Status::FAULT_INTERLOCK);
   EXPECT_EQ(static_cast<std::uint8_t>(Fault::NotCommissioned), Status::FAULT_NOT_COMMISSIONED);
+}
+
+TEST(CraneSupervisorContract, TheSolveVerdictIsNumberedAsTheProducersOwnMessageNumbersIt)
+{
+  // The third cast the adapter makes, and the third place the core's enum has
+  // to agree with a wire it cannot include.  PRD §10 step 2 is decided on this
+  // value, so a numbering that drifted would admit a switch into an optimizer
+  // that had said the opposite.
+  using Wire = crane_msgs::msg::SolverHealth;
+  using Outcome = crane_supervisor::SolveOutcome;
+
+  EXPECT_EQ(static_cast<std::uint8_t>(Outcome::Unknown), Wire::SOLVE_UNKNOWN);
+  EXPECT_EQ(static_cast<std::uint8_t>(Outcome::Converged), Wire::SOLVE_CONVERGED);
+  EXPECT_EQ(static_cast<std::uint8_t>(Outcome::BudgetExceeded), Wire::SOLVE_BUDGET_EXCEEDED);
+  EXPECT_EQ(static_cast<std::uint8_t>(Outcome::Failed), Wire::SOLVE_FAILED);
+
+  // And the value both sides start from is the unknown one, for the reason the
+  // settled predicate's zero is unknown: a message nobody filled must not read
+  // as an optimizer that converged, which is the one verdict this supervisor
+  // admits a switch on.
+  EXPECT_EQ(static_cast<std::uint8_t>(crane_supervisor::HorizonReport{}.outcome),
+    Wire::SOLVE_UNKNOWN);
+  EXPECT_EQ(Wire{}.outcome, Wire::SOLVE_UNKNOWN);
+
+  // The producer's fault code travels unrenumbered as well, exactly as the
+  // inner loop's does: the supervisor merges rather than translates.
+  EXPECT_EQ(
+    static_cast<std::uint8_t>(crane_supervisor::Fault::Solver),
+    crane_msgs::msg::SupervisorStatus::FAULT_SOLVER);
 }
 
 TEST(CraneSupervisorContract, TheSettledPredicateIsNumberedAsItsOwnMessageNumbersIt)

@@ -95,13 +95,21 @@ crane_supervisor::SupervisorConfig with_shipped_deadlines(
   // it is missing, so a fixture that omitted it would not be a configuration a
   // node could start from.
   config.controller_manager_deadline = 0.25;
+  // The horizon producer's margin, refused by `validate()` when it is missing
+  // for the same reason: PRD §10 step 2's check has to compare an age against
+  // something, and a fixture that omitted it would not be a configuration a node
+  // could start from either.
+  config.horizon_deadline = 0.3;
   // The arm claim's controllers, as `config/crane_supervisor.yaml` ships them:
-  // the FOLLOW pair in the cascade's activation order, and nothing for
-  // MODE_MANUAL or MODE_FOLLOW's absent siblings. That is the deployment's own
-  // state and not a convenience -- no CBS profile composes a manual controller,
-  // and MODE_MPC has no producer until slice 6.
+  // the FOLLOW pair in the cascade's activation order, MODE_MPC as that pair
+  // without the trajectory controller (PRD §10 step 3 -- the same inner loop
+  // carries both paths), and nothing for MODE_MANUAL, which is the deployment's
+  // own state and not a convenience since no CBS profile composes one.
   config.mode_controllers[crane_supervisor::index_of(crane_supervisor::Mode::Follow)] = {
     "crane_velocity_controller", "trajectory_controller_a2b"};
+  config.mode_controllers[crane_supervisor::index_of(crane_supervisor::Mode::Mpc)] = {
+    "crane_velocity_controller"};
+  config.mpc_node = "crane_mpc";
   config.sway = shipped_sway_bound();
   return config;
 }
@@ -1761,11 +1769,55 @@ ControllerManagerReport following()
       controller(kManualController, "inactive"), controller(kToolController, "inactive")});
 }
 
+/// The state after a switch into MODE_MPC: the inner loop alone holds the claim.
+ControllerManagerReport unchained()
+{
+  return answered(
+    {controller(kVelocityController, "active", {"theta1_slewing_joint/velocity"}),
+      controller(kFollower, "inactive"), controller(kManualController, "inactive"),
+      controller(kToolController, "inactive")});
+}
+
+/// What the horizon producer would have reported, `age` seconds ago.
+/**
+ * The evidence PRD §10 step 2 is verified against, and it is
+ * `crane_msgs/SolverHealth` rather than the horizon itself for a reason the
+ * core's `HorizonReport` states: in shadow -- the state every switch into
+ * `MODE_MPC` is made from -- `crane_mpc` publishes nothing at all on
+ * `/crane/mpc/horizon`, so a check against the horizon could never pass.
+ */
+crane_supervisor::HorizonReport solving(
+  double age = 0.01,
+  crane_supervisor::SolveOutcome outcome = crane_supervisor::SolveOutcome::Converged)
+{
+  crane_supervisor::HorizonReport report;
+  report.health.received = true;
+  report.health.age = age;
+  report.outcome = outcome;
+  report.solve_time = 0.012;
+  report.solve_budget = 0.03;
+  report.status = "solved in 12 ms of a 30 ms budget";
+  return report;
+}
+
 /// A healthy observation with the controller manager answering.
+/**
+ * The horizon producer is left as it is on a stack that never composed one:
+ * nothing has arrived, which is what makes a `MODE_MPC` request refused unless
+ * a test says otherwise. `warm()` is how a test says otherwise.
+ */
 crane_supervisor::SupervisorInput input_with(ControllerManagerReport manager)
 {
   crane_supervisor::SupervisorInput input = healthy_input();
   input.controller_manager = std::move(manager);
+  return input;
+}
+
+/// The same observation with the horizon producer solving inside its deadline.
+crane_supervisor::SupervisorInput warm(
+  crane_supervisor::SupervisorInput input, crane_supervisor::HorizonReport horizon = solving())
+{
+  input.horizon = std::move(horizon);
   return input;
 }
 
@@ -1799,18 +1851,36 @@ TEST(SupervisorMode, TheActiveModeIsReadOffTheManagerAndNotRemembered)
   EXPECT_EQ(
     follow.active_controllers, (std::vector<std::string>{kVelocityController, kFollower}));
 
-  // One of the two: a half-state is not a mode.  MODE_IDLE is what claims the
-  // least, and the clause says which controller is up rather than rounding the
-  // drift off into a mode nobody can act on.
+  // The inner loop alone: **MODE_MPC**, and not a half-state of MODE_FOLLOW.
+  // That is the whole of what slice 6 changed about this function.  PRD §10
+  // step 3 puts the same `crane_velocity_controller` instance on both paths, so
+  // MODE_MPC's claim *is* MODE_FOLLOW's minus the trajectory controller, and
+  // matching by containment would have called this drift while calling
+  // MODE_FOLLOW ambiguous.  Matching by set equality answers both exactly.
+  ControllerManagerReport unchained = following();
+  unchained.controllers[1].state = "inactive";
+  const ActiveMode mpc = crane_supervisor::active_mode(config, unchained);
+  EXPECT_TRUE(mpc.known);
+  EXPECT_FALSE(mpc.partial);
+  EXPECT_EQ(mpc.mode, Mode::Mpc);
+  EXPECT_EQ(mpc.active_controllers, (std::vector<std::string>{kVelocityController}));
+
+  // And MODE_FOLLOW is still answered exactly rather than being satisfied by
+  // MODE_MPC's list as well: one mode matches, not two.
+  EXPECT_EQ(crane_supervisor::active_mode(config, following()).mode, Mode::Follow);
+
+  // The trajectory controller alone, with the inner loop it chains onto down:
+  // *that* is a half-state, and a half-state is not a mode.  MODE_IDLE is what
+  // claims the least, and the clause says which controller is up rather than
+  // rounding the drift off into a mode nobody can act on.
   ControllerManagerReport half = following();
-  half.controllers[1].state = "inactive";
+  half.controllers[0].state = "inactive";
   const ActiveMode drifted = crane_supervisor::active_mode(config, half);
   EXPECT_TRUE(drifted.known);
   EXPECT_TRUE(drifted.partial);
   EXPECT_EQ(drifted.mode, Mode::Idle);
   const std::string clause = crane_supervisor::mode_clause(config, drifted);
-  EXPECT_NE(clause.find(kVelocityController), std::string::npos) << clause;
-  EXPECT_EQ(clause.find(kFollower), std::string::npos) << clause;
+  EXPECT_NE(clause.find(kFollower), std::string::npos) << clause;
 }
 
 TEST(SupervisorMode, AManagerThatIsNotAnsweringLeavesTheModeNotKnown)
@@ -1869,21 +1939,178 @@ TEST(SupervisorMode, AValueThatIsNotAModeIsRefusedRatherThanCast)
   EXPECT_FALSE(crane_supervisor::is_mode(4));
 }
 
-TEST(SupervisorMode, MpcIsRefusedWithTheReasonAndNotLeftToFailAtTheClaim)
+TEST(SupervisorMode, AStaleHorizonRefusesMpcAndTheTrajectoryControllerIsNotPlannedAway)
 {
-  // PRD §10 step 2, in the only form slice 3 can implement it: the horizon's
-  // freshness is verified *before* anything is deactivated, and there is no
-  // horizon, so the answer is no.  The check exists and refuses, which is what
-  // makes slice 6 an activation rather than a build.
+  // PRD §10 step 2 and user story 35.  The freshness of the horizon is verified
+  // *before* the trajectory controller is deactivated -- no freshness, no
+  // switch -- and what makes that an assertion rather than a claim is that the
+  // plan comes back **empty**: nothing was deactivated, because nothing was
+  // planned to be.
   const auto config = config_with_modes();
-  const auto refused = ask(config, Mode::Mpc, following());
-  EXPECT_FALSE(refused.accepted);
-  EXPECT_TRUE(refused.deactivate.empty()) << "the trajectory controller was planned away";
-  EXPECT_NE(refused.message.find("slice 6"), std::string::npos) << refused.message;
-  EXPECT_NE(refused.message.find("freshness"), std::string::npos) << refused.message;
-  // And the machine is reported in the mode it is still in, not in the one that
-  // was asked for.
-  EXPECT_EQ(refused.active.mode, Mode::Follow);
+
+  // Nothing has ever arrived, which is also what a deployment that composes no
+  // producer at all looks like from here.
+  const auto absent = ask(config, Mode::Mpc, following());
+  EXPECT_FALSE(absent.accepted);
+  EXPECT_TRUE(absent.deactivate.empty()) << "the trajectory controller was planned away";
+  EXPECT_TRUE(absent.activate.empty());
+  EXPECT_NE(absent.message.find("freshness"), std::string::npos) << absent.message;
+  EXPECT_NE(absent.message.find("Nothing was deactivated"), std::string::npos) << absent.message;
+  // The machine is reported in the mode it is still in, not in the one that was
+  // asked for (user story 36).
+  EXPECT_EQ(absent.active.mode, Mode::Follow);
+
+  // It was arriving and stopped, which is a different thing to chase and reads
+  // as one: the age and the deadline are both in the sentence.
+  crane_supervisor::HorizonReport late = solving(10.0 * config.horizon_deadline);
+  const auto stale = crane_supervisor::arbitrate_mode(
+    config, static_cast<std::uint8_t>(Mode::Mpc), warm(input_with(following()), late));
+  EXPECT_FALSE(stale.accepted);
+  EXPECT_TRUE(stale.deactivate.empty());
+  EXPECT_NE(stale.message.find("3.000 s old"), std::string::npos) << stale.message;
+  EXPECT_NE(stale.message.find("0.300 s"), std::string::npos) << stale.message;
+  EXPECT_NE(stale.message, absent.message);
+
+  // A stamp further in this node's future than the margin allows is not a fresh
+  // sample either, and it names the clock rather than the optimizer.
+  crane_supervisor::HorizonReport ahead = solving(-10.0 * config.horizon_deadline);
+  const auto skewed = crane_supervisor::arbitrate_mode(
+    config, static_cast<std::uint8_t>(Mode::Mpc), warm(input_with(following()), ahead));
+  EXPECT_FALSE(skewed.accepted);
+  EXPECT_TRUE(skewed.deactivate.empty());
+  EXPECT_NE(skewed.message.find("future"), std::string::npos) << skewed.message;
+}
+
+TEST(SupervisorMode, AProducerThatIsAliveAndNotConvergingIsTheDeadMpcStepTwoRefuses)
+{
+  // The half freshness alone cannot see.  An optimizer that publishes at rate
+  // and fails every solve reads as fresh, and it is exactly the dead MPC user
+  // story 35 refuses to switch into: PRD §10 step 1 wants it *warm*, and shadow
+  // mode already implies it solves.
+  const auto config = config_with_modes();
+
+  for (const crane_supervisor::SolveOutcome outcome :
+    {crane_supervisor::SolveOutcome::Unknown, crane_supervisor::SolveOutcome::BudgetExceeded,
+      crane_supervisor::SolveOutcome::Failed})
+  {
+    const crane_supervisor::HorizonReport report = solving(0.01, outcome);
+    EXPECT_EQ(
+      crane_supervisor::horizon_precondition(config, report).cause, Staleness::Fresh)
+      << "the stream is fine; it is the solve that is not";
+    EXPECT_FALSE(crane_supervisor::horizon_precondition(config, report).fresh);
+
+    const auto refused = crane_supervisor::arbitrate_mode(
+      config, static_cast<std::uint8_t>(Mode::Mpc), warm(input_with(following()), report));
+    EXPECT_FALSE(refused.accepted);
+    EXPECT_TRUE(refused.deactivate.empty());
+    EXPECT_NE(
+      refused.message.find(crane_supervisor::solve_outcome_name(outcome)), std::string::npos)
+      << refused.message;
+    // The producer's own account of the cycle is carried rather than restated,
+    // the way the broadcaster's status string is.
+    EXPECT_NE(refused.message.find("30 ms budget"), std::string::npos) << refused.message;
+  }
+
+  // And the converged one is the only one that passes.
+  EXPECT_TRUE(crane_supervisor::horizon_precondition(config, solving()).fresh);
+}
+
+TEST(SupervisorMode, TheFreshnessCheckIsAFunctionOfItsOwnAndItAnswersOnlyAboutMpc)
+{
+  // The order is the assertion, and it is what makes the node able to run this
+  // check *before it asks the controller manager for anything at all*.  A
+  // request for any other mode has to come back empty from it, or the node's
+  // early exit would refuse switches that have nothing to do with the horizon.
+  const auto config = config_with_modes();
+  const crane_supervisor::SupervisorInput cold = input_with(following());
+
+  for (const Mode mode : {Mode::Idle, Mode::Manual, Mode::Follow}) {
+    EXPECT_TRUE(
+      crane_supervisor::mpc_horizon_refusal(config, static_cast<std::uint8_t>(mode), cold).empty())
+      << crane_supervisor::mode_name(mode);
+  }
+  // A value that is not a mode is not this check's to refuse either:
+  // `arbitrate_mode()` answers that one and says which values exist.
+  EXPECT_TRUE(crane_supervisor::mpc_horizon_refusal(config, 200, cold).empty());
+
+  // MODE_MPC with nothing arriving is the one case it answers, and the sentence
+  // it returns is the one the arbitration puts on the response -- one function,
+  // two call sites, so the early answer and the arbitration cannot disagree.
+  const std::string refusal =
+    crane_supervisor::mpc_horizon_refusal(config, static_cast<std::uint8_t>(Mode::Mpc), cold);
+  EXPECT_FALSE(refusal.empty());
+  EXPECT_EQ(refusal, ask(config, Mode::Mpc, following()).message);
+
+  // And it is checked *above* the view of the controller manager: a supervisor
+  // that cannot see the manager still refuses MODE_MPC for the horizon, which
+  // is the reason that is actually true and the one an operator can act on.
+  crane_supervisor::SupervisorInput blind = healthy_input();
+  EXPECT_EQ(
+    crane_supervisor::arbitrate_mode(config, static_cast<std::uint8_t>(Mode::Mpc), blind).message,
+    refusal);
+}
+
+TEST(SupervisorMode, AWarmHorizonAdmitsMpcAndThePlanNeverNamesTheInnerLoop)
+{
+  // PRD §10 step 3 as a plan: "Same controller instance across both paths, so
+  // the handover is an ordinary seam, not new machinery."  The switch out of
+  // MODE_FOLLOW names the trajectory controller and **nothing else** -- a plan
+  // that named the inner loop would be asking for the sole claimant of the six
+  // velocity command interfaces to be released and re-claimed, which would
+  // destroy the very thing step 3 clamps the first B-spline to.
+  const auto config = config_with_modes();
+  const auto accepted = crane_supervisor::arbitrate_mode(
+    config, static_cast<std::uint8_t>(Mode::Mpc), warm(input_with(following())));
+  ASSERT_TRUE(accepted.accepted) << accepted.message;
+  EXPECT_TRUE(accepted.switch_required);
+  EXPECT_EQ(accepted.deactivate, (std::vector<std::string>{kFollower}));
+  EXPECT_TRUE(accepted.activate.empty()) << "the inner loop was planned to be reactivated";
+  // The other half of the switch, and this supervisor's alone.
+  EXPECT_TRUE(accepted.horizon_producer_active);
+
+  // And back.  Only the trajectory controller is activated, nothing is
+  // deactivated at all, and the producer goes back to shadow.
+  const auto back = crane_supervisor::arbitrate_mode(
+    config, static_cast<std::uint8_t>(Mode::Follow), warm(input_with(unchained())));
+  ASSERT_TRUE(back.accepted) << back.message;
+  EXPECT_EQ(back.activate, (std::vector<std::string>{kFollower}));
+  EXPECT_TRUE(back.deactivate.empty()) << "the inner loop was planned away across the handover";
+  EXPECT_FALSE(back.horizon_producer_active);
+
+  // Every other mode leaves the producer in shadow, so the flag is the mode and
+  // not a second decision.
+  for (const Mode mode : {Mode::Idle, Mode::Manual}) {
+    EXPECT_FALSE(
+      crane_supervisor::arbitrate_mode(
+        config, static_cast<std::uint8_t>(mode), warm(input_with(following())))
+      .horizon_producer_active)
+      << crane_supervisor::mode_name(mode);
+  }
+}
+
+TEST(SupervisorMode, TheHorizonProducerHasADeadlineAndItIsNotAnyOfTheInputDeadlines)
+{
+  // The producer's stream is deliberately not an `Input` -- an optimizer that is
+  // quiet while the machine is in MODE_FOLLOW is the ordinary state of this
+  // stack, and ROS 2 Interfaces §4 makes merging FAULT_SOLVER onto the status a
+  // slice of its own.  §5.3's rule is met the way the polled controller-manager
+  // view meets it: its own margin, refused when absent, and a defined
+  // consequence at the point it matters.
+  std::string reason;
+  auto undated = config_with_modes();
+  undated.horizon_deadline = 0.0;
+  EXPECT_FALSE(crane_supervisor::validate(undated, reason));
+  EXPECT_NE(reason.find("horizon"), std::string::npos) << reason;
+
+  // And a producer that stopped raises no fault on the status stream at all:
+  // the decision is unchanged by it, which is the property the registry's
+  // absence is there to give.
+  const auto config = config_with_modes();
+  crane_supervisor::SupervisorInput quiet = input_with(following());
+  const auto without = crane_supervisor::decide(config, quiet);
+  const auto with = crane_supervisor::decide(config, warm(quiet));
+  EXPECT_EQ(without.fault, with.fault);
+  EXPECT_EQ(without.message, with.message);
 }
 
 TEST(SupervisorMode, NoViewOfTheManagerRefusesEverySwitchRatherThanSwitchingBlind)
@@ -2135,12 +2362,43 @@ TEST(SupervisorMode, ValidateRefusesAConfigurationTheArbitrationCouldNotAnswerFr
 {
   std::string reason;
 
-  // A controller in two modes: two modes would read as active at once and the
-  // answer would depend on which list was checked first.
-  auto overlapping = config_with_modes();
-  overlapping.mode_controllers[crane_supervisor::index_of(Mode::Manual)] = {kVelocityController};
-  EXPECT_FALSE(crane_supervisor::validate(overlapping, reason));
-  EXPECT_NE(reason.find(kVelocityController), std::string::npos) << reason;
+  // Two modes with the *same set* of controllers: both would read as active at
+  // once and the answer would depend on which list was checked first.  This is
+  // what replaced the old pairwise-disjointness rule, and it keeps the defect
+  // that rule was aimed at while letting through the overlap PRD §10 step 3
+  // requires.
+  auto indistinguishable = config_with_modes();
+  indistinguishable.mode_controllers[crane_supervisor::index_of(Mode::Manual)] = {
+    kVelocityController};
+  EXPECT_FALSE(crane_supervisor::validate(indistinguishable, reason));
+  EXPECT_NE(reason.find("same set"), std::string::npos) << reason;
+
+  // The overlap itself is admitted, and it has to be: `MODE_MPC` is
+  // `MODE_FOLLOW` without the trajectory controller because the same inner loop
+  // carries both paths, and a rule that outlawed that would outlaw the
+  // architecture.  This is the shipped configuration.
+  EXPECT_TRUE(crane_supervisor::validate(config_with_modes(), reason)) << reason;
+
+  // A name twice in one list: the list's length stops counting its controllers,
+  // so the set comparison could never match and the mode would be unreachable.
+  auto repeated = config_with_modes();
+  repeated.mode_controllers[crane_supervisor::index_of(Mode::Manual)] = {
+    kManualController, kManualController};
+  EXPECT_FALSE(crane_supervisor::validate(repeated, reason));
+  EXPECT_NE(reason.find("twice"), std::string::npos) << reason;
+
+  // MODE_MPC implemented with no producer named: the claim would move to a path
+  // whose producer publishes nothing, and the inner loop would be unchained
+  // with no horizon.
+  auto unnamed = config_with_modes();
+  unnamed.mpc_node.clear();
+  EXPECT_FALSE(crane_supervisor::validate(unnamed, reason));
+  EXPECT_NE(reason.find("mpc_node"), std::string::npos) << reason;
+
+  // ... and a deployment that implements neither is fine without one.
+  auto without_mpc = unnamed;
+  without_mpc.mode_controllers[crane_supervisor::index_of(Mode::Mpc)].clear();
+  EXPECT_TRUE(crane_supervisor::validate(without_mpc, reason)) << reason;
 
   // A controller that is both a mode's and the tool claim's: an arm mode change
   // would deactivate the gripper it is supposed to leave alone (§7.3).

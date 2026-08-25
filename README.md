@@ -27,11 +27,20 @@ decides is which controller holds the claim.
   acknowledges a latched emergency stop and does nothing else, and
   `/crane/set_mode` (`crane_msgs/SetMode`), which is the **only** way a mode
   changes (ROS 2 Interfaces §5).
+- a **fifth stream, watched but not swept** — `crane_msgs/SolverHealth` on
+  `/crane/mpc/solver_health`.  It is deliberately not one of the four `Input`s:
+  its absence raises no fault on the status stream, and the whole of what it
+  decides is whether `MODE_MPC` may be entered (PRD §10 step 2).
 - two **clients on the controller manager** — `list_controllers`, which is where
   the reported mode comes from, and `switch_controller`, which is the one call
   this package makes that reaches the machine.  ROS 2 Interfaces §5 puts that
   client here and nowhere else: mode changes go **through the supervisor**, not
   from the behaviour tree.
+- one **client on the horizon producer** — `rcl_interfaces/SetParameters` on the
+  node `mpc_node` names, carrying one parameter: `crane_mpc`'s `mode`.  ROS 2
+  Interfaces §4 makes which of the two producers is live the supervisor's
+  decision *alone*, issue 053 made that a state of `crane_mpc`, and this is the
+  call that moves it.
 
 > **The emergency stop and the deadman are read here for diagnosis and clean
 > recovery. They are not the protection.** The stop chain is hardware and PLC
@@ -202,8 +211,23 @@ somebody has to read a log to understand.
 
 `mode` on the status stream is re-derived from the controller manager on every
 cycle, never remembered from the last successful request.  A mode is active when
-**every** controller configured for it is active; when none is, the arm claim is
-free and that is `MODE_IDLE` as an observation rather than as a default.
+the controllers of the arm claim that are up are **exactly** the ones configured
+for it; when none is up, the arm claim is free and that is `MODE_IDLE` as an
+observation rather than as a default.
+
+**Equality and not containment, and slice 6 is why.**  Until `MODE_MPC` was
+populated the rule was "every controller configured for it is active" and the
+lists were required to be pairwise disjoint, which made that rule sound.  PRD
+§10 step 3 puts the *same* `crane_velocity_controller` instance on both paths —
+"same controller instance across both paths, so the handover is an ordinary
+seam, not new machinery" — so `MODE_MPC`'s list is `MODE_FOLLOW`'s minus the
+trajectory controller, and a disjointness rule would have outlawed the
+architecture.  Under containment the nesting is worse than untidy: `MODE_FOLLOW`
+holding the claim would satisfy `MODE_MPC` as well, and `MODE_MPC` holding it
+would leave `MODE_FOLLOW` half up and read as drift.  Under equality both are
+answered exactly, and what `validate()` has to insist on is only that no two
+modes name the *same set* — two identical claims under two names would both
+match and the answer would depend on which was checked first.
 
 Three things follow, and each is a case a remembered mode would have hidden:
 
@@ -230,7 +254,7 @@ is never discovered half-way (PRD §10 step 2, user story 35).  In order:
 | Refused when | Because |
 |---|---|
 | the request is not one of the four constants | a `uint8` is not a mode until it has been checked, and answering 200 with a plausible mode is worse than refusing it |
-| the mode is `MODE_MPC` | PRD §10 step 2 requires the horizon's freshness to be verified before the trajectory controller is deactivated, and there is no horizon: the check exists and refuses, which is what makes slice 6 an activation rather than a build |
+| the mode is `MODE_MPC` and the horizon is not fresh | PRD §10 step 2 and user story 35, and **it is checked first on purpose** — see below.  The refusal names freshness, how old the producer's newest report is, what the deadline was and what its last solve said |
 | the controller manager has not answered inside its deadline | a precondition cannot be checked against a view this supervisor does not have, and a switch issued blind is the half-way discovery §10 forbids |
 | a fault is latched **and** the mode is a motion mode | the latched cause is the reason, carried rather than restated, and clearing it goes through `/crane/clear_fault`.  `MODE_IDLE` is still reachable: releasing the claim is the one direction a latched stop does not argue against |
 | the deployment configures no controller for the mode | there is nothing to activate, and an empty switch reported as a success is a no-op an operator cannot see.  `MODE_MANUAL` is in this state on today's profiles |
@@ -245,6 +269,81 @@ mode the machine was already in, and a switch the manager accepted but that
 landed somewhere else is reported as where it landed, with a clause saying so.
 A request for the mode that is already active is a no-op and is reported as one
 rather than as a switch.
+
+### The handover, and why step 2 is first
+
+PRD §10 sequences the change into and out of the MPC path in four steps.  Two of
+them are this package's, and the order between them is the whole content:
+
+**Step 2 — freshness, before the controller manager is asked for anything.**
+Not before the switch: before the *poll*.  `mpc_horizon_refusal()` is evaluated
+on the observation this node already holds, and only if it comes back empty does
+`/crane/set_mode` go on to read the machine.  So a switch into a dead MPC costs
+the manager nothing and is refused from the mode the machine is already in
+(user story 35).  `arbitrate_mode()` runs the same function again at precondition
+2, off the same observation, so the early answer and the arbitration cannot
+disagree about what was verified.
+
+The evidence is `/crane/mpc/solver_health` and **not** `/crane/mpc/horizon`, and
+the substitution is forced rather than chosen: in shadow — the state every switch
+into `MODE_MPC` is made *from* — `crane_mpc` publishes nothing at all on the
+contract topic, so a check against the horizon could never pass and `MODE_MPC`
+would be unreachable by construction.  `solver_health` runs in both modes and
+carries the solve's own three-valued verdict, which is exactly what step 1 means
+by "the MPC runs warm before the switch; shadow mode already implies it solves".
+
+Two things have to hold and the second is not implied by the first.  The report
+has to be **fresh**, against `horizon_timeout`; and the newest solve has to have
+**converged**.  A producer that is alive, publishing at rate and failing every
+solve reads as fresh and is precisely the dead MPC step 2 exists to refuse.
+`SOLVE_BUDGET_EXCEEDED` is refused with `SOLVE_FAILED`, deliberately: §5 row 3
+gives `FAULT_SOLVER` to a deadline miss and to non-convergence alike, and
+entering the mode on a plan with nothing behind it costs a handover while
+refusing costs one more request.
+
+That stream is deliberately **not** an `Input`.  An optimizer that is quiet while
+the machine is in `MODE_FOLLOW` is the ordinary state of this stack rather than a
+defect, and ROS 2 Interfaces §4 records that the supervisor merging
+`FAULT_SOLVER` onto `/crane/supervisor/status` is a slice of its own.  §5.3's
+rule is met the way `ControllerManagerReport` meets it — its own configured
+margin, refused by `validate()` when it is missing, and a defined, narrow
+consequence stated where it matters: no freshness, no switch.
+
+**The producer's own mode, and the order is not symmetric.**  ROS 2 Interfaces
+§4's "One command path" ends by saying that which of the two producers is live is
+the supervisor's decision *alone* and that the two never drive at once.  Issue
+053 made that a state of `crane_mpc` and left its `mode` parameter writable for
+exactly this, so a switch moves it as well as moving the claim:
+
+| Direction | Order | Why |
+|---|---|---|
+| into `MODE_MPC` | producer to `active` **before** the claim moves | the MPC then publishes while the trajectory controller is still chained, which cannot steal the command, and the velocity controller has a fitted spline in hand at the instant the follower lets go |
+| out of `MODE_MPC` | producer to `shadow` **after** the claim has moved | the same argument read the other way |
+
+The producer is therefore active across the union of the two intervals rather
+than across either exactly.  What settles it afterwards is the mode **read back**
+off the manager rather than the one that was asked for, so a switch that failed
+in either direction leaves the producer where the claim actually is — and a
+producer that refused, timed out or was not there is *named on the response*
+rather than left for a silent horizon to be the evidence of.
+
+**Steps 3 and 4 are not here and are not this package's at all.**  The seam clamp
+and the setpoint the re-entering trajectory is anchored on live in
+`crane_control`, where the command is, and the reason they need no supervisor is
+step 3's own: the same controller instance runs both paths.  That is also why the
+plan never *names* `crane_velocity_controller` in either direction — a plan that
+did would be asking for the sole claimant of the six `velocity` command
+interfaces to be released and re-claimed, which is a different thing from the
+chained-mode transition the manager performs on it internally and one it is not
+written to survive.
+
+**The bound the clamp acts with does not exist.**  All six values in
+`crane_control/config/tracking_tolerance.yaml` are negative and that file's own
+header says why: the number comes from merge gate (ii-b) or the slice 1b
+campaign, both human-only.  So the clamp is *transparent* on the deployed
+configuration, the report this node composes about a missing tolerance says so in
+as many words rather than implying a bound nothing enforces, and the mechanism is
+tested against an injected number in `crane_control/test/test_mode_handover.cpp`.
 
 ### Two claims, not one machine
 
@@ -282,6 +381,21 @@ the one call that must never be issued against the machine by accident, and this
 workspace's sim runs join the real crane's DDS graph, so it is never asserted
 against a launch.  The arbitration itself is decided in the ROS-free core, so
 every refusal is reachable from a unit test with no runtime at all.
+
+**A real manager keeps no record of who called it**, and two of the things slice
+6 has to assert are about exactly that.  "The switch was never issued" and "the
+switch was issued and the manager refused it" are indistinguishable from the
+outcome alone, and so are "the horizon was checked first" and "the manager was
+consulted first and happened to answer".  So `test/test_handover_sequence.cpp`
+runs the same node against a controller manager that can be **watched** — a spy
+that answers `list_controllers` from a scripted table and counts every
+`switch_controller` call — and a `crane_mpc` stub that records what the claim was
+doing at the instant its mode changed.  It is an instrument rather than a
+stand-in: there is no control loop and no hardware in it, and what it exists to
+observe is which calls this node makes and in what order.  One of its tests takes
+the manager off the graph entirely, which is what turns "freshness is checked
+first" into an observation: a supervisor that consulted the manager first would
+have exactly one thing to say, and the refusal that comes back names the horizon.
 
 **One cost is known and is not fixed here.**  `/crane/set_mode` and the status
 timer share this node's default callback group, so while a switch is in flight
@@ -639,11 +753,11 @@ an input and reported on every status, whatever `fault` says.
 
 ## Configuration
 
-Eleven read-only parameters are shipped in `config/crane_supervisor.yaml`:
+Fourteen read-only parameters are shipped in `config/crane_supervisor.yaml`:
 `pendulum_state_timeout`, `remote_ctrl_timeout`, `controller_state_timeout`,
-`controller_health_timeout`, `controller_manager_timeout`,
-`mode_controllers.follow`, `tool_controllers`, the four under `sway`, and
-`deadman_button`.  The first four are the freshness deadlines of the four
+`controller_health_timeout`, `controller_manager_timeout`, `horizon_timeout`,
+`mpc_node`, `mode_controllers.follow`, `mode_controllers.mpc`,
+`tool_controllers`, the four under `sway`, and `deadman_button`.  The first four are the freshness deadlines of the four
 `Input`s, one each, and they are the only place those numbers exist — the core's
 array has no default, so a deadline that is not configured is a node that does
 not start.  Their names are the ones `crane_bringup` already passes; they read
@@ -656,17 +770,37 @@ Its age is measured from **arrival** rather than from a header stamp, because
 `ListControllers` carries none — weaker than the four above, and weaker in the
 safe direction, since it cannot be fooled by a publisher whose clock ran ahead.
 
+`horizon_timeout` is the sixth, and the second that is not an `Input`'s: how old
+the horizon producer's newest `crane_msgs/SolverHealth` may be and still say it
+is solving.  It is PRD §10 step 2's whole margin — past it a request for
+`MODE_MPC` is refused with the age and the deadline in the sentence, before the
+trajectory controller is deactivated and before the controller manager is asked
+anything at all.  Derived like the two 20 Hz margins, from a 12.5 Hz contract:
+80 ms of publication period plus 50 ms of status period plus the 50.4 ms worst
+control-cycle gap in the recorded machine data is 180 ms, and 300 ms clears it.
+
+`mpc_node` names the node a profile composed the horizon producer under, and is
+the one name in this package that reaches a *node* rather than a topic or a
+service.  Empty is admissible and means this deployment composes no producer;
+`validate()` then refuses a configuration that gives `MODE_MPC` controllers
+anyway, because the claim would move to a path whose producer publishes
+nothing.
+
 `mode_controllers` and `tool_controllers` are names and not types, because the
 architecture fixes the four modes and a profile fixes what implements them and
 under which names the manager loaded them.  `follow` is the pair the `fake` and
-`hardware` profiles spawn, in the cascade's activation order (PRD §5).  `manual`
-and `mpc` are left unset and each for its own reason: no CBS profile composes a
-manual controller, so `MODE_MANUAL` is a mode this deployment does not implement
-and the request is refused with that as the reason; `MODE_MPC` is refused by the
-freshness check before any list is consulted.  `tool_controllers` is empty
-because this composition has one claim — see *Two claims, not one machine*.
-`validate()` refuses lists that overlap, a controller shared with the tool claim,
-and any controller under `idle`.
+`hardware` profiles spawn, in the cascade's activation order (PRD §5).  `mpc` is that
+pair without the trajectory controller, because PRD §10 step 3 puts the same
+inner loop on both paths.  `manual` is left unset and that is the honest state:
+no CBS profile composes a manual controller, so `MODE_MANUAL` is a mode this
+deployment does not implement and the request is refused with that as the reason.
+`tool_controllers` is empty because this composition has one claim — see *Two
+claims, not one machine*.  `validate()` refuses two modes that name the *same
+set* of controllers, a name repeated within one list, a controller shared with
+the tool claim, any controller under `idle`, and a `MODE_MPC` that is implemented
+with no producer named.  It no longer refuses lists that merely overlap: that
+rule was right while `mpc` was empty and became wrong the moment it was
+populated — see *What is reported is what is active*.
 
 `sway.dq_u_max`, `sway.dq_u_settled`, `sway.settled_release_factor` and
 `sway.settle_dwell` are the sway duty's bounds, and **every one of them is a
@@ -714,11 +848,12 @@ absolute and this package may not rely on a namespace.
 
 `/crane/velocity_controller/health` needs no remap: `crane_velocity_controller`
 creates the publisher with that absolute name itself, and ROS 2 Interfaces §4
-carries the row.
+carries the row.  Nor does `/crane/mpc/solver_health`: `crane_mpc` publishes on
+the absolute contract name, and both profiles compose it.
 
-**Two things are owed outside this package** and neither is in it: ROS 2
-Interfaces §4 has no row for `/crane/controller_state` yet, and no profile
-supplies the remap or passes `tracking_tolerance.yaml` to this node.  Until they
-land the supervisor reports `FAULT_STATE_HEALTH` for a controller state that
-never arrives, which is the honest reading of the situation and not a defect in
-this package.
+The `mode` this node moves on `crane_mpc` is the other half of the composition
+and is owed by the profile as well: `mpc_node` has to name the node the producer
+was loaded under, and nothing else composed beside it may hold a parameter client
+on that node.  `crane_bringup`'s launch contract asserts both, because "which
+path is live is the supervisor's decision **alone**" is a claim about the whole
+running system and no single package can make it.

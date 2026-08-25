@@ -18,34 +18,48 @@
 // supplementary and one-directional, so what arrives here is consumed and
 // reported and never acted on.
 //
-// **Since issue 026 there is exactly one exception, and it is named.** This node
-// holds two clients on the controller manager -- `list_controllers`, to re-derive
-// what is active, and `switch_controller`, to perform a mode change somebody
-// asked for on `/crane/set_mode`. ROS 2 Interfaces §5 puts that client here
-// deliberately: mode changes go **through the supervisor**, not from the
+// **Since issue 026 there are exceptions, they are counted, and each is named.**
+// This node holds two clients on the controller manager -- `list_controllers`,
+// to re-derive what is active, and `switch_controller`, to perform a mode change
+// somebody asked for on `/crane/set_mode`. ROS 2 Interfaces §5 puts that client
+// here deliberately: mode changes go **through the supervisor**, not from the
 // behaviour tree, and a stack in which two elements can switch controllers has
 // no arbiter at all. The guard test was updated rather than deleted -- it names
-// those two service types and no others, and every other identifier that could
+// those service types and no others, and every other identifier that could
 // reach a command interface is still banned -- so the exception is a line
 // somebody wrote down rather than a hole that opened.
 //
-// The exception is narrow in a way worth stating: a switch decides *which
-// controller holds the claim*, and no message this node sends carries a
-// setpoint, a velocity, a trajectory or a goal. Releasing a claim is not a stop
-// either, and the report on a `MODE_IDLE` switch says so -- §7.2 measured that a
-// manual controller which deactivates leaves its last velocity latched on the
-// interface it just released, so a claim released is not a machine at rest.
+// **Issue 054 added a third, on the same terms.** ROS 2 Interfaces §4's "One
+// command path" ends by saying that which of the two producers is live is the
+// supervisor's decision *alone* and that the two never drive at once. Issue 053
+// made that a state of `crane_mpc` -- `shadow`, in which it solves at rate and
+// publishes nothing at all on `/crane/mpc/horizon`, and `active`, in which the
+// same solve reaches the velocity controller -- and left the transition
+// deliberately undriven, as a parameter that is *not* read-only precisely so
+// that this node could move it. So there is one `rcl_interfaces/SetParameters`
+// client, on the node a profile composed the producer under, and the only
+// parameter it ever carries is that producer's `mode`.
 //
-// # Why the two clients live in a callback group of their own
+// The exceptions are narrow in a way worth stating: a switch decides *which
+// controller holds the claim*, the parameter call decides *which producer may
+// publish*, and no message this node sends carries a setpoint, a velocity, a
+// trajectory or a goal. Releasing a claim is not a stop either, and the report
+// on a `MODE_IDLE` switch says so -- §7.2 measured that a manual controller
+// which deactivates leaves its last velocity latched on the interface it just
+// released, so a claim released is not a machine at rest.
+//
+// # Why the three clients live in a callback group of their own
 //
 // `switch_controller` blocks until the controller manager performs the switch in
 // its own control cycle, and the `/crane/set_mode` handler cannot answer until
 // it knows the outcome. A client called from inside a service callback on the
 // same single-threaded executor would wait for a response that executor is busy
-// not processing, which is a deadlock rather than a timeout.
+// not processing, which is a deadlock rather than a timeout. The producer's
+// parameter call is blocking for the same reason and is made from the same
+// handler.
 //
-// So the two clients are created in a `MutuallyExclusive` callback group that is
-// **not** added to the executor with the node, and this node owns a private
+// So the three clients are created in a `MutuallyExclusive` callback group that
+// is **not** added to the executor with the node, and this node owns a private
 // executor that holds only that group. The outer executor never sees the
 // clients; the private one is spun in two ways and two only -- `spin_some()` on
 // the status cycle, which is non-blocking and is how the polled snapshot is
@@ -53,6 +67,35 @@
 // handler, which is the blocking call the handler exists to make. Both run on
 // the outer executor's thread, so the private executor is never spun from two
 // threads and the node still needs no lock.
+//
+// # One handover, in order, and why the order is not symmetric
+//
+// PRD §10 sequences the change into and out of the MPC path, and
+// `/crane/set_mode` performs it in that order rather than in a convenient one:
+//
+//   1. **Freshness first, before anything is asked of the controller manager.**
+//      `mpc_horizon_refusal()` is evaluated on the observation this node
+//      already holds, *before* `refresh_controller_manager()` is called at all,
+//      so a switch into a dead MPC is refused from the mode the machine is
+//      already in and never discovered half-way through one (user story 35).
+//      `arbitrate_mode()` runs the same function again at precondition 2, so
+//      the early answer and the arbitration cannot disagree.
+//   2. **Into `MODE_MPC`, the producer goes active *before* the claim moves.**
+//      The MPC then publishes horizons while the trajectory controller is still
+//      chained, which cannot steal the command, and the velocity controller has
+//      a fitted spline in hand at the instant the follower lets go. The other
+//      order would leave the inner loop unchained with no horizon for as long as
+//      the switch takes, and an unchained loop with no horizon ramps its command
+//      to zero and raises `FAULT_REFERENCE_STALE` -- a hole in the handover
+//      rather than a seam.
+//   3. **Out of `MODE_MPC`, the producer goes back to shadow *after*.** The same
+//      argument read the other way.
+//
+// The producer is therefore active across the union of the two intervals rather
+// than across either one exactly, and what settles it afterwards is the mode
+// **read back** off the manager rather than the one that was asked for. A switch
+// that failed in either direction therefore leaves the producer where the claim
+// actually is, not where the request wanted it to be.
 //
 // # The mode is polled, and the poll is not an `Input`
 //
@@ -99,12 +142,14 @@
 #include "controller_manager_msgs/srv/list_controllers.hpp"
 #include "controller_manager_msgs/srv/switch_controller.hpp"
 #include "crane_msgs/msg/pendulum_state.hpp"
+#include "crane_msgs/msg/solver_health.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
 #include "crane_msgs/msg/sway_settled.hpp"
 #include "crane_msgs/msg/velocity_controller_health.hpp"
 #include "crane_msgs/srv/set_mode.hpp"
 #include "crane_supervisor/supervisor_core.hpp"
 #include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
+#include "rcl_interfaces/srv/set_parameters.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "std_srvs/srv/trigger.hpp"
 
@@ -147,6 +192,36 @@ inline constexpr double kStatusRate = 20.0;
 inline constexpr char kListControllersService[] = "/controller_manager/list_controllers";
 inline constexpr char kSwitchControllerService[] = "/controller_manager/switch_controller";
 
+/// The horizon producer's own status stream, and the evidence PRD §10 step 2
+/// is verified against.
+/**
+ * A contract name of ROS 2 Interfaces §4 and therefore absolute, like every
+ * other name here. It is **not** an alias of a policy row, because this stream
+ * is deliberately not an `Input` -- `HorizonReport` in the core says why, and
+ * why the evidence is the solve rather than `/crane/mpc/horizon` itself.
+ */
+inline constexpr char kSolverHealthTopic[] = "/crane/mpc/solver_health";
+
+/// How this node moves the horizon producer between shadow and active.
+/**
+ * The parameter's name and its two values are `crane_mpc`'s contract and not
+ * this node's setting, so they are constants; the *node* the producer was
+ * loaded under is a profile's decision and is `SupervisorConfig::mpc_node`.
+ * `crane_mpc`'s own declaration validates the string against exactly these two,
+ * so a third value would be refused by the producer rather than accepted and
+ * quietly ignored.
+ *
+ * The service name is composed from the configured node name at construction
+ * and is the one ROS name in this package that is not written out whole. Every
+ * other one is a cross-node contract of ROS 2 Interfaces §1 and is absolute;
+ * this one is a node's own parameter service, and which node that is is exactly
+ * what a profile decides.
+ */
+inline constexpr char kSetParametersSuffix[] = "/set_parameters";
+inline constexpr char kHorizonProducerModeParameter[] = "mode";
+inline constexpr char kHorizonProducerActive[] = "active";
+inline constexpr char kHorizonProducerShadow[] = "shadow";
+
 /// How long a *blocking* call on the controller manager may take, s.
 /**
  * Budgets and not contracts, so they are constants with a reason rather than
@@ -183,6 +258,19 @@ inline constexpr char kSwitchControllerService[] = "/controller_manager/switch_c
 inline constexpr double kControllerManagerCallBudget = 0.5;
 inline constexpr double kSwitchControllerTimeout = 1.0;
 inline constexpr double kSwitchBudget = 3.0;
+
+/// How long the horizon producer may take to answer a `set_parameters`, s.
+/**
+ * A budget and not a contract, for the reason the three above are. It is the
+ * same number as `kControllerManagerCallBudget` and for the same reason: the
+ * call is a local service round trip that normally returns in a millisecond,
+ * and the number bounds a failure rather than a success. A producer that will
+ * not answer must not hold the one service an operator uses to get out of a
+ * mode, and the answer to a call that times out is not "assume it worked" --
+ * the report says the claim and the producer disagree, which is the state ROS 2
+ * Interfaces §4 forbids and therefore the state worth naming.
+ */
+inline constexpr double kProducerModeBudget = 0.5;
 
 /// The four input contract names, off the policy rows that already carry them.
 /**
@@ -323,6 +411,21 @@ private:
     const std::vector<std::string> & activate, const std::vector<std::string> & deactivate,
     std::string & account);
 
+  /// Puts the horizon producer into `active` or into `shadow`, and reports it.
+  /**
+   * One `rcl_interfaces/SetParameters` call carrying one parameter. It never
+   * returns "assume it worked": a producer that refused, that answered nothing,
+   * or that nothing is serving is reported in `ProducerSwitch::account`, so a
+   * claim that moved while the producer did not is named on the response rather
+   * than inferred later from a horizon that never arrives.
+   *
+   * A deployment that names no producer -- `mpc_node` empty, which `validate()`
+   * allows only when `MODE_MPC` has no controllers either -- is not a failure
+   * and makes no call: `attempted` stays false and the report says nothing
+   * about a producer this composition does not have.
+   */
+  ProducerSwitch set_horizon_producer_mode(bool active);
+
   SupervisorConfig config_;
   /// Which inputs a subscription was created for, indexed by `Input`. Checked
   /// once, at construction: an enumerator with no subscription behind it is an
@@ -347,6 +450,14 @@ private:
   /// an uncommissioned axis reported to nobody is the state this input exists
   /// to end.
   crane_msgs::msg::VelocityControllerHealth::ConstSharedPtr controller_health_;
+  /// The newest message on `/crane/mpc/solver_health`, or null before the first
+  /// one. Held for the reason the four above are, and read in exactly one
+  /// place: PRD §10 step 2's precondition on a switch into `MODE_MPC`. It is
+  /// **not** an `Input` and raises no fault of its own -- an optimizer that is
+  /// quiet while the machine is in `MODE_FOLLOW` is the ordinary state of this
+  /// stack, and ROS 2 Interfaces §4 makes merging `FAULT_SOLVER` onto the status
+  /// stream a slice of its own.
+  crane_msgs::msg::SolverHealth::ConstSharedPtr solver_health_;
   /// The emergency-stop latch, carried from one decision into the next. Raised
   /// by `decide()`, lowered only by an acknowledged `/crane/clear_fault`.
   bool estop_latched_{false};
@@ -371,6 +482,18 @@ private:
     controller_state_subscription_;
   rclcpp::Subscription<crane_msgs::msg::VelocityControllerHealth>::SharedPtr
     controller_health_subscription_;
+  /// The horizon producer's own stream, and the **only** subscription in this
+  /// package that does not go through `subscribe()`.
+  /**
+   * That helper takes an `Input`, and an `Input` is by definition a stream whose
+   * absence raises a fault on the status. This one's must not, so it cannot be
+   * an enumerator and therefore cannot go through the helper. Both static
+   * guards were updated to *name* the exception rather than relaxed --
+   * `test_every_input_has_a_deadline.py` and `test_no_command_path.py` each
+   * pin the two call sites and the two types, so a third subscription is still
+   * a line somebody has to write in a test.
+   */
+  rclcpp::Subscription<crane_msgs::msg::SolverHealth>::SharedPtr solver_health_subscription_;
   /// The newest `list_controllers` answer, or null before the first one.
   /**
    * Held rather than consumed, for the reason every input above is: the gap
@@ -406,19 +529,28 @@ private:
   rclcpp::Service<crane_msgs::srv::SetMode>::SharedPtr set_mode_service_;
   rclcpp::TimerBase::SharedPtr status_timer_;
 
-  /// The one exception to "no path to a motion command", kept apart from
+  /// The exceptions to "no path to a motion command", kept apart from
   /// everything else this node holds.
   /**
    * The group is created with `automatically_add_to_executor_with_node` false,
    * so `rclcpp::spin(node)` in `crane_supervisor_main.cpp` never sees it and the
-   * private executor below is the only thing that ever serves these two
+   * private executor below is the only thing that ever serves these three
    * clients. That is what lets the `/crane/set_mode` handler make a blocking
    * call without deadlocking the executor it is running on.
+   *
+   * It is named for the *shape* of what it holds rather than for the controller
+   * manager, because since issue 054 one of the three is on `crane_mpc`: what
+   * these have in common is that each is a blocking call on another process
+   * made from inside a service callback.
    */
-  rclcpp::CallbackGroup::SharedPtr controller_manager_group_;
-  rclcpp::executors::SingleThreadedExecutor::SharedPtr controller_manager_executor_;
+  rclcpp::CallbackGroup::SharedPtr remote_call_group_;
+  rclcpp::executors::SingleThreadedExecutor::SharedPtr remote_call_executor_;
   rclcpp::Client<controller_manager_msgs::srv::ListControllers>::SharedPtr list_controllers_;
   rclcpp::Client<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_controller_;
+  /// The third client, on the node `mpc_node` names. Null when a deployment
+  /// composes no horizon producer, which is a composition with no `MODE_MPC`
+  /// rather than a misconfiguration.
+  rclcpp::Client<rcl_interfaces::srv::SetParameters>::SharedPtr set_horizon_producer_mode_;
 };
 
 }  // namespace crane_supervisor

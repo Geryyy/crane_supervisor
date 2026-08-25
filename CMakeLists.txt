@@ -7,6 +7,7 @@ find_package(controller_manager_msgs REQUIRED)
 find_package(crane_msgs REQUIRED)
 find_package(epsilon_crane_msgs REQUIRED)
 find_package(generate_parameter_library REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_srvs REQUIRED)
 
@@ -46,6 +47,7 @@ target_link_libraries(supervisor_node
     ${controller_manager_msgs_TARGETS}
     ${crane_msgs_TARGETS}
     ${epsilon_crane_msgs_TARGETS}
+    ${rcl_interfaces_TARGETS}
     ${std_srvs_TARGETS}
   PRIVATE
     crane_supervisor_parameters)
@@ -74,7 +76,8 @@ ament_export_include_directories(include)
 # publisher on a contract stream that has exactly one.
 ament_export_libraries(supervisor_core)
 ament_export_dependencies(
-  control_msgs controller_manager_msgs crane_msgs epsilon_crane_msgs rclcpp std_srvs)
+  control_msgs controller_manager_msgs crane_msgs epsilon_crane_msgs rcl_interfaces rclcpp
+  std_srvs)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -139,9 +142,26 @@ if(BUILD_TESTING)
   target_compile_definitions(test_mode_switch PRIVATE
     CRANE_SUPERVISOR_TEST_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/config")
 
+  # PRD §10's sequence, against a controller manager that can be *watched*: the
+  # spy counts every switch call, so "the switch was never issued" and "the
+  # switch was issued and refused" are two observations here rather than one.
+  # It is also where the freshness check's position is proven dynamically --
+  # with no manager on the graph at all, the refusal still names the horizon --
+  # and where the producer's shadow/active transition and its ordering are
+  # asserted. Its own stepped domain, because colcon runs it beside the two
+  # binaries above.
+  ament_add_gtest(test_handover_sequence test/test_handover_sequence.cpp TIMEOUT 300)
+  target_link_libraries(test_handover_sequence
+    supervisor_node
+    ${controller_manager_msgs_TARGETS}
+    ${crane_msgs_TARGETS}
+    ${epsilon_crane_msgs_TARGETS}
+    ${rcl_interfaces_TARGETS}
+    ${std_srvs_TARGETS})
+
   # The absence that is the feature: no publisher on a command topic, and no
-  # reach beyond the two controller-manager services ROS 2 Interfaces §5 puts
-  # here on purpose.
+  # reach beyond the controller-manager services ROS 2 Interfaces §5 puts
+  # here on purpose, and the one parameter call ROS 2 Interfaces §4 does.
   ament_add_pytest_test(test_no_command_path test/test_no_command_path.py)
 
   # The other absence that is a feature: this package keeps no copy of the one

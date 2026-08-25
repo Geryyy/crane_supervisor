@@ -42,6 +42,36 @@
 // rest, because §7.2's measured defect leaves a manual controller's last
 // velocity latched on the interface it just released.
 //
+// # The handover, and why step 2 is first
+//
+// Since issue 054 `MODE_MPC` is a mode this deployment implements, and PRD §10
+// sequences the change into it in four steps. Two of them are this file's:
+//
+//   step 2  the horizon's freshness is verified **before** the trajectory
+//           controller is deactivated. `mpc_horizon_refusal()` is that check,
+//           and it is a free function rather than a branch buried in
+//           `arbitrate_mode()` because the node runs it *before it asks the
+//           controller manager for anything at all* -- so a switch into a dead
+//           MPC is refused from the mode the machine is already in, not
+//           discovered half-way through one (user story 35). The refusal names
+//           freshness, the age, the deadline and what the newest solve said,
+//           because an operator left with an unexplained no-op is user story
+//           36's failure.
+//   the mode of the producer  which path is live is this supervisor's decision
+//           alone (ROS 2 Interfaces §4, "One command path"), so the switch also
+//           moves `crane_mpc` between the shadow and active states issue 053
+//           built. `ModeArbitration::horizon_producer_active` carries that half
+//           of the plan and `ProducerSwitch` carries its outcome.
+//
+// Steps 3 and 4 are **not** here and are not this package's at all. The seam
+// clamp and the setpoint the re-entering trajectory is anchored on live in
+// `crane_control`, where the command is, and the reason they need no supervisor
+// is PRD §10 step 3's own: the same `crane_velocity_controller` instance runs
+// both paths, so a mode change deactivates the trajectory controller and leaves
+// the inner loop exactly where it was. That is why `MODE_MPC`'s controller list
+// overlaps `MODE_FOLLOW`'s rather than replacing it, and why the plan below
+// never deactivates a controller the incoming mode also wants.
+//
 // # Claims, plural, and why the model is not one per machine
 //
 // §7.3 is the trap this model is shaped around. With the block gripper the tool
@@ -354,6 +384,27 @@ inline constexpr std::size_t kInputCount = static_cast<std::size_t>(Input::Count
   return static_cast<std::size_t>(input);
 }
 
+/// What the horizon producer's newest solve did, numbered as the wire numbers it.
+/**
+ * The four `SOLVE_*` constants of `crane_msgs/SolverHealth`, in that message's
+ * own numbering, so the adapter is a cast and not a table and
+ * `test_contract.cpp` asserts each pair. Zero is **unknown** and not a healthy
+ * solve, deliberately and for the reason `SwaySettled`'s zero is unknown: a
+ * message nobody filled must not read as an optimizer that converged, and
+ * `Converged` is the only value PRD §10 step 1's "the MPC runs warm before the
+ * switch" is satisfied by.
+ */
+enum class SolveOutcome : std::uint8_t
+{
+  Unknown = 0,
+  Converged = 1,
+  BudgetExceeded = 2,
+  Failed = 3,
+};
+
+/// The outcome as an operator reads it off a panel.
+[[nodiscard]] const char * solve_outcome_name(SolveOutcome outcome) noexcept;
+
 /// Which staleness cause fired on one input this cycle.
 /**
  * The three causes wiki/control_architecture.md §5.3 now lists -- flag, age and
@@ -550,6 +601,36 @@ struct SupervisorConfig
    */
   double controller_manager_deadline{0.0};
 
+  /// How old the horizon producer's newest report may be and still say it
+  /// solves, s.
+  /**
+   * PRD §10 step 2's whole margin, and the only thing this supervisor decides
+   * about the MPC. Zero for the reason every other deadline here is zero:
+   * `validate()` refuses it and the node throws rather than admitting a switch
+   * into a producer it cannot date. It is separate from the array above because
+   * this stream is **not** an `Input` -- see `HorizonReport` for why, and for
+   * what §5.3's rule looks like for something whose absence is a refused
+   * request rather than a fault on the status.
+   */
+  double horizon_deadline{0.0};
+
+  /// The node the horizon producer was loaded under, whose mode this
+  /// supervisor drives.
+  /**
+   * Configuration for the reason `mode_controllers` is: ROS 2 Interfaces §4
+   * fixes that which path is live is the supervisor's decision alone, and a
+   * profile fixes which node implements the MPC path and under what name. The
+   * `crane_mpc` node's `mode` parameter is what that decision moves (issue
+   * 053), and this is the only name in this package that reaches a node rather
+   * than a topic or a service of the architecture's own.
+   *
+   * Empty is admissible only on a deployment that does not implement
+   * `MODE_MPC`: `validate()` refuses a configuration that gives `MODE_MPC`
+   * controllers and names no producer, because the claim would then move to a
+   * path whose producer nothing ever started.
+   */
+  std::string mpc_node;
+
   /// Which controllers hold the **arm claim** in each mode, indexed by `Mode`.
   /**
    * The names a deployment loaded its controllers under, so this is
@@ -561,14 +642,19 @@ struct SupervisorConfig
    * An empty list for a *motion* mode is not an error either: it is the honest
    * state of a deployment that composes no controller for it, and the request
    * is refused with that as the reason. `MODE_MANUAL` is empty on today's
-   * profiles for exactly that reason, and `MODE_MPC` is empty because its
-   * producer does not exist until slice 6.
+   * profiles for exactly that reason.
    *
-   * The non-empty lists must be **pairwise disjoint**, which `validate()`
-   * enforces. That is not tidiness: `active_mode()` reads the machine by asking
-   * which mode's controllers are all active, so a list that were a subset of
-   * another's would make two modes read as active at once and the answer would
-   * depend on the order this file happened to check them in.
+   * **`MODE_FOLLOW` and `MODE_MPC` overlap, and that overlap is the
+   * architecture.** PRD §10 step 3 is explicit that the same
+   * `crane_velocity_controller` instance carries both paths -- "so the handover
+   * is an ordinary seam, not new machinery" -- so `MODE_MPC`'s list is
+   * `MODE_FOLLOW`'s without the trajectory controller, and a mode switch
+   * between them neither activates nor deactivates the inner loop. What
+   * `validate()` enforces is therefore **not** disjointness, which would
+   * outlaw exactly that: it is that no two modes name the *same set*, because
+   * `active_mode()` matches the active controllers against each mode's set by
+   * equality, and two identical sets would make two modes read as active at
+   * once.
    */
   std::array<std::vector<std::string>, kModeCount> mode_controllers;
 
@@ -719,6 +805,61 @@ struct ControllerManagerReport
   std::vector<ControllerReport> controllers;
 };
 
+/// What the horizon producer last said about itself, and how old that is.
+/**
+ * PRD §10 step 2's evidence, and the second thing this supervisor watches that
+ * is deliberately **not** an `Input`. The registry above is the enum of the
+ * inputs whose absence raises a fault on the status stream, and this one's
+ * absence must not: a stack in `MODE_FOLLOW` with no optimizer running is the
+ * ordinary state of this machine, not a defect, and
+ * wiki/implementation/ros2_interfaces.md §4 records outright that the
+ * supervisor merging `FAULT_SOLVER` onto `/crane/supervisor/status` is a slice
+ * of its own. A row in `kInputPolicies` would make it a standing fault on every
+ * profile the day it was added.
+ *
+ * §5.3's rule is met and it is met the way `ControllerManagerReport` meets it:
+ * the consequence of this stream stopping is **defined, narrow and stated at
+ * the point it matters** -- no freshness, no switch. `arbitrate_mode()` refuses
+ * `MODE_MPC` and says how old the newest report is and what the deadline was,
+ * so an absent optimizer is a refusal an operator reads rather than a switch
+ * somebody discovers half-way through (user stories 35 and 36).
+ *
+ * **It is `/crane/mpc/solver_health` and not `/crane/mpc/horizon`, and the
+ * substitution is forced rather than chosen.** In shadow -- which is the state
+ * every switch into `MODE_MPC` is made *from* -- `crane_mpc` publishes nothing
+ * at all on the contract topic (issue 053), so a freshness check against the
+ * horizon itself could never pass and `MODE_MPC` would be unreachable by
+ * construction. `solver_health` runs in both modes, carries the solve's own
+ * three-valued verdict, and names the mode, which is exactly what PRD §10 step
+ * 1 means by "the MPC runs warm before the switch; shadow mode already implies
+ * it solves". It also keeps this package clear of `trajectory_msgs`, the
+ * package a *commanded* trajectory is typed with, which
+ * `test_no_command_path.py` bans outright.
+ */
+struct HorizonReport
+{
+  /// The transport half, judged by the same `freshness_of()` every input is.
+  StreamReport health;
+  /// `crane_msgs/SolverHealth.outcome`, in the numbering the wire and the enum
+  /// share.
+  SolveOutcome outcome{SolveOutcome::Unknown};
+  /// `crane_msgs/SolverHealth.fault`, carried and not translated, exactly as
+  /// the inner loop's is. `FAULT_SOLVER` is the only code this producer raises.
+  Fault fault{Fault::None};
+  /// `solve_time` and `solve_budget`, s. Reported in the refusal so that a
+  /// producer that is losing its deadline says so in the sentence that refuses
+  /// the switch rather than only in its own stream.
+  double solve_time{0.0};
+  double solve_budget{0.0};
+  /// `applied_previous_solution`: the shifted previous horizon went out instead
+  /// of this solve (wiki/mpc.md §6, requirement 3).
+  bool applied_previous_solution{false};
+  /// `crane_msgs/SolverHealth.message`, verbatim. The producer's own account of
+  /// what it did, carried rather than restated, for the reason
+  /// `PendulumStateReport::status` is.
+  std::string status;
+};
+
 /// What `/crane/pendulum_state` said about itself this cycle.
 /**
  * The payload half. `pendulum_state_broadcaster` separates six causes behind
@@ -849,6 +990,15 @@ struct SupervisorInput
    * question "is this old enough to stop believing" is the same question.
    */
   ControllerManagerReport controller_manager;
+
+  /// What the horizon producer last said about itself.
+  /**
+   * Not one of the `streams` above and not a fault of its own: the whole of
+   * what it decides is whether `MODE_MPC` may be entered. `HorizonReport` says
+   * why that is the right shape and why the evidence is the solve rather than
+   * the horizon.
+   */
+  HorizonReport horizon;
 
   /// The emergency-stop latch as the previous cycle left it.
   /**
@@ -1153,19 +1303,119 @@ struct ModeArbitration
   /// response carries when the request is refused, because a refusal leaves the
   /// machine in the mode it was already in.
   ActiveMode active;
+  /// Which mode the horizon producer has to be in once this plan is carried
+  /// out: `true` is `active`, `false` is `shadow`.
+  /**
+   * True for `MODE_MPC` and false for every other mode, so it is not an extra
+   * decision -- it is the same decision, read on the producer's side of the
+   * seam. ROS 2 Interfaces §4's "One command path" ends by saying that which
+   * path is live is the supervisor's decision **alone** and that the two never
+   * drive at once, and this field is where that sentence becomes a call: issue
+   * 053 made shadow a state of `crane_mpc` and left the transition to be driven
+   * from here.
+   *
+   * **The order is not symmetric, and it cannot be.** Entering `MODE_MPC` the
+   * producer is put into `active` *before* the claim moves, so that a horizon
+   * is already fitted when the trajectory controller lets go -- an unchained
+   * velocity controller with no horizon ramps its command to zero and raises
+   * `FAULT_REFERENCE_STALE`, which is a hole in the handover rather than a
+   * seam. Leaving it the producer is put back into `shadow` *after* the claim
+   * has moved, for the same reason read the other way. `supervisor_node.hpp`
+   * carries the sequence.
+   */
+  bool horizon_producer_active{false};
   /// Why, in words an operator can act on. Never empty.
   std::string message;
 };
 
+/// What this supervisor did to the horizon producer as part of one switch.
+/**
+ * Reported rather than assumed, exactly as `active_mode` on the response is:
+ * `crane_mpc`'s `mode` is a parameter of a node in another process, and a
+ * `set_parameters` call can be refused, time out, or find nobody there. A
+ * switch whose claim moved and whose producer did not is the state ROS 2
+ * Interfaces §4 forbids, so it is named in the report instead of being left for
+ * somebody to infer from a silent horizon.
+ */
+struct ProducerSwitch
+{
+  /// Whether a call was made at all. False on every request that was refused,
+  /// and on a deployment that names no producer.
+  bool attempted{false};
+  /// Which mode was asked for: `true` is `active`.
+  bool active{false};
+  /// Whether the producer accepted it.
+  bool accepted{false};
+  /// The producer's own reason when it refused, or this node's when the call
+  /// never went out. Empty when nothing was attempted.
+  std::string account;
+};
+
 /// What the controller manager's answer says is active.
 /**
- * A mode is active when **every** controller configured for it is active. That
- * is why `validate()` insists the mode lists be pairwise disjoint: with nested
- * lists two modes could satisfy the test at once and the answer would be
- * whichever this function looked at first.
+ * A mode is active when the controllers of the arm claim that are up are
+ * **exactly** the ones configured for it -- equality of sets, not containment.
+ *
+ * Containment was the rule until slice 6 and it stopped being sound the moment
+ * `MODE_MPC` was populated. PRD §10 step 3 puts the *same*
+ * `crane_velocity_controller` instance on both paths, so `MODE_MPC`'s list is
+ * `MODE_FOLLOW`'s minus the trajectory controller: under containment,
+ * `MODE_FOLLOW` holding the claim would satisfy `MODE_MPC` as well and the
+ * answer would be whichever list this function happened to look at first, while
+ * `MODE_MPC` holding it would leave `MODE_FOLLOW` half up and read as drift.
+ * Under equality both are answered exactly, and what `validate()` has to insist
+ * on is only that no two modes name the same *set*.
  */
 [[nodiscard]] ActiveMode active_mode(
   const SupervisorConfig & config, const ControllerManagerReport & report);
+
+/// Whether PRD §10 step 2's precondition holds, and which cause fired if not.
+/**
+ * Two questions and both have to answer yes. The report has to be **fresh** --
+ * judged by the same `freshness_of()` every stream here is judged by, against
+ * `horizon_deadline` -- and the newest solve has to have **converged**.
+ *
+ * The second is not redundant with the first and it is the half PRD §10 step 1
+ * is about: a producer that is alive, publishing at rate and failing every
+ * solve is precisely the dead MPC user story 35 refuses to switch into, and it
+ * is indistinguishable from a healthy one on freshness alone. `BudgetExceeded`
+ * is refused with it, and deliberately: wiki/control_architecture.md §5 row 3
+ * gives `FAULT_SOLVER` to a deadline miss and to non-convergence alike, and
+ * "the MPC runs warm before the switch" is not satisfied by an optimizer that
+ * is only keeping up by shipping the horizon it shifted last cycle. A refusal
+ * costs an operator one more request; entering on a plan with nothing behind it
+ * costs a handover.
+ */
+struct HorizonPrecondition
+{
+  /// True when the producer is arriving inside its deadline **and** its newest
+  /// solve converged.
+  bool fresh{false};
+  /// Which staleness cause fired, judged the way every stream is. `Fresh` here
+  /// with `fresh` false means the stream is fine and the *solve* is not.
+  Staleness cause{Staleness::NeverArrived};
+};
+
+[[nodiscard]] HorizonPrecondition horizon_precondition(
+  const SupervisorConfig & config, const HorizonReport & report) noexcept;
+
+/// PRD §10 step 2, on its own and ahead of everything else.
+/**
+ * Empty when nothing about the horizon refuses `requested`: when the request is
+ * not `MODE_MPC` at all, or when `horizon_precondition()` holds. Otherwise the
+ * whole refusal, ready to be a `message` -- it names freshness as the cause,
+ * how old the producer's newest report is, what the deadline was, what the
+ * solve said, and that nothing was deactivated.
+ *
+ * It is exported rather than left inside `arbitrate_mode()` because **the order
+ * is the assertion**. `SupervisorNode::set_mode()` runs it before it asks the
+ * controller manager for anything at all -- before the poll, let alone before
+ * the switch -- and `arbitrate_mode()` runs it again at precondition 2. Two
+ * call sites, one function, so the early answer and the arbitration cannot
+ * disagree about what was verified or when.
+ */
+[[nodiscard]] std::string mpc_horizon_refusal(
+  const SupervisorConfig & config, std::uint8_t requested, const SupervisorInput & input);
 
 /// The mode clause, for the end of any report. Never empty.
 [[nodiscard]] std::string mode_clause(const SupervisorConfig & config, const ActiveMode & active);
@@ -1178,8 +1428,11 @@ struct ModeArbitration
  * and is never discovered half-way (PRD §10 step 2, user story 35). In order:
  *
  *   1. the request names one of the four modes;
- *   2. `MODE_MPC` is refused -- the horizon freshness of PRD §10 step 2 cannot
- *      be verified because no producer exists until slice 6;
+ *   2. **the horizon is fresh** (PRD §10 step 2, user story 35). Above the
+ *      view, above the latch and above every deployment question, because it
+ *      depends on none of them and because the node runs the same check before
+ *      it asks the controller manager for anything at all -- so a switch into a
+ *      dead MPC is refused rather than discovered;
  *   3. the controller manager has answered inside its deadline, since a
  *      precondition cannot be checked against a view this supervisor does not
  *      have;
@@ -1204,11 +1457,15 @@ struct ModeArbitration
  * reads is written once, beside the arbitration that produced the plan.
  * `reached` is the mode the controller manager reports **after** the call --
  * `active_mode` on the response is what is actually active, never what was
- * asked for.
+ * asked for. `producer` is what happened to the horizon producer's own mode,
+ * reported for the same reason and never assumed: a claim that moved and a
+ * producer that did not is the state ROS 2 Interfaces §4 forbids, and the
+ * report has to be able to say so.
  */
 [[nodiscard]] std::string mode_switch_message(
   const SupervisorConfig & config, Mode requested, const ModeArbitration & arbitration,
-  bool switched, const std::string & carried, const ActiveMode & reached);
+  bool switched, const std::string & carried, const ActiveMode & reached,
+  const ProducerSwitch & producer);
 
 }  // namespace crane_supervisor
 

@@ -12,6 +12,8 @@
 #include <vector>
 
 #include "crane_supervisor/crane_supervisor_parameters.hpp"
+#include "rcl_interfaces/msg/parameter.hpp"
+#include "rcl_interfaces/msg/parameter_type.hpp"
 
 namespace crane_supervisor
 {
@@ -126,6 +128,11 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   config_.deadline(Input::ControllerState) = parameters.controller_state_timeout;
   config_.deadline(Input::ControllerHealth) = parameters.controller_health_timeout;
   config_.controller_manager_deadline = parameters.controller_manager_timeout;
+  // The horizon producer's margin, and the node whose mode this supervisor
+  // drives. Both are the mode arbitration's and neither is swept on the status
+  // cycle: `HorizonReport` in the core says why this stream is not an `Input`.
+  config_.horizon_deadline = parameters.horizon_timeout;
+  config_.mpc_node = parameters.mpc_node;
   config_.deadman_button = static_cast<int>(parameters.deadman_button);
 
   // Which controller holds the claim in each mode, and which holds the tool
@@ -239,6 +246,21 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
       controller_health_ = std::move(message);
     });
 
+  // The horizon producer's own stream, and the one subscription in this package
+  // that does not go through `subscribe()`. It cannot: that helper takes an
+  // `Input`, and an `Input` is a stream whose absence raises a fault on the
+  // status. This one's must not -- an optimizer that is quiet while the machine
+  // is in MODE_FOLLOW is the ordinary state of this stack, and ROS 2 Interfaces
+  // §4 makes merging FAULT_SOLVER onto the status a slice of its own -- so it is
+  // held to §5.3's rule the way the polled controller-manager view is: a defined
+  // consequence at the point it matters, which is that PRD §10 step 2 refuses
+  // MODE_MPC and says how old the newest report is and what the deadline was.
+  solver_health_subscription_ = create_subscription<crane_msgs::msg::SolverHealth>(
+    kSolverHealthTopic, contract_qos(),
+    [this](crane_msgs::msg::SolverHealth::ConstSharedPtr message) {
+      solver_health_ = std::move(message);
+    });
+
   // The other half of the structural guard. `validate()` refuses an input with
   // no deadline; this refuses one with no subscription, which would otherwise be
   // reported as never having arrived for the lifetime of the process -- a defect
@@ -287,19 +309,28 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
       set_mode(request, response);
     });
 
-  // The one exception to this package's absence of a path to the machine, and
-  // the reason it is safe to have: the group is never added to the executor
-  // that spins this node, so the two clients below are served only by the
-  // private executor, only from the two places that spin it.
-  controller_manager_group_ =
+  // The exceptions to this package's absence of a path to the machine, and the
+  // reason they are safe to have: the group is never added to the executor that
+  // spins this node, so the clients below are served only by the private
+  // executor, only from the two places that spin it.
+  remote_call_group_ =
     create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
-  controller_manager_executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
-  controller_manager_executor_->add_callback_group(
-    controller_manager_group_, get_node_base_interface());
+  remote_call_executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+  remote_call_executor_->add_callback_group(remote_call_group_, get_node_base_interface());
   list_controllers_ = create_client<controller_manager_msgs::srv::ListControllers>(
-    kListControllersService, rmw_qos_profile_services_default, controller_manager_group_);
+    kListControllersService, rmw_qos_profile_services_default, remote_call_group_);
   switch_controller_ = create_client<controller_manager_msgs::srv::SwitchController>(
-    kSwitchControllerService, rmw_qos_profile_services_default, controller_manager_group_);
+    kSwitchControllerService, rmw_qos_profile_services_default, remote_call_group_);
+  // The third, and only on a deployment that named a producer. Which node that
+  // is is a profile's decision, so the service name is composed here rather
+  // than written out; the parameter it carries and the two values it may take
+  // are `crane_mpc`'s own contract and are constants (ROS 2 Interfaces §4, "One
+  // command path": which path is live is this supervisor's decision alone).
+  if (!config_.mpc_node.empty()) {
+    set_horizon_producer_mode_ = create_client<rcl_interfaces::srv::SetParameters>(
+      "/" + config_.mpc_node + kSetParametersSuffix, rmw_qos_profile_services_default,
+      remote_call_group_);
+  }
 
   // The freshness sweep runs from here and from nowhere else. A deadline
   // evaluated in a subscription callback could not fire on the stream that
@@ -315,7 +346,10 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
     "rather than left at FAULT_NONE. Button %d of the remote is the deadman. It serves %s and %s. "
     "The mode it reports is re-derived from %s every cycle and never remembered, and %s is the one "
     "call this package makes that reaches the machine -- narrowly: it decides which controller "
-    "holds the claim and carries no setpoint. It holds no stop authority: the hardware stop input "
+    "holds the claim and carries no setpoint. Beside it, and only on a deployment that names a "
+    "horizon producer, one parameter call moves that producer between shadow and active, because "
+    "which of the two paths is live is this supervisor's decision alone and the two never drive at "
+    "once. It holds no stop authority: the hardware stop input "
     "is an unverified commissioning prerequisite, so releasing a claim on MODE_IDLE is a mode "
     "change somebody asked for and not a way to bring the machine to rest, and what it does with "
     "the emergency stop is diagnosis and recovery rather than protection.",
@@ -402,6 +436,26 @@ SupervisorInput SupervisorNode::observe() const
 
   input.controller_manager = observe_controller_manager();
 
+  // The horizon producer, aged on the same reading of the clock the four inputs
+  // are, against its own deadline rather than any of theirs. It is read here
+  // and consulted in exactly one place -- PRD §10 step 2 -- so a request
+  // arbitrated from this observation is judged against the same producer the
+  // status cycle saw.
+  if (solver_health_) {
+    const auto & message = *solver_health_;
+    input.horizon.health.received = true;
+    input.horizon.health.age = age_of(solver_health_);
+    // A cast and not a lookup table, the way the mode and the fault are: the
+    // core's `SolveOutcome` and the message's `SOLVE_*` constants share one
+    // numbering, and `test_contract.cpp` asserts every pair of them.
+    input.horizon.outcome = static_cast<SolveOutcome>(message.outcome);
+    input.horizon.fault = static_cast<Fault>(message.fault);
+    input.horizon.solve_time = message.solve_time;
+    input.horizon.solve_budget = message.solve_budget;
+    input.horizon.applied_previous_solution = message.applied_previous_solution;
+    input.horizon.status = message.message;
+  }
+
   if (controller_health_) {
     const auto & message = *controller_health_;
     // A cast and not a lookup table: the message and the core's enum share one
@@ -451,7 +505,7 @@ void SupervisorNode::poll_controller_manager()
   // The private group's only non-blocking spin. Anything the two clients have
   // waiting is dispatched here, on the status cycle, on the outer executor's
   // own thread.
-  controller_manager_executor_->spin_some();
+  remote_call_executor_->spin_some();
 
   if (pending_snapshot_.has_value()) {
     if (
@@ -500,7 +554,7 @@ bool SupervisorNode::refresh_controller_manager(double timeout)
   const std::int64_t request_id = pending.request_id;
   auto future = pending.future.share();
   if (
-    controller_manager_executor_->spin_until_future_complete(future, budget(timeout)) !=
+    remote_call_executor_->spin_until_future_complete(future, budget(timeout)) !=
     rclcpp::FutureReturnCode::SUCCESS)
   {
     list_controllers_->remove_pending_request(request_id);
@@ -540,7 +594,7 @@ bool SupervisorNode::switch_controllers(
   const std::int64_t request_id = pending.request_id;
   auto future = pending.future.share();
   if (
-    controller_manager_executor_->spin_until_future_complete(future, budget(kSwitchBudget)) !=
+    remote_call_executor_->spin_until_future_complete(future, budget(kSwitchBudget)) !=
     rclcpp::FutureReturnCode::SUCCESS)
   {
     switch_controller_->remove_pending_request(request_id);
@@ -555,15 +609,92 @@ bool SupervisorNode::switch_controllers(
   return response->ok;
 }
 
+ProducerSwitch SupervisorNode::set_horizon_producer_mode(bool active)
+{
+  ProducerSwitch outcome;
+  outcome.active = active;
+  if (!set_horizon_producer_mode_) {
+    // A composition with no horizon producer. `validate()` has already refused
+    // one that implements MODE_MPC and names none, so this is a deployment
+    // where the mode is unreachable anyway and there is nothing to report.
+    return outcome;
+  }
+  outcome.attempted = true;
+
+  if (!set_horizon_producer_mode_->service_is_ready()) {
+    outcome.account =
+      "the producer's parameter service is not reachable from this node, so its mode was never "
+      "moved -- check that the profile composes it under the name mpc_node gives";
+    return outcome;
+  }
+
+  auto request = std::make_shared<rcl_interfaces::srv::SetParameters::Request>();
+  rcl_interfaces::msg::Parameter parameter;
+  parameter.name = kHorizonProducerModeParameter;
+  parameter.value.type = rcl_interfaces::msg::ParameterType::PARAMETER_STRING;
+  parameter.value.string_value = active ? kHorizonProducerActive : kHorizonProducerShadow;
+  // One parameter and never more. The producer's own declaration validates the
+  // string against its two values, so a third would be refused there rather
+  // than accepted and quietly ignored here.
+  request->parameters.push_back(std::move(parameter));
+
+  auto pending = set_horizon_producer_mode_->async_send_request(request);
+  const std::int64_t request_id = pending.request_id;
+  auto future = pending.future.share();
+  if (
+    remote_call_executor_->spin_until_future_complete(future, budget(kProducerModeBudget)) !=
+    rclcpp::FutureReturnCode::SUCCESS)
+  {
+    set_horizon_producer_mode_->remove_pending_request(request_id);
+    outcome.account =
+      "the call did not come back inside this node's own budget, so which mode the producer is in "
+      "is unknown here";
+    return outcome;
+  }
+
+  const auto answer = future.get();
+  if (answer->results.empty()) {
+    outcome.account =
+      "the producer answered with no result for the one parameter that was sent, which is itself a "
+      "defect: rcl_interfaces/SetParameters carries one per parameter";
+    return outcome;
+  }
+  outcome.accepted = answer->results.front().successful;
+  outcome.account = answer->results.front().reason;
+  return outcome;
+}
+
 void SupervisorNode::set_mode(
   const crane_msgs::srv::SetMode::Request::SharedPtr request,
   crane_msgs::srv::SetMode::Response::SharedPtr response)
 {
-  // Truth about the machine, taken now. Every precondition below is checked
-  // against this snapshot, before anything is deactivated (PRD §10 step 2): a
-  // switch that cannot succeed is refused from the mode the machine is already
-  // in. A stale snapshot would make `arbitrate_mode()` refuse for want of a
-  // view, which is the safe direction for this failure to fall in.
+  // PRD §10 step 2, and **the order is the assertion** (user story 35). The
+  // horizon's freshness is verified before this node asks the controller
+  // manager for anything at all -- not before the switch, before the *poll* --
+  // so a switch into a dead MPC is refused from the mode the machine is already
+  // in and costs the manager nothing. `arbitrate_mode()` runs the same function
+  // again at precondition 2, off the same observation, so the early answer here
+  // and the arbitration below cannot disagree about what was verified.
+  //
+  // The mode reported on a refusal comes off the polled snapshot rather than a
+  // fresh one, deliberately: it is judged by the same deadline every other
+  // answer is, so a snapshot too old to believe reads as *not known* instead of
+  // being replaced by a call this branch exists not to make.
+  const std::string refusal = mpc_horizon_refusal(config_, request->mode, observe());
+  if (!refusal.empty()) {
+    const ActiveMode active = active_mode(config_, observe_controller_manager());
+    response->success = false;
+    response->message = refusal + mode_clause(config_, active);
+    response->active_mode = static_cast<std::uint8_t>(active.mode);
+    RCLCPP_WARN(get_logger(), "%s: %s", kSetModeService, response->message.c_str());
+    return;
+  }
+
+  // Truth about the machine, taken now. Every remaining precondition is checked
+  // against this snapshot, before anything is deactivated: a switch that cannot
+  // succeed is refused from the mode the machine is already in. A stale
+  // snapshot would make `arbitrate_mode()` refuse for want of a view, which is
+  // the safe direction for this failure to fall in.
   refresh_controller_manager(kControllerManagerCallBudget);
 
   const ModeArbitration arbitration = arbitrate_mode(config_, request->mode, observe());
@@ -583,6 +714,18 @@ void SupervisorNode::set_mode(
   }
 
   const Mode requested = static_cast<Mode>(request->mode);
+
+  // Into MODE_MPC the producer goes active **before** the claim moves, so that
+  // a horizon is already fitted when the trajectory controller lets go. It
+  // cannot steal the command in the meantime: the velocity controller takes the
+  // chained path whenever a trajectory controller is chained onto it, and the
+  // freshness this switch was admitted on is the producer's own statement that
+  // it is solving.
+  ProducerSwitch producer;
+  if (arbitration.horizon_producer_active) {
+    producer = set_horizon_producer_mode(true);
+  }
+
   std::string account;
   const bool switched = switch_controllers(arbitration.activate, arbitration.deactivate, account);
 
@@ -592,9 +735,24 @@ void SupervisorNode::set_mode(
   refresh_controller_manager(kControllerManagerCallBudget);
   const ActiveMode reached = active_mode(config_, observe_controller_manager());
 
+  // Out of MODE_MPC the producer goes back to shadow **after** the claim has
+  // moved, for the same reason it goes active before: an inner loop that is
+  // unchained with no horizon ramps its command to zero.
+  //
+  // It is settled from the mode that was **read back** and not from the one
+  // that was asked for, which is what makes this self-correcting: a switch into
+  // MODE_MPC that the manager refused leaves the producer active over a claim
+  // that never moved, and this puts it back. The two branches are exclusive --
+  // the one above only fires for a request into MODE_MPC, this one only when
+  // the machine did not end up there -- so no request makes two calls.
+  const bool mpc_holds_the_claim = reached.known && !reached.partial && reached.mode == Mode::Mpc;
+  if (!mpc_holds_the_claim && (arbitration.horizon_producer_active || switched)) {
+    producer = set_horizon_producer_mode(false);
+  }
+
   response->success = switched && reached.known && !reached.partial && reached.mode == requested;
   response->message =
-    mode_switch_message(config_, requested, arbitration, switched, account, reached);
+    mode_switch_message(config_, requested, arbitration, switched, account, reached, producer);
   response->active_mode = static_cast<std::uint8_t>(reached.mode);
   if (response->success) {
     RCLCPP_INFO(get_logger(), "%s: %s", kSetModeService, response->message.c_str());

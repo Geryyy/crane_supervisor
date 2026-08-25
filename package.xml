@@ -48,6 +48,18 @@
        types and no others. -->
   <depend>controller_manager_msgs</depend>
 
+  <!-- The second exception, added by issue 054 on the same terms. ROS 2
+       Interfaces §4's "One command path" ends by saying that which of the two
+       producers is live is the supervisor's decision *alone* and that the two
+       never drive at once; issue 053 made that a state of `crane_mpc` and left
+       its `mode` parameter writable so that this node could move it. This is
+       ROS 2's own parameter service interface, which the Libraries page carries
+       as part of "ROS 2 Humble ... parameters" rather than as a library of its
+       own, and it is declared explicitly rather than taken through `rclcpp` so
+       that the reach is visible in the manifest the guard test reads. One
+       service type, one parameter, and the guard names both. -->
+  <depend>rcl_interfaces</depend>
+
   <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>crane_model</test_depend>

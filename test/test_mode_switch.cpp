@@ -268,7 +268,13 @@ protected:
           "mode_controllers.follow", std::vector<std::string>{kFollowController}),
         rclcpp::Parameter(
           "mode_controllers.manual", std::vector<std::string>{kManualController}),
-        rclcpp::Parameter("tool_controllers", std::vector<std::string>{kToolController})});
+        rclcpp::Parameter("tool_controllers", std::vector<std::string>{kToolController}),
+        // No horizon producer, which is what this harness actually composes:
+        // `mode_controllers.mpc` is left empty, so `validate()` allows the name
+        // to be empty too and no request here moves anything outside the
+        // controller manager. What a switch into MODE_MPC does to the producer
+        // needs a producer to watch and is `test_handover_sequence.cpp`.
+        rclcpp::Parameter("mpc_node", std::string{})});
     return options;
   }
 
@@ -512,8 +518,14 @@ TEST_F(ModeSwitch, AnArmModeChangeLeavesTheToolClaimExactlyWhereItWas)
 TEST_F(ModeSwitch, MpcIsRefusedBeforeTheTrajectoryControllerIsDeactivated)
 {
   // PRD §10 step 2 and user story 35, against a real manager: freshness is
-  // verified before anything is deactivated, there is no horizon to verify, and
-  // the refusal leaves the machine in the mode it was already in.
+  // verified before anything is deactivated, nothing is publishing
+  // `/crane/mpc/solver_health` in this harness, and the refusal therefore
+  // leaves the machine in the mode it was already in.
+  //
+  // What is asserted here is the *outcome* against a real controller manager.
+  // That the switch service was never reached at all, and that the freshness
+  // check ran before this node consulted the manager for anything, needs a
+  // manager that can be watched and is `test_handover_sequence.cpp`.
   clear_the_starting_latch();
   ASSERT_NE(request(SupervisorStatus::MODE_FOLLOW), nullptr);
   ASSERT_TRUE(is_active(kFollowController));
@@ -521,7 +533,9 @@ TEST_F(ModeSwitch, MpcIsRefusedBeforeTheTrajectoryControllerIsDeactivated)
   const auto refused = request(SupervisorStatus::MODE_MPC);
   ASSERT_NE(refused, nullptr);
   EXPECT_FALSE(refused->success);
-  EXPECT_NE(refused->message.find("slice 6"), std::string::npos) << refused->message;
+  EXPECT_NE(refused->message.find("freshness"), std::string::npos) << refused->message;
+  EXPECT_NE(refused->message.find("Nothing was deactivated"), std::string::npos)
+    << refused->message;
   EXPECT_EQ(refused->active_mode, SupervisorStatus::MODE_FOLLOW) << refused->message;
   EXPECT_TRUE(is_active(kFollowController)) << "a refused switch deactivated the active mode";
 }

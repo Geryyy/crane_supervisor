@@ -67,6 +67,28 @@ crane_supervisor:
     # age is measured from arrival, because ListControllers carries no header.
     # Same derivation and same number as the two 20 Hz margins above.
     controller_manager_timeout: 0.25
+    # Seconds. How old the horizon producer's newest crane_msgs/SolverHealth on
+    # /crane/mpc/solver_health may be and still say it is solving. Past it a
+    # request for MODE_MPC is refused with the age and this deadline in the
+    # sentence, before the trajectory controller is deactivated and before the
+    # controller manager is asked anything at all (PRD 10 step 2, user story
+    # 35). It is judged on that stream and not on /crane/mpc/horizon because in
+    # shadow mode -- the state every switch into MODE_MPC is made from --
+    # crane_mpc publishes nothing on the contract topic, so a check against the
+    # horizon could never pass. Derived from a 12.5 Hz contract sampled here at
+    # 20 Hz, the way the margins above are derived; see
+    # src/crane_supervisor_parameters.yaml.
+    horizon_timeout: 0.3
+
+    # The node crane_bringup composes the horizon producer under, and whose
+    # `mode` parameter this supervisor moves between `shadow` and `active`.
+    # ROS 2 Interfaces 4's "One command path" makes which of the two producers
+    # is live the supervisor's decision alone and says the two never drive at
+    # once; issue 053 made that a state of crane_mpc and left the parameter
+    # writable for exactly this. It is the default of the declaration as well,
+    # and it is written out here because it is the one name in this file that
+    # reaches a *node* rather than a controller.
+    mpc_node: crane_mpc
 
     # Which controller holds the arm claim in each mode
     # (control_architecture.md 7). Names, because the controller manager loads
@@ -84,13 +106,37 @@ crane_supervisor:
     # not implement: the supervisor refuses the request and says so, instead of
     # naming a controller that would fail to load.
     #
-    # `mpc` is absent for a different reason: there is no horizon producer until
-    # slice 6, so MODE_MPC is refused by PRD 10 step 2's freshness check before
-    # any controller list is consulted. Naming one here would change nothing.
+    # **`mpc` is `follow` without the trajectory controller, and the overlap is
+    # the architecture rather than an oversight.** PRD 10 step 3: "Same
+    # controller instance across both paths, so the handover is an ordinary
+    # seam, not new machinery." The inner loop is the sole claimant of the six
+    # velocity command interfaces in both modes and takes its command from the
+    # chained trajectory controller in one and from /crane/mpc/horizon in the
+    # other, so what a switch between them names is the trajectory controller
+    # alone -- the plan never deactivates a controller the incoming mode also
+    # wants, so the inner loop is never released and re-claimed. The manager
+    # still re-enters its activation callbacks to change its chained mode, and
+    # the controller is written around that: what it preserves there is the
+    # reference interfaces and the seam clamp's anchor.
+    #
+    # It was declared and left empty by issue 026 because there was no horizon
+    # producer; there is one now, `crane_mpc` runs in shadow on both profiles,
+    # and PRD 10 step 2's freshness check reads its solver-health stream instead
+    # of reporting its absence. Entering the mode also puts that producer into
+    # `active` -- see mpc_node above -- which is the half of the switch that
+    # happens outside the controller manager.
+    #
+    # The lists are therefore no longer pairwise disjoint. The rule that
+    # replaced disjointness is that no two modes name the same *set*:
+    # active_mode() matches by equality rather than containment, which answers a
+    # nested pair exactly, and two identical claims under two names would both
+    # read as active at once.
     mode_controllers:
       follow:
         - crane_velocity_controller
         - trajectory_controller_a2b
+      mpc:
+        - crane_velocity_controller
 
     # The tool claim of control_architecture.md 7.3 -- a second, independent
     # claim on the same pump, which no mode switch touches.

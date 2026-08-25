@@ -67,7 +67,12 @@ constexpr char kNoToleranceAtAll[] =
   "no per-axis velocity-tracking tolerance is configured. The number does not exist yet -- it "
   "comes from merge gate (ii-b) or from the identification campaign, both human-only -- and it "
   "belongs in crane_control/config/tracking_tolerance.yaml, which is the one file the seam clamp, "
-  "the MPC's constraint margin and this supervisor all read, so that they cannot drift apart.";
+  "the MPC's constraint margin and this supervisor all read, so that they cannot drift apart. The "
+  "same absence reaches further than this report and is worth reading as the whole of it: the seam "
+  "clamp in crane_velocity_controller is **transparent** while it holds, so the velocity step at a "
+  "handover between the following controller and the MPC is not bounded by anything either. The "
+  "mechanism is built and is tested against an injected number; what is missing is the number, and "
+  "a plausible one invented anywhere in this stack would be worse than the gap.";
 
 constexpr char kNoVelocityErrorReported[] =
   "a tolerance is configured but the trajectory controller reports no velocity error for the axes "
@@ -200,13 +205,81 @@ constexpr char kModeNotAValue[] =
   "MODE_IDLE (0), MODE_MANUAL (1), MODE_FOLLOW (2) and MODE_MPC (3). Nothing was switched, and the "
   "machine is in the mode the response reports.";
 
-constexpr char kModeRefusedMpc[] =
-  "refused: MODE_MPC has no producer until slice 6. PRD 10 step 2 requires the horizon's freshness "
-  "to be verified *before* the trajectory controller is deactivated -- no freshness, no switch -- "
-  "and there is no horizon to verify: nothing publishes one, so the check cannot pass and the "
-  "switch is refused from the mode the machine is already in rather than discovered half-way. This "
-  "is deliberate and not an omission: the sequence is proven now and activated in slice 6, when "
-  "the check reads a horizon instead of reporting its absence. Nothing was deactivated.";
+// PRD §10 step 2, in the form slice 6 can implement it: there is a producer
+// now, so the check reads it instead of reporting its absence. Every branch
+// ends in the same two clauses -- what is lost, and that nothing was
+// deactivated -- because the whole point of checking first is that the machine
+// keeps the claim it has.
+constexpr char kHorizonRefusedHead[] =
+  "refused: MODE_MPC needs a horizon and the freshness of the one behind it cannot be established. "
+  "PRD 10 step 2 requires that to be verified *before* the trajectory controller is deactivated -- "
+  "no freshness, no switch -- so this is answered from the mode the machine is already in rather "
+  "than discovered half-way through a switch. Nothing was deactivated, and nothing was asked of "
+  "the controller manager: this check runs before the view of it is even taken. ";
+
+constexpr char kHorizonNeverArrived[] =
+  "No crane_msgs/SolverHealth has arrived on /crane/mpc/solver_health since this supervisor "
+  "started, so nothing is known about the optimizer at all -- it has never connected, which on a "
+  "deployment that composes no crane_mpc is simply what is true. That stream is what this "
+  "supervisor judges the horizon by and not /crane/mpc/horizon itself, because in shadow mode -- "
+  "the state every switch into MODE_MPC is made from -- crane_mpc publishes nothing on the "
+  "contract topic at all, so a check against the horizon could never pass.";
+
+constexpr char kHorizonStoppedHead[] =
+  "The newest crane_msgs/SolverHealth on /crane/mpc/solver_health is ";
+
+constexpr char kHorizonStoppedTail[] =
+  " s old, past the freshness deadline of ";
+
+constexpr char kHorizonStoppedEnd[] =
+  " s. It was arriving before, so the optimizer has stopped reporting rather than never having "
+  "started, and a producer nobody has heard from is exactly the dead MPC this step exists to "
+  "refuse a switch into (user story 35).";
+
+constexpr char kHorizonStampAheadHead[] =
+  "The newest crane_msgs/SolverHealth on /crane/mpc/solver_health is stamped ";
+
+constexpr char kHorizonStampAheadTail[] =
+  " s in this supervisor's future, further ahead than the freshness deadline of ";
+
+constexpr char kHorizonStampAheadEnd[] =
+  " s, so its age is not a measurement of anything and no freshness answer about the optimizer "
+  "means anything either. crane_mpc runs on a workstation outside the hard real-time cycle and "
+  "wiki/control_architecture.md 3.3 makes clock synchronisation between the two a functional "
+  "requirement rather than housekeeping; synchronise them.";
+
+constexpr char kHorizonOutcomeHead[] =
+  "The optimizer is arriving inside its freshness deadline of ";
+
+constexpr char kHorizonOutcomeMid[] = " s and its newest solve says ";
+
+constexpr char kHorizonOutcomeTail[] =
+  ". PRD 10 step 1 wants the MPC *warm* before the switch -- shadow mode already implies it solves "
+  "-- and a producer that is alive, publishing at rate and not converging is indistinguishable "
+  "from a healthy one on freshness alone, which is why the verdict is checked beside the age. A "
+  "budget miss is refused with a failure on purpose: wiki/control_architecture.md 5 row 3 gives "
+  "FAULT_SOLVER to a deadline miss and to non-convergence alike, and entering the mode on a plan "
+  "with nothing behind it costs a handover, while refusing costs one more request.";
+
+constexpr char kHorizonSolveTiming[] = " The last solve took ";
+
+constexpr char kHorizonSolveBudget[] = " s against a budget of ";
+
+constexpr char kHorizonShifted[] =
+  " s, and what went out was the previous horizon shifted rather than this solve "
+  "(wiki/mpc.md 6, requirement 3).";
+
+constexpr char kHorizonSolveEnd[] = " s.";
+
+constexpr char kHorizonCarried[] =
+  " The producer's own account of the cycle, carried rather than restated: ";
+
+constexpr char kHorizonNoAccount[] =
+  " The producer set no message on that report, which is itself worth chasing: "
+  "crane_msgs/SolverHealth carries one for exactly this.";
+
+constexpr char kHorizonProducerFault[] =
+  " It is also raising FAULT_SOLVER on that stream, which is the one code it raises.";
 
 constexpr char kModeRefusedNoView[] =
   "refused: this supervisor cannot see the controller manager, so it does not know which "
@@ -278,6 +351,35 @@ constexpr char kSwitchFailedTail[] =
 constexpr char kSwitchNoAccount[] =
   "(the controller manager returned no message, which is itself worth reporting: the service "
   "carries one for exactly this case)";
+
+// The horizon producer's own mode, reported beside the claim. It is a second
+// process and a second thing that can fail, so the report says which of the two
+// moved rather than letting a silent horizon be the only evidence.
+constexpr char kProducerActive[] = "active";
+constexpr char kProducerShadow[] = "shadow";
+
+constexpr char kProducerMovedHead[] = " The horizon producer was put into ";
+
+constexpr char kProducerMovedTail[] =
+  " mode, which is the other half of this switch and this supervisor's alone: ROS 2 Interfaces 4 "
+  "makes which path is live the supervisor's decision and says the two never drive at once. In "
+  "shadow crane_mpc solves at rate and publishes nothing on /crane/mpc/horizon; in active the same "
+  "solve reaches the velocity controller. Entering MODE_MPC it is moved before the claim is, so a "
+  "horizon is already fitted when the trajectory controller lets go; leaving, after -- an "
+  "unchained inner loop with no horizon ramps to zero and raises FAULT_REFERENCE_STALE, which "
+  "would be a hole in the handover rather than a seam.";
+
+constexpr char kProducerRefusedHead[] =
+  " The horizon producer would not be put into ";
+
+constexpr char kProducerRefusedTail[] =
+  " mode, so the claim and the producer disagree about which path is live -- which is the one "
+  "state ROS 2 Interfaces 4 forbids, and it is reported rather than left for a silent horizon to "
+  "be the evidence of. The producer's own account: ";
+
+constexpr char kProducerNoAccount[] =
+  "(none was given, which is itself worth chasing: rcl_interfaces/SetParameters carries a reason "
+  "per parameter for exactly this)";
 
 constexpr char kSwitchLandedElsewhereHead[] =
   ". The controller manager accepted the switch and the mode read back afterwards is ";
@@ -494,6 +596,24 @@ bool is_mode(std::uint8_t value) noexcept
   return value < static_cast<std::uint8_t>(kModeCount);
 }
 
+const char * solve_outcome_name(SolveOutcome outcome) noexcept
+{
+  switch (outcome) {
+    case SolveOutcome::Unknown:
+      // The wire's zero, and the wire says outright why it is `unknown` rather
+      // than a healthy solve: a message nobody filled must not read as an
+      // optimizer that converged.
+      return "SOLVE_UNKNOWN -- nothing filled the verdict on that report";
+    case SolveOutcome::Converged:
+      return "SOLVE_CONVERGED";
+    case SolveOutcome::BudgetExceeded:
+      return "SOLVE_BUDGET_EXCEEDED -- the solve hit its deadline without converging";
+    case SolveOutcome::Failed:
+      return "SOLVE_FAILED";
+  }
+  return "a verdict crane_msgs/SolverHealth does not define";
+}
+
 const char * mode_name(Mode mode) noexcept
 {
   // The wire's own constant names, so a report and a panel say the same word.
@@ -548,11 +668,36 @@ bool validate(const SupervisorConfig & config, std::string & reason)
       "src/crane_supervisor_parameters.yaml.";
     return false;
   }
+  // The horizon producer's report. Held to the same rule the polled view is,
+  // and for the same reason: a producer nobody can date is a switch into
+  // MODE_MPC that would be admitted or refused by a number nobody chose, and
+  // PRD §10 step 2's whole content is that the age is compared against
+  // something.
+  if (!std::isfinite(config.horizon_deadline) || config.horizon_deadline <= 0.0) {
+    reason =
+      "the horizon producer's report has a freshness deadline of " +
+      seconds_text(config.horizon_deadline) +
+      " s, and a deadline is a finite positive number of seconds. Without one PRD 10 step 2's "
+      "check has nothing to compare an age against, so MODE_MPC would be admitted or refused by a "
+      "number nobody chose. The number and its derivation are in "
+      "src/crane_supervisor_parameters.yaml.";
+    return false;
+  }
   // The mode lists. Every rule here is what makes `active_mode()` able to give
-  // one answer: a name that is empty pairs with nothing, a name in two modes
-  // makes two modes read as active at once, and a controller that is both a
-  // mode's and the tool's would be deactivated by a mode switch that is
-  // supposed never to touch the tool claim (§7.3).
+  // one answer: a name that is empty pairs with nothing, a name twice in one
+  // list makes that list's size stop counting its controllers, two modes with
+  // the same set of controllers both match the machine at once, and a
+  // controller that is both a mode's and the tool's would be deactivated by a
+  // mode switch that is supposed never to touch the tool claim (§7.3).
+  //
+  // What is deliberately *not* a rule any more is that the lists be pairwise
+  // disjoint. It was one until slice 6 and it was right while `MODE_MPC` was
+  // empty; populating it makes it wrong, because PRD §10 step 3 puts the same
+  // `crane_velocity_controller` instance on both paths on purpose -- "so the
+  // handover is an ordinary seam, not new machinery" -- and a rule that
+  // outlawed the overlap would outlaw the architecture. `active_mode()` matches
+  // by set equality instead of containment, which answers a nested pair exactly,
+  // and the rule that keeps that answer unique is the one below.
   if (!config.mode_controllers[index_of(Mode::Idle)].empty()) {
     reason =
       "MODE_IDLE is configured with controllers, and it is the absence of a motion claim rather "
@@ -560,25 +705,55 @@ bool validate(const SupervisorConfig & config, std::string & reason)
       "releasing the claim into a claim of its own. Leave mode_controllers.idle unset.";
     return false;
   }
-  std::vector<std::string> seen;
+  std::vector<std::string> in_a_mode;
   for (std::size_t i = 0; i < kModeCount; ++i) {
-    for (const std::string & name : config.mode_controllers[i]) {
+    const std::vector<std::string> & controllers = config.mode_controllers[i];
+    for (std::size_t j = 0; j < controllers.size(); ++j) {
+      const std::string & name = controllers[j];
       if (name.empty()) {
         reason = std::string("a controller of ") + mode_name(static_cast<Mode>(i)) +
           " is configured with an empty name, and an unnamed controller can never be paired with "
           "anything the controller manager loaded";
         return false;
       }
-      if (std::find(seen.begin(), seen.end(), name) != seen.end()) {
-        reason = name +
-          " is configured for more than one mode. The modes are mutually exclusive by resource "
-          "claim (wiki/control_architecture.md 7) and this supervisor reads the active mode by "
-          "asking which mode's controllers are all active, so a controller in two lists would make "
-          "two modes read as active at once and the answer would depend on which list was checked "
-          "first.";
+      if (std::find(controllers.begin(), controllers.begin() + static_cast<std::ptrdiff_t>(j),
+        name) != controllers.begin() + static_cast<std::ptrdiff_t>(j))
+      {
+        reason = name + " is configured twice for " + mode_name(static_cast<Mode>(i)) +
+          ". A mode is read as active by comparing the controllers that are up against the set "
+          "this list names, and a name that appears twice makes the list's length stop counting "
+          "the controllers in it, so the comparison would never match.";
         return false;
       }
-      seen.push_back(name);
+      if (std::find(in_a_mode.begin(), in_a_mode.end(), name) == in_a_mode.end()) {
+        in_a_mode.push_back(name);
+      }
+    }
+    // The rule that replaced disjointness. Two modes naming the same set both
+    // match the machine at once and the answer would depend on which was
+    // checked first -- which is the defect the old rule was aimed at, kept,
+    // while the overlap PRD §10 step 3 requires is allowed through.
+    for (std::size_t k = 0; k < i; ++k) {
+      if (controllers.empty() || config.mode_controllers[k].size() != controllers.size()) {
+        continue;
+      }
+      bool same = true;
+      for (const std::string & name : controllers) {
+        const std::vector<std::string> & other = config.mode_controllers[k];
+        if (std::find(other.begin(), other.end(), name) == other.end()) {
+          same = false;
+          break;
+        }
+      }
+      if (same) {
+        reason = std::string(mode_name(static_cast<Mode>(i))) + " and " +
+          mode_name(static_cast<Mode>(k)) +
+          " are configured with the same set of controllers, so both would read as active at once "
+          "and which one this supervisor reported would depend on the order it happened to check "
+          "them in. Two modes may share a controller -- the same inner loop carries both paths of "
+          "PRD 10 step 3 -- but they may not be the same claim under two names.";
+        return false;
+      }
     }
   }
   for (const std::string & name : config.tool_controllers) {
@@ -588,7 +763,7 @@ bool validate(const SupervisorConfig & config, std::string & reason)
         "controller can never be paired with anything the controller manager loaded";
       return false;
     }
-    if (std::find(seen.begin(), seen.end(), name) != seen.end()) {
+    if (std::find(in_a_mode.begin(), in_a_mode.end(), name) != in_a_mode.end()) {
       reason = name +
         " is configured both as a mode's controller and as the tool claim's. The tool axis is a "
         "second, independent claim on the same pump (wiki/control_architecture.md 7.3) and no mode "
@@ -596,7 +771,21 @@ bool validate(const SupervisorConfig & config, std::string & reason)
         "change that is supposed to leave the gripper alone.";
       return false;
     }
-    seen.push_back(name);
+  }
+  // The producer behind MODE_MPC. A deployment that implements the mode has to
+  // name the node whose mode this supervisor drives, because the claim moving
+  // to the MPC path while the producer stays in shadow leaves the inner loop
+  // unchained with no horizon -- which ramps its command to zero and reports
+  // FAULT_REFERENCE_STALE, a hole in the handover rather than a seam.
+  if (!config.mode_controllers[index_of(Mode::Mpc)].empty() && config.mpc_node.empty()) {
+    reason =
+      "MODE_MPC is configured with controllers and no horizon producer is named. Which path is "
+      "live is this supervisor's decision alone (wiki/implementation/ros2_interfaces.md 4, 'One "
+      "command path') and the switch has to move crane_mpc between shadow and active as well as "
+      "moving the claim, so a deployment that implements the mode names the node it composed the "
+      "producer under in mpc_node. Without it the claim would move to a path whose producer "
+      "publishes nothing.";
+    return false;
   }
   for (const AxisTolerance & axis : config.tracking_tolerance) {
     if (axis.joint.empty()) {
@@ -1096,40 +1285,54 @@ ActiveMode active_mode(const SupervisorConfig & config, const ControllerManagerR
   }
   active.known = true;
 
-  // A mode is active when *every* controller configured for it is active.
-  // `validate()` has already refused overlapping lists, so at most one mode can
-  // satisfy that on a deployment that started -- and if two somehow do, that is
-  // reported as drift rather than resolved by whichever was checked first.
-  std::size_t complete = 0;
+  // Every controller of the arm claim that is up right now, once each and in
+  // configuration order. This is the set the modes are matched against.
   for (std::size_t i = 0; i < kModeCount; ++i) {
-    const std::vector<std::string> & controllers = config.mode_controllers[i];
-    if (controllers.empty()) {
-      continue;
-    }
-    std::size_t up = 0;
-    for (const std::string & name : controllers) {
-      if (is_controller_active(report, name)) {
-        ++up;
+    for (const std::string & name : config.mode_controllers[i]) {
+      if (
+        is_controller_active(report, name) &&
+        std::find(active.active_controllers.begin(), active.active_controllers.end(), name) ==
+        active.active_controllers.end())
+      {
         active.active_controllers.push_back(name);
       }
     }
-    if (up == 0) {
+  }
+
+  // A mode is active when its controllers are *exactly* the ones that are up --
+  // equality and not containment. Containment was the rule while `MODE_MPC` was
+  // empty and it stops being sound the moment it is populated: PRD §10 step 3
+  // puts the same inner loop on both paths, so `MODE_MPC`'s list is
+  // `MODE_FOLLOW`'s minus the trajectory controller, and under containment
+  // FOLLOW holding the claim would satisfy MPC as well while MPC holding it
+  // would leave FOLLOW half up and read as drift. `validate()` has refused two
+  // modes with the same set, so at most one can match -- and if two somehow do,
+  // that is reported as drift rather than resolved by whichever came first.
+  std::size_t matched = 0;
+  for (std::size_t i = 0; i < kModeCount; ++i) {
+    const std::vector<std::string> & controllers = config.mode_controllers[i];
+    if (controllers.empty() || controllers.size() != active.active_controllers.size()) {
       continue;
     }
-    if (up == controllers.size()) {
-      ++complete;
+    bool all_up = true;
+    for (const std::string & name : controllers) {
+      if (!is_controller_active(report, name)) {
+        all_up = false;
+        break;
+      }
+    }
+    if (all_up) {
+      ++matched;
       active.mode = static_cast<Mode>(i);
-    } else {
-      active.partial = true;
     }
   }
-  if (complete > 1) {
-    active.partial = true;
-  }
   // A half-state is not a mode. `Idle` is what claims the least, and the clause
-  // names what is up so that the drift is visible rather than rounded off.
-  if (active.partial) {
+  // names what is up so that the drift is visible rather than rounded off. With
+  // nothing up at all there is no drift to report: that is the arm claim being
+  // free, which is `MODE_IDLE` as an observation.
+  if (matched != 1) {
     active.mode = Mode::Idle;
+    active.partial = !active.active_controllers.empty();
   }
 
   for (const std::string & name : config.tool_controllers) {
@@ -1188,6 +1391,81 @@ std::string mode_clause(const SupervisorConfig & config, const ActiveMode & acti
   return text;
 }
 
+HorizonPrecondition horizon_precondition(
+  const SupervisorConfig & config, const HorizonReport & report) noexcept
+{
+  HorizonPrecondition precondition;
+  precondition.cause = freshness_of(config.horizon_deadline, report.health);
+  // Both halves, and the second is not implied by the first: a producer that is
+  // alive, publishing at rate and failing every solve is exactly the dead MPC
+  // user story 35 refuses to switch into, and it reads as fresh.
+  precondition.fresh =
+    precondition.cause == Staleness::Fresh && report.outcome == SolveOutcome::Converged;
+  return precondition;
+}
+
+std::string mpc_horizon_refusal(
+  const SupervisorConfig & config, std::uint8_t requested, const SupervisorInput & input)
+{
+  // Silent about every request that is not for the MPC path, so that the node
+  // can run this first without it having an opinion about anything else. A
+  // value that is not a mode is not this check's to refuse either --
+  // `arbitrate_mode()` answers that one, and says which values exist.
+  if (!is_mode(requested) || static_cast<Mode>(requested) != Mode::Mpc) {
+    return {};
+  }
+
+  const HorizonReport & horizon = input.horizon;
+  const HorizonPrecondition precondition = horizon_precondition(config, horizon);
+  if (precondition.fresh) {
+    return {};
+  }
+
+  const std::string deadline = seconds_text(config.horizon_deadline);
+  std::string text = kHorizonRefusedHead;
+  switch (precondition.cause) {
+    case Staleness::NeverArrived:
+      text += kHorizonNeverArrived;
+      break;
+    case Staleness::StoppedArriving:
+      text += kHorizonStoppedHead + seconds_text(horizon.health.age) + kHorizonStoppedTail +
+        deadline + kHorizonStoppedEnd;
+      break;
+    case Staleness::StampAhead:
+      text += kHorizonStampAheadHead + seconds_text(-horizon.health.age) + kHorizonStampAheadTail +
+        deadline + kHorizonStampAheadEnd;
+      break;
+    case Staleness::Fresh:
+    case Staleness::ProducerUnhealthy:
+      // The stream is fine and the *solve* is not, which is the half freshness
+      // alone cannot see. `ProducerUnhealthy` cannot arise here -- nothing sets
+      // it on this report -- and it lands in the same branch rather than in a
+      // default, so a value added to `Staleness` fails to compile instead of
+      // falling through to a sentence about a converged solve.
+      text += kHorizonOutcomeHead + deadline + kHorizonOutcomeMid +
+        solve_outcome_name(horizon.outcome) + kHorizonOutcomeTail;
+      break;
+  }
+
+  // The timing, whenever the producer has reported one at all: a solve that is
+  // losing its deadline says so in the sentence that refuses the switch rather
+  // than only in its own stream.
+  if (horizon.health.received && horizon.solve_budget > 0.0) {
+    text += kHorizonSolveTiming + seconds_text(horizon.solve_time) + kHorizonSolveBudget +
+      seconds_text(horizon.solve_budget) +
+      (horizon.applied_previous_solution ? kHorizonShifted : kHorizonSolveEnd);
+  }
+  if (horizon.fault == Fault::Solver) {
+    text += kHorizonProducerFault;
+  }
+  if (horizon.health.received) {
+    text += horizon.status.empty()
+      ? std::string(kHorizonNoAccount)
+      : kHorizonCarried + horizon.status;
+  }
+  return text;
+}
+
 ModeArbitration arbitrate_mode(
   const SupervisorConfig & config, std::uint8_t requested, const SupervisorInput & input)
 {
@@ -1204,15 +1482,19 @@ ModeArbitration arbitrate_mode(
   }
   const Mode mode = static_cast<Mode>(requested);
 
-  // 2. PRD §10 step 2, in the only form slice 3 can implement it: the horizon's
-  // freshness is verified before anything is deactivated, and there is no
-  // horizon, so the answer is no. The refusal is here -- above the view, above
-  // the latch, above every deployment question -- because it does not depend on
-  // any of them and an operator asking for MODE_MPC is owed the reason that is
-  // actually true.
-  if (mode == Mode::Mpc) {
-    arbitration.message = kModeRefusedMpc;
-    return arbitration;
+  // 2. PRD §10 step 2 and user story 35. The refusal is here -- above the view,
+  // above the latch, above every deployment question -- because it depends on
+  // none of them and an operator asking for MODE_MPC is owed the reason that is
+  // actually true. `SupervisorNode::set_mode()` runs the same function before it
+  // asks the controller manager for anything at all, so the order this position
+  // states is the order the node keeps: nothing is deactivated, and nothing is
+  // even polled, until the horizon has been verified.
+  {
+    const std::string refusal = mpc_horizon_refusal(config, requested, input);
+    if (!refusal.empty()) {
+      arbitration.message = refusal;
+      return arbitration;
+    }
   }
 
   // 3. Nothing below can be checked without a view of the machine.
@@ -1278,20 +1560,36 @@ ModeArbitration arbitrate_mode(
   // call, so the machine passes from one mode to the other inside one of the
   // manager's cycles rather than through a state that is neither.
   arbitration.accepted = true;
+  arbitration.horizon_producer_active = mode == Mode::Mpc;
   for (const std::string & name : wanted) {
     if (!is_controller_active(input.controller_manager, name)) {
       arbitration.activate.push_back(name);
     }
   }
-  // Only the arm claim, and only what is actually up. The tool claim is not
-  // walked at all: §7.3's second claim is reported and never switched by a mode
-  // request.
+  // Only the arm claim, only what is actually up, and **never a controller the
+  // incoming mode also wants**. That last exclusion is PRD §10 step 3 as a line
+  // of code: the same `crane_velocity_controller` instance carries both paths,
+  // so the change between FOLLOW and MPC names the trajectory controller and
+  // nothing else. A plan that named the inner loop as well would be asking for
+  // it to be released and re-claimed -- which is a *different* thing from the
+  // chained-mode transition the manager performs on it internally, and one the
+  // controller is not written to survive: what `on_activate` preserves across
+  // that transition is the reference interfaces and the seam clamp's anchor,
+  // which is exactly what step 3 clamps the first B-spline to.
+  //
+  // The tool claim is not walked at all: §7.3's second claim is reported and
+  // never switched by a mode request.
   for (std::size_t i = 0; i < kModeCount; ++i) {
     if (i == index_of(mode)) {
       continue;
     }
     for (const std::string & name : config.mode_controllers[i]) {
-      if (is_controller_active(input.controller_manager, name)) {
+      if (
+        is_controller_active(input.controller_manager, name) &&
+        std::find(wanted.begin(), wanted.end(), name) == wanted.end() &&
+        std::find(arbitration.deactivate.begin(), arbitration.deactivate.end(), name) ==
+        arbitration.deactivate.end())
+      {
         arbitration.deactivate.push_back(name);
       }
     }
@@ -1317,7 +1615,8 @@ ModeArbitration arbitrate_mode(
 
 std::string mode_switch_message(
   const SupervisorConfig & config, Mode requested, const ModeArbitration & arbitration,
-  bool switched, const std::string & carried, const ActiveMode & reached)
+  bool switched, const std::string & carried, const ActiveMode & reached,
+  const ProducerSwitch & producer)
 {
   std::string text;
   if (!switched) {
@@ -1328,6 +1627,19 @@ std::string mode_switch_message(
     if (reached.mode != requested || !reached.known || reached.partial) {
       text += kSwitchLandedElsewhereHead + std::string(mode_name(reached.mode)) +
         kSwitchLandedElsewhereTail;
+    }
+  }
+  // The other half of the switch, always said when it was attempted and
+  // whichever way it went. A claim that moved and a producer that did not is
+  // the one state ROS 2 Interfaces §4 forbids, and the report is where it
+  // becomes visible instead of a silent horizon being the only evidence.
+  if (producer.attempted) {
+    const char * const wanted = producer.active ? kProducerActive : kProducerShadow;
+    if (producer.accepted) {
+      text += kProducerMovedHead + std::string(wanted) + kProducerMovedTail;
+    } else {
+      text += kProducerRefusedHead + std::string(wanted) + kProducerRefusedTail +
+        (producer.account.empty() ? std::string(kProducerNoAccount) : producer.account);
     }
   }
   return text + mode_clause(config, reached);

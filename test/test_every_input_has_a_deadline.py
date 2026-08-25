@@ -12,9 +12,24 @@ one helper that creates a subscription takes one, and a deadline of zero is
 refused by `validate()`.  What this file asserts is the shape those pieces have
 to keep for that to hold:
 
-* `create_subscription` appears exactly once in the whole package, inside the
-  helper.  A second call site could take a topic name of its own, and an input
-  with no `Input` behind it has no deadline, no policy row and no report.
+* `create_subscription` appears exactly twice in the whole package: inside the
+  helper, and on the one stream that deliberately is not an `Input`.  A third
+  call site could take a topic name of its own, and an input with no `Input`
+  behind it has no deadline, no policy row and no report.
+
+  The second site landed in issue 054 and is named here rather than the count
+  loosened, which is the same move the command-path guard makes for its service
+  clients.  It is `/crane/mpc/solver_health`, the evidence PRD 10 step 2's
+  freshness check is made against, and it *cannot* be an `Input`: an `Input` is
+  by definition a stream whose absence raises a fault on the status stream, and
+  an optimizer that is quiet while the machine is in MODE_FOLLOW is the ordinary
+  state of this stack rather than a defect -- wiki/implementation/ros2_interfaces.md 4
+  records that the supervisor merging `FAULT_SOLVER` onto
+  `/crane/supervisor/status` is a slice of its own.  5.3's rule is met the way
+  the polled controller-manager view meets it: its own configured margin,
+  refused by `validate()` when it is missing, and a defined, narrow consequence
+  stated where it matters -- no freshness, no switch, with the age and the
+  deadline in the refusal.  That margin is asserted below beside the four.
 * every enumerator of `Input` is subscribed, has a policy row, and is assigned a
   deadline out of a parameter -- in that same order, so a row cannot describe one
   input while a deadline is written into another.
@@ -35,6 +50,14 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 CORE_HEADER = PACKAGE_ROOT / "include" / "crane_supervisor" / "supervisor_core.hpp"
 NODE_HEADER = PACKAGE_ROOT / "include" / "crane_supervisor" / "supervisor_node.hpp"
 NODE_SOURCE = PACKAGE_ROOT / "src" / "supervisor_node.cpp"
+PARAMETER_DECLARATION = PACKAGE_ROOT / "src" / "crane_supervisor_parameters.yaml"
+
+# Every `create_subscription` this package may hold, by type and in source
+# order.  The first is the `subscribe()` helper every `Input` goes through -- the
+# type is its template parameter, which is what makes "one call site" and "one
+# per input" different assertions.  The second is the horizon producer's own
+# status stream, which is deliberately not an `Input`; see the module docstring.
+PERMITTED_SUBSCRIPTION_TYPES = ["MessageT", "crane_msgs::msg::SolverHealth"]
 
 # A ROS name standing on its own.  The same expression the command-path guard
 # uses, for the same reason: a literal that is nothing but a ROS name is a name
@@ -104,22 +127,49 @@ def _inputs():
 
 
 def test_every_input_is_subscribed_through_the_one_helper_that_gives_it_a_deadline():
-    """One `create_subscription`, and one `subscribe()` call per input.
+    """Two `create_subscription` sites, and one `subscribe()` call per input.
 
     The helper takes an `Input`, so a subscription that named no input -- and
     therefore had no deadline, no policy row and no way to be reported -- cannot
-    be written.  A second `create_subscription` anywhere in the package would be
-    that subscription, so the count is what is asserted rather than the topic.
+    be written through it.  The one stream that is not an `Input` is enumerated
+    beside it by type, and a third `create_subscription` anywhere in the package
+    would be the subscription this guard exists against, so the list is what is
+    asserted rather than the topic.
     """
     created = []
     for path in _sources():
         created += re.findall(r"create_subscription<([A-Za-z0-9_:]+)>", _code(path))
-    assert created == ["MessageT"], created
+    assert created == PERMITTED_SUBSCRIPTION_TYPES, created
 
     subscribed = re.findall(
         r"subscribe<[A-Za-z0-9_:]+>\(\s*Input::([A-Za-z0-9_]+)", _code(NODE_SOURCE)
     )
     assert subscribed == _inputs(), subscribed
+
+
+def test_the_stream_that_is_not_an_input_still_has_a_margin_of_its_own():
+    """5.3's rule, met the way the polled controller-manager view meets it.
+
+    `/crane/mpc/solver_health` is not an `Input` and must not be: an optimizer
+    that is quiet while the machine is in MODE_FOLLOW is the ordinary state of
+    this stack, and merging `FAULT_SOLVER` onto the status stream is a slice of
+    its own.  What it is *not* exempt from is having a deadline at all -- the
+    consequence of it stopping is that PRD 10 step 2 refuses MODE_MPC and says
+    how old the newest report is against what margin, and there is no margin to
+    say without a configured one.
+
+    So the same three things the four inputs get are asserted here one at a
+    time: a member on the config, a parameter it is read out of, and no default
+    on the struct -- because a plausible default is exactly how a stream nobody
+    configured goes on being judged by a number nobody chose.
+    """
+    core = _code(CORE_HEADER)
+    declaration = re.search(r"double\s+horizon_deadline\s*(\{[^;]*\})?\s*;", core)
+    assert declaration, "the horizon producer's margin is no longer on SupervisorConfig"
+    assert (declaration.group(1) or "").strip() in ("", "{0.0}"), declaration.group(1)
+
+    assert "config_.horizon_deadline = parameters." in _code(NODE_SOURCE)
+    assert "horizon_timeout:" in PARAMETER_DECLARATION.read_text(encoding="utf-8")
 
 
 def test_every_input_has_a_policy_row_and_a_deadline_out_of_a_parameter():

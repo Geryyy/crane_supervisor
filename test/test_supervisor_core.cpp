@@ -2364,7 +2364,7 @@ TEST(SupervisorMode, ValidateRefusesAConfigurationTheArbitrationCouldNotAnswerFr
 
   // Two modes with the *same set* of controllers: both would read as active at
   // once and the answer would depend on which list was checked first.  This is
-  // what replaced the old pairwise-disjointness rule, and it keeps the defect
+  // what replaced the old pairwise-disjoint rule, and it keeps the defect
   // that rule was aimed at while letting through the overlap PRD §10 step 3
   // requires.
   auto indistinguishable = config_with_modes();

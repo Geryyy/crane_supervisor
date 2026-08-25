@@ -221,8 +221,9 @@ lists were required to be pairwise disjoint, which made that rule sound.  PRD
 §10 step 3 puts the *same* `crane_velocity_controller` instance on both paths —
 "same controller instance across both paths, so the handover is an ordinary
 seam, not new machinery" — so `MODE_MPC`'s list is `MODE_FOLLOW`'s minus the
-trajectory controller, and a disjointness rule would have outlawed the
-architecture.  Under containment the nesting is worse than untidy: `MODE_FOLLOW`
+trajectory controller, and a rule requiring the lists to be pairwise disjoint
+would have outlawed the architecture.  Under containment the nesting is worse
+than untidy: `MODE_FOLLOW`
 holding the claim would satisfy `MODE_MPC` as well, and `MODE_MPC` holding it
 would leave `MODE_FOLLOW` half up and read as drift.  Under equality both are
 answered exactly, and what `validate()` has to insist on is only that no two

@@ -26,8 +26,15 @@
 # consumer. A profile that wants this supervisor to raise FAULT_TRACKING passes
 # that file to this node as a second parameter file; without it every axis
 # reports no tolerance, the supervisor warns once at configuration and names the
-# axes, and tracking_error is still published as a measurement. The numbers do
-# not exist yet, so today no profile passes it and that is the honest state.
+# axes, and tracking_error is still published as a measurement. Both command
+# profiles do pass it, and since issue 054 they pass the same file to crane_mpc
+# as well -- PRD 6's "one number" is a property of the composition, and
+# crane_bringup's test_one_number_reaches_both_of_its_consumers_or_neither
+# asserts the pair rather than each half. What still does not exist is the
+# number: the six values in that file are the -1.0 sentinel, so every consumer
+# including this one reads "no tolerance" and says so. The clamp is transparent
+# and FAULT_TRACKING is unreachable until merge gate (ii-b) or the slice 1b
+# campaign lands a measured value -- both human-only (PRD 14).
 #
 # `joints` is absent for a different reason: the six actuated joints are fixed by
 # ROS 2 Interfaces 3.2 and the declared default already is them. A deployment
@@ -127,7 +134,7 @@ crane_supervisor:
     # happens outside the controller manager.
     #
     # The lists are therefore no longer pairwise disjoint. The rule that
-    # replaced disjointness is that no two modes name the same *set*:
+    # replaced that one is that no two modes name the same *set*:
     # active_mode() matches by equality rather than containment, which answers a
     # nested pair exactly, and two identical claims under two names would both
     # read as active at once.

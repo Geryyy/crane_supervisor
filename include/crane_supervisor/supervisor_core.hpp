@@ -650,8 +650,9 @@ struct SupervisorConfig
    * is an ordinary seam, not new machinery" -- so `MODE_MPC`'s list is
    * `MODE_FOLLOW`'s without the trajectory controller, and a mode switch
    * between them neither activates nor deactivates the inner loop. What
-   * `validate()` enforces is therefore **not** disjointness, which would
-   * outlaw exactly that: it is that no two modes name the *same set*, because
+   * `validate()` enforces is therefore **not** that the lists be pairwise
+   * disjoint, which would outlaw exactly that: it is that no two modes name
+   * the *same set*, because
    * `active_mode()` matches the active controllers against each mode's set by
    * equality, and two identical sets would make two modes read as active at
    * once.

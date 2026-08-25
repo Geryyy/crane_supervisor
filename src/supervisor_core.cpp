@@ -729,7 +729,7 @@ bool validate(const SupervisorConfig & config, std::string & reason)
         in_a_mode.push_back(name);
       }
     }
-    // The rule that replaced disjointness. Two modes naming the same set both
+    // The rule that replaced the pairwise-disjoint one. Two modes naming the same set both
     // match the machine at once and the answer would depend on which was
     // checked first -- which is the defect the old rule was aimed at, kept,
     // while the overlap PRD §10 step 3 requires is allowed through.

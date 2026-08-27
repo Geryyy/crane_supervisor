@@ -1,6 +1,3 @@
-// The decision core, offline. No ROS, no DDS, no clock is linked into this
-// binary and none is reachable from it, so every cause can be produced exactly
-// and one at a time -- which is the point of the core being ROS-free at all.
 
 #include <gtest/gtest.h>
 
@@ -24,9 +21,6 @@ using crane_supervisor::kInputCount;
 using crane_supervisor::index_of;
 using crane_supervisor::policy_of;
 
-/// The six actuated joints of ROS 2 Interfaces §3.2, in configuration order.
-/// Four `theta*` angles and two `q*` lengths -- the split that makes the max in
-/// `tracking_error` a number in two units.
 const std::vector<std::string> & actuated_joints()
 {
   static const std::vector<std::string> joints{
@@ -36,14 +30,6 @@ const std::vector<std::string> & actuated_joints()
 }
 
 /// The four sway numbers `config/crane_supervisor.yaml` ships.
-/**
- * Written out here for the same reason the deadlines below are: `SwayBound` is
- * value-initialised to zero, zero is not a bound and `validate()` refuses one,
- * so a test of the decision has to say which bounds it is deciding against
- * exactly as a deployment does. Their derivations, and what would replace each,
- * are in `src/crane_supervisor_parameters.yaml`; the properties those
- * derivations claim are asserted in `test_sway_monitor.cpp`.
- */
 crane_supervisor::SwayBound shipped_sway_bound()
 {
   crane_supervisor::SwayBound bound;
@@ -57,32 +43,15 @@ crane_supervisor::SwayBound shipped_sway_bound()
 /// The status period of ROS 2 Interfaces §2, as the step a sequence advances by.
 constexpr double kCycle = 1.0 / 20.0;
 
-/// The clock a fixture starts at, s. Epoch-scale rather than zero, because that
-/// is what a node's clock reads and the dwell arithmetic runs on it.
 constexpr double kFirstCycle = 1'700'000'000.0;
 
 /// The part of a report the fault composed, without the settled clause.
-/**
- * Every report ends in the settled clause, and the clause names both passive
- * coordinates in rad/s. A test asserting that a *length* axis is not reported in
- * rad/s therefore has to look at the sentence the fault wrote and not at the
- * whole string. The seam comes off the core rather than being written out here,
- * so the two cannot drift apart.
- */
 std::string without_settled_clause(const std::string & message)
 {
   return message.substr(0, message.find(crane_supervisor::kSettledClausePrefix));
 }
 
 /// The four shipped freshness deadlines, s, in `Input` order.
-/**
- * Written out here rather than read off a struct default, because there is no
- * struct default: the numbers and the derivation of each live once, in
- * `src/crane_supervisor_parameters.yaml`, and a `SupervisorConfig` that was
- * handed none is one `validate()` refuses. That is the point -- an input with no
- * deadline is a node that does not start -- so a test of the decision has to say
- * which margins it is deciding against, exactly as a deployment does.
- */
 crane_supervisor::SupervisorConfig with_shipped_deadlines(
   crane_supervisor::SupervisorConfig config)
 {
@@ -90,21 +59,8 @@ crane_supervisor::SupervisorConfig with_shipped_deadlines(
   config.deadline(Input::RemoteCtrl) = 0.25;
   config.deadline(Input::ControllerState) = 0.15;
   config.deadline(Input::ControllerHealth) = 0.25;
-  // The polled view of the controller manager. Not one of the four -- it is a
-  // service and not a stream -- and refused by `validate()` all the same when
-  // it is missing, so a fixture that omitted it would not be a configuration a
-  // node could start from.
   config.controller_manager_deadline = 0.25;
-  // The horizon producer's margin, refused by `validate()` when it is missing
-  // for the same reason: PRD §10 step 2's check has to compare an age against
-  // something, and a fixture that omitted it would not be a configuration a node
-  // could start from either.
   config.horizon_deadline = 0.3;
-  // The arm claim's controllers, as `config/crane_supervisor.yaml` ships them:
-  // the FOLLOW pair in the cascade's activation order, MODE_MPC as that pair
-  // without the trajectory controller (PRD §10 step 3 -- the same inner loop
-  // carries both paths), and nothing for MODE_MANUAL, which is the deployment's
-  // own state and not a convenience since no CBS profile composes one.
   config.mode_controllers[crane_supervisor::index_of(crane_supervisor::Mode::Follow)] = {
     "crane_velocity_controller", "trajectory_controller_a2b"};
   config.mode_controllers[crane_supervisor::index_of(crane_supervisor::Mode::Mpc)] = {
@@ -119,18 +75,12 @@ crane_supervisor::SupervisorConfig default_config()
 {
   crane_supervisor::SupervisorConfig config;
   for (const std::string & joint : actuated_joints()) {
-    // One member given, so `dq_a` takes its own default: NaN, the state a
-    // deployment that was never handed the tolerance file is honestly in.
     config.tracking_tolerance.push_back(crane_supervisor::AxisTolerance{joint});
   }
   return with_shipped_deadlines(config);
 }
 
 /// The same configuration with the six numbers a human has not measured yet.
-/**
- * Distinct per axis on purpose: a comparison that paired the two lists by index
- * rather than by name would still pass with six equal numbers.
- */
 crane_supervisor::SupervisorConfig config_with_tolerances()
 {
   crane_supervisor::SupervisorConfig config;
@@ -186,9 +136,6 @@ crane_supervisor::ControllerHealthReport healthy_inner_loop()
   return inner_loop;
 }
 
-/// The report `crane_velocity_controller` publishes on the `hardware` profile
-/// today: prerequisite 4 is missing, so the gripper axis ran PI only and the
-/// loop raises the commissioning code and names the axis.
 crane_supervisor::ControllerHealthReport uncommissioned_gripper()
 {
   crane_supervisor::ControllerHealthReport inner_loop = healthy_inner_loop();
@@ -205,15 +152,6 @@ crane_supervisor::ControllerHealthReport inner_loop_fault(crane_supervisor::Faul
   return inner_loop;
 }
 
-/// All four inputs arriving, in time, trusted, with the operator holding the
-/// button and the inner loop reporting nothing wrong with itself.
-/**
- * The arriving half is set over the whole registry rather than input by input,
- * deliberately: a fixture that named its four streams by hand would leave a
- * fifth input default-constructed -- which is to say never arrived -- and every
- * test below would then be asserting about that fifth input's absence instead of
- * about what it was written for.
- */
 crane_supervisor::SupervisorInput healthy_input()
 {
   crane_supervisor::SupervisorInput input;
@@ -223,10 +161,6 @@ crane_supervisor::SupervisorInput healthy_input()
   }
   input.pendulum_state.valid = true;
   input.pendulum_state.status = "complementary filter on the two bracketing IMUs";
-  // A still crane. The rate is filled because a `PendulumStateReport` that was
-  // never given one carries NaN -- the absence of a measurement -- and a fixture
-  // built on the absence would be asserting about the sway being unknowable
-  // rather than about whatever the test was written for.
   input.pendulum_state.velocity = {{0.0, 0.0}};
   input.sampled_at = kFirstCycle;
   input.remote_ctrl = held_remote();
@@ -264,8 +198,6 @@ crane_supervisor::SupervisorInput stale(
   return input;
 }
 
-/// One decision, with everything a cycle hands to its successor carried the way
-/// the node carries it: the emergency-stop latch, the sway dwell, and the clock.
 crane_supervisor::SupervisorDecision step(
   const crane_supervisor::SupervisorConfig & config, crane_supervisor::SupervisorInput & input)
 {
@@ -288,17 +220,9 @@ const std::array<Staleness, 3> & transport_causes()
 
 TEST(SupervisorCore, EveryInputHasADeadlineAndNoneIsExempt)
 {
-  // The first acceptance criterion of issue 023, and the reason the deadlines
-  // live in an array `Input` sizes rather than in four named doubles: an input
-  // added to the enum and given no margin has a slot value-initialised to zero,
-  // and zero is not a deadline.  So the node refuses to start rather than
-  // publishing a status about a stream nobody is watching -- the guard is
-  // structural, and this loop is over the registry rather than over a list.
   std::string reason;
   EXPECT_TRUE(crane_supervisor::validate(default_config(), reason)) << reason;
 
-  // A `SupervisorConfig` nobody handed a margin to is refused outright, which is
-  // what makes "no default deadline" a rule and not a comment.
   EXPECT_FALSE(crane_supervisor::validate(crane_supervisor::SupervisorConfig{}, reason));
   EXPECT_FALSE(reason.empty());
 
@@ -308,8 +232,6 @@ TEST(SupervisorCore, EveryInputHasADeadlineAndNoneIsExempt)
       crane_supervisor::SupervisorConfig config = default_config();
       config.deadline(which) = refused;
       EXPECT_FALSE(crane_supervisor::validate(config, reason)) << policy_of(which).topic;
-      // And it says which input, because "a margin is wrong" is not something an
-      // operator or an integrator can act on and "this topic has none" is.
       EXPECT_NE(reason.find(policy_of(which).topic), std::string::npos) << reason;
     }
   }
@@ -317,11 +239,6 @@ TEST(SupervisorCore, EveryInputHasADeadlineAndNoneIsExempt)
 
 TEST(SupervisorCore, TheRegistryIsTheOneListAndItsRowsMatchTheirInputs)
 {
-  // The table is what makes a report name its own stream, so a row sitting at
-  // the wrong index would report the wrong topic for the wrong input.  A
-  // `static_assert` in the header refuses that at compile time; this asserts the
-  // properties a compiler cannot -- that no two inputs share a topic and that
-  // every row is filled in.
   EXPECT_EQ(crane_supervisor::kInputPolicies.size(), kInputCount);
   for (std::size_t i = 0; i < kInputCount; ++i) {
     const crane_supervisor::InputPolicy & policy = crane_supervisor::kInputPolicies[i];
@@ -339,11 +256,6 @@ TEST(SupervisorCore, TheRegistryIsTheOneListAndItsRowsMatchTheirInputs)
 
 TEST(SupervisorCore, EveryInputIsSweptAndReportsItsOwnInputAndItsOwnCause)
 {
-  // wiki/control_architecture.md §5.3, over the registry rather than over the
-  // four inputs somebody remembered: every input that stops arriving ends in the
-  // fault its policy row names, and the message says which input it was about
-  // and which staleness cause fired.  An input added to `Input` is swept by this
-  // loop the day it is added, and fails here until `decide()` consults it.
   const auto config = default_config();
 
   for (std::size_t i = 0; i < kInputCount; ++i) {
@@ -364,9 +276,6 @@ TEST(SupervisorCore, EveryInputIsSweptAndReportsItsOwnInputAndItsOwnCause)
       messages.push_back(decision.message);
     }
 
-    // An input that never arrived and one that stopped arriving are both faults
-    // and are not the same fault to chase: "never connected" sends an integrator
-    // after a launch file and "died" sends them after a process.
     for (std::size_t a = 0; a < messages.size(); ++a) {
       for (std::size_t b = a + 1; b < messages.size(); ++b) {
         EXPECT_NE(messages[a], messages[b]) << policy_of(which).topic << ": " << messages[a];
@@ -377,11 +286,6 @@ TEST(SupervisorCore, EveryInputIsSweptAndReportsItsOwnInputAndItsOwnCause)
 
 TEST(SupervisorCore, TheDeadlinesArePerInputAndNotOneNumber)
 {
-  // §5.3's margins are properties of the streams they judge: the passive state
-  // comes off the manager's 100 Hz cycle and the remote is a 20 Hz contract, so
-  // an age that is healthy on one is a dead publisher on the other.  A single
-  // global margin would report the fast stream late or the slow one falsely, and
-  // this asserts the two are actually judged apart.
   auto config = default_config();
   config.deadline(Input::PendulumState) = 0.05;
   config.deadline(Input::RemoteCtrl) = 1.0;
@@ -402,10 +306,6 @@ TEST(SupervisorCore, TheDeadlinesArePerInputAndNotOneNumber)
 
 TEST(SupervisorCore, TheFreshnessSweepIsTotalBoundedAndNeedsNoMessageToNoticeAStop)
 {
-  // The sweep answers for every input on every call, from the state of the
-  // input struct alone: no history, no counters, nothing that has to be fed by a
-  // message arriving.  That is what makes a deadline able to fire on the one
-  // stream it exists for -- the one where no callback will ever run again.
   const auto config = default_config();
   const auto input = stale(config, Input::ControllerHealth, Staleness::StoppedArriving);
 
@@ -420,9 +320,6 @@ TEST(SupervisorCore, TheFreshnessSweepIsTotalBoundedAndNeedsNoMessageToNoticeASt
     }
   }
 
-  // The margin is symmetric and closed: exactly a deadline's worth of age is
-  // still arriving, on both sides of now, so ordinary clock jitter between two
-  // hosts is not a fault.
   for (std::size_t i = 0; i < kInputCount; ++i) {
     const Input which = static_cast<Input>(i);
     EXPECT_EQ(
@@ -439,11 +336,6 @@ TEST(SupervisorCore, TheFreshnessSweepIsTotalBoundedAndNeedsNoMessageToNoticeASt
 
 TEST(SupervisorCore, EveryInputRecoversOnItsOwnExceptTheOneThatLatches)
 {
-  // §5.3's rule is symmetric: an input that starts arriving again inside its
-  // deadline clears its own fault, with no acknowledgement.  The emergency stop
-  // is the single exception and `InputPolicy::latches` is where that is written
-  // down -- §6.1 asks for the software to come back in a defined state, so the
-  // stop survives the signal returning and only `/crane/clear_fault` lowers it.
   const auto config = default_config();
 
   for (std::size_t i = 0; i < kInputCount; ++i) {
@@ -473,11 +365,6 @@ TEST(SupervisorCore, EveryInputRecoversOnItsOwnExceptTheOneThatLatches)
 
 TEST(SupervisorCore, TheThreeConstantsStayDistinctRatherThanCollapsingIntoOne)
 {
-  // PRD user story 52 and the third acceptance criterion of issue 023.  A stale
-  // state, an expired reference and an absent stop are three different things to
-  // do next, so they are three constants -- collapsing them into one is the
-  // defect the policy exists to prevent, and it is the kind of defect that is
-  // invisible until an operator is standing in front of the panel.
   const auto config = default_config();
 
   const auto state = crane_supervisor::decide(
@@ -503,11 +390,6 @@ TEST(SupervisorCore, TheThreeConstantsStayDistinctRatherThanCollapsingIntoOne)
 
 TEST(SupervisorCore, AMissingToleranceIsReportedRatherThanRefused)
 {
-  // The number does not exist yet and is human-owned.  A supervisor that
-  // refused to start over it would withhold the emergency stop, the state
-  // health and the interlock to report one duty it cannot perform, so the
-  // absence is a warning at configuration and not a validation failure.  A
-  // missing *deadline* is the opposite and is refused -- see the first test.
   std::string reason;
   EXPECT_TRUE(crane_supervisor::validate(default_config(), reason));
   EXPECT_TRUE(crane_supervisor::validate(config_with_tolerances(), reason));
@@ -534,9 +416,6 @@ TEST(SupervisorCore, AMissingToleranceIsReportedRatherThanRefused)
 
 TEST(SupervisorCore, ANumberIsAToleranceOnlyIfItIsFiniteAndPositive)
 {
-  // The rule `tracking_tolerance.yaml` states in its own header, and the reason
-  // its six rows are written out as -1.0 rather than omitted: the absence has to
-  // be visible in the file that will one day carry the value.
   EXPECT_TRUE(crane_supervisor::is_tolerance(0.02));
   EXPECT_FALSE(crane_supervisor::is_tolerance(-1.0));
   EXPECT_FALSE(crane_supervisor::is_tolerance(0.0));
@@ -546,10 +425,6 @@ TEST(SupervisorCore, ANumberIsAToleranceOnlyIfItIsFiniteAndPositive)
 
 TEST(SupervisorCore, ATrackingToleranceWithNoAxisNameIsRefused)
 {
-  // A tolerance is paired with an axis by name.  One with no name can never be
-  // paired with anything, so it is a tolerance that silently applies to nothing
-  // -- which is the one failure mode a warning would not catch, because there
-  // would be nothing to name in it.
   std::string reason;
   crane_supervisor::SupervisorConfig config = config_with_tolerances();
   config.tracking_tolerance[3].joint.clear();
@@ -559,10 +434,6 @@ TEST(SupervisorCore, ATrackingToleranceWithNoAxisNameIsRefused)
 
 TEST(SupervisorCore, RejectsADeadmanButtonTheMessageDoesNotHave)
 {
-  // The message names twelve booleans and no thirteenth.  A number outside them
-  // would select no field at all, and a deadman read off no field is one that is
-  // released forever -- which would raise FAULT_INTERLOCK for a reason that has
-  // nothing to do with the operator.
   std::string reason;
   crane_supervisor::SupervisorConfig config = default_config();
 
@@ -580,20 +451,11 @@ TEST(SupervisorCore, RejectsADeadmanButtonTheMessageDoesNotHave)
     EXPECT_TRUE(crane_supervisor::validate(config, reason)) << button;
   }
 
-  // The default is button 12, read from the retained stack: the behaviour tree's
-  // approval gate returns `msg.button12`, and the TUI's keycode table maps that
-  // button to `z`, which is the key wiki/control_architecture.md §6.2 names as
-  // the simulated deadman.  It is asserted here so that a later edit of the
-  // default is a test failure rather than a silent re-wiring.
   EXPECT_EQ(default_config().deadman_button, 12);
 }
 
 TEST(SupervisorCore, AbsenceIsNotHealthBeforeTheFirstMessage)
 {
-  // wiki/control_architecture.md §5.3: no input may stop arriving without a
-  // defined consequence, and "has not started arriving" is the same absence.
-  // The remote is healthy here so that the passive state is what is being
-  // judged; with nothing arriving at all the stop of §6.1 owns the report.
   const auto config = default_config();
   auto input = healthy_input();
   input.stream(Input::PendulumState).received = false;
@@ -617,8 +479,6 @@ TEST(SupervisorCore, AbsenceIsNotHealthAfterTheStreamStops)
   const auto stopped = crane_supervisor::decide(config, input);
   EXPECT_EQ(stopped.fault, crane_supervisor::Fault::StateHealth);
 
-  // The cause names both numbers, because an operator cannot judge a margin
-  // crossing without knowing what was crossed by how much.
   EXPECT_NE(stopped.message.find("0.420"), std::string::npos) << stopped.message;
   EXPECT_NE(stopped.message.find("0.150"), std::string::npos) << stopped.message;
   EXPECT_NE(stopped.message.find("stopped arriving"), std::string::npos) << stopped.message;
@@ -626,10 +486,6 @@ TEST(SupervisorCore, AbsenceIsNotHealthAfterTheStreamStops)
 
 TEST(SupervisorCore, AStampAheadOfTheClockIsAFaultRatherThanAFreshSample)
 {
-  // A stamp slightly ahead is ordinary clock jitter between two hosts and stays
-  // inside the margin.  Further ahead than the margin, the age is not a
-  // measurement of anything, and reporting the sample fresh off it would hide
-  // exactly the absence this input exists to detect (PRD user story 59).
   const auto config = default_config();
   auto input = healthy_input();
 
@@ -644,12 +500,6 @@ TEST(SupervisorCore, AStampAheadOfTheClockIsAFaultRatherThanAFreshSample)
 
 TEST(SupervisorCore, TheProducersOwnFlagIsTheThirdCauseAndItsAccountIsCarriedThrough)
 {
-  // The three causes §5.3 now lists are the flag, the age and the sample that
-  // stopped refreshing behind a header that keeps moving.  The age is the one
-  // this supervisor measures itself; the other two are the broadcaster's, and
-  // they arrive here behind `valid == false` with the broadcaster's own account
-  // of which one fired.  Restating it would flatten a distinction the estimator
-  // went to some trouble to make.
   auto input = healthy_input();
   input.pendulum_state.valid = false;
   input.pendulum_state.status =
@@ -659,8 +509,6 @@ TEST(SupervisorCore, TheProducersOwnFlagIsTheThirdCauseAndItsAccountIsCarriedThr
   EXPECT_EQ(decision.fault, crane_supervisor::Fault::StateHealth);
   EXPECT_NE(decision.message.find(input.pendulum_state.status), std::string::npos)
     << decision.message;
-  // And it says which of the three fired, and that this one is not measured
-  // here: a supervisor cannot ask whether twelve booleans moved.
   EXPECT_NE(decision.message.find("health flag"), std::string::npos) << decision.message;
   EXPECT_NE(decision.message.find("refreshing"), std::string::npos) << decision.message;
 }
@@ -679,9 +527,6 @@ TEST(SupervisorCore, AnInvalidStateWithNoStatusStillReportsACause)
 
 TEST(SupervisorCore, AbsenceOutranksInvalidity)
 {
-  // A stream that stopped and whose last sample was already bad has to report
-  // the absence: it is the cause that removes more of the estimate, and it is
-  // the one that is still true right now.
   const auto config = default_config();
   auto input = healthy_input();
   input.pendulum_state.valid = false;
@@ -696,21 +541,12 @@ TEST(SupervisorCore, AHealthyTracerClearsTheFaultAndStillSaysWhatIsNotWatched)
   const auto decision = crane_supervisor::decide(default_config(), healthy_input());
   EXPECT_EQ(decision.fault, crane_supervisor::Fault::None);
   EXPECT_FALSE(decision.message.empty());
-  // FAULT_NONE from a supervisor that watches one input is not a statement
-  // about the machine, and the report says so rather than letting a panel read
-  // it as one.
   EXPECT_NE(decision.message.find("only input"), std::string::npos) << decision.message;
-  // Including the gap it does *not* close: §6.3's controller-side timeouts are
-  // still ad hoc, and the supervisor reporting that honestly is the correct
-  // interim answer rather than papering over it.
   EXPECT_NE(decision.message.find("never times out"), std::string::npos) << decision.message;
 }
 
 TEST(SupervisorCore, AReleasedDeadmanIsAnInterlockAndIsCheckedEveryCycle)
 {
-  // wiki/control_architecture.md §6.2: the check runs continuously and not once
-  // at the start of a motion, so the same input decided twice decides the same
-  // way both times and the release is caught in whichever cycle it happens in.
   const auto config = default_config();
   auto input = healthy_input();
 
@@ -721,13 +557,9 @@ TEST(SupervisorCore, AReleasedDeadmanIsAnInterlockAndIsCheckedEveryCycle)
     const auto released = step(config, input);
     EXPECT_EQ(released.fault, crane_supervisor::Fault::Interlock) << cycle;
     EXPECT_FALSE(released.deadman_held);
-    // The cause names the button, because "the interlock is open" is not
-    // something an operator can act on and "button 12 is not held" is.
     EXPECT_NE(released.message.find("button 12"), std::string::npos) << released.message;
   }
 
-  // Pressed again, and the interlock clears itself on the next cycle: it is a
-  // fact about the operator, not a latch.
   input.remote_ctrl.deadman_held = true;
   const auto pressed = step(config, input);
   EXPECT_EQ(pressed.fault, crane_supervisor::Fault::None);
@@ -736,8 +568,6 @@ TEST(SupervisorCore, AReleasedDeadmanIsAnInterlockAndIsCheckedEveryCycle)
 
 TEST(SupervisorCore, TheDeadmanIsReportedOnEveryDecisionWhateverTheFaultIs)
 {
-  // `deadman_held` is a field of its own on every status, so the button stays
-  // visible in the cycles where a more consequential cause owns `fault`.
   const auto config = default_config();
   auto input = healthy_input();
   input.pendulum_state.valid = false;
@@ -747,17 +577,12 @@ TEST(SupervisorCore, TheDeadmanIsReportedOnEveryDecisionWhateverTheFaultIs)
   EXPECT_EQ(degraded.fault, crane_supervisor::Fault::StateHealth);
   EXPECT_TRUE(degraded.deadman_held);
 
-  // ... and it is false whenever the remote is not arriving, because a button
-  // nobody reported is not a button somebody is holding.
   input.stream(Input::RemoteCtrl).received = false;
   EXPECT_FALSE(crane_supervisor::decide(config, input).deadman_held);
 }
 
 TEST(SupervisorCore, AnAssertedStopLatchesAndSurvivesTheSignalGoingBackToReleased)
 {
-  // §6.1: the supervisor consumes the stop so the software comes back in a
-  // defined state instead of resuming from whatever it was doing.  A fault that
-  // cleared itself when the button was released would resume silently.
   const auto config = default_config();
   auto input = healthy_input();
 
@@ -777,9 +602,6 @@ TEST(SupervisorCore, AnAssertedStopLatchesAndSurvivesTheSignalGoingBackToRelease
 
 TEST(SupervisorCore, AbsenceOfTheStopSignalIsAssertedAndTheThreeDoNotLookAlike)
 {
-  // §5.3 and §6.1: a dead GPIO reader, a crashed driver and a released button
-  // must not look alike.  All three of the absences raise the stop; the released
-  // button raises the interlock; and no two of the four say the same thing.
   const auto config = default_config();
 
   std::vector<std::string> messages;
@@ -815,10 +637,6 @@ TEST(SupervisorCore, AbsenceOfTheStopSignalIsAssertedAndTheThreeDoNotLookAlike)
 
 TEST(SupervisorCore, TheStopOutranksTheOtherTwoCausesAndTheInterlockOutranksNothing)
 {
-  // Precedence, stated once: the stop has no field of its own, so a cycle that
-  // reported something else instead would not report it at all.  The deadman
-  // does have one, so the interlock can sit below a defect in a stream without
-  // becoming invisible.
   const auto config = default_config();
 
   crane_supervisor::SupervisorInput everything_wrong = healthy_input();
@@ -855,8 +673,6 @@ TEST(SupervisorCore, ClearingIsRefusedWithAnExplanationWhileTheConditionHolds)
   EXPECT_NE(refused_absent.message.find("not arriving"), std::string::npos)
     << refused_absent.message;
 
-  // Never an empty success (ROS 2 Interfaces §1): an acknowledgement of nothing
-  // is reported as one rather than as a clear.
   crane_supervisor::SupervisorInput nothing_latched = healthy_input();
   const auto nothing = crane_supervisor::clear_fault(config, nothing_latched);
   EXPECT_FALSE(nothing.cleared);
@@ -885,8 +701,6 @@ TEST(SupervisorCore, AnAcknowledgedStopClearsAndReRaisesOnTheNextCycleIfItRecurs
   EXPECT_EQ(after.fault, crane_supervisor::Fault::None);
   EXPECT_FALSE(after.estop_latched);
 
-  // Pressed again: the latch comes straight back, which is the specified
-  // behaviour and not a failed clear.
   input.remote_ctrl.em_stop = true;
   const auto again = step(config, input);
   EXPECT_EQ(again.fault, crane_supervisor::Fault::EStop);
@@ -895,19 +709,12 @@ TEST(SupervisorCore, AnAcknowledgedStopClearsAndReRaisesOnTheNextCycleIfItRecurs
 
 TEST(SupervisorCore, TheReportedErrorIsTheMaxOverTheActuatedJointsOfThePositionError)
 {
-  // ROS 2 Interfaces §6 fixes the field as the max over the actuated joints in
-  // rad or m, so it is the *position* error that is reduced and the reduction is
-  // over the absolute value: an axis lagging by 0.3 rad is as far out as one
-  // leading by 0.3 rad.
   const auto config = default_config();
   auto input = healthy_input();
 
   input.controller_state = with_error("theta3_arm_joint", -0.30, 0.0);
   EXPECT_DOUBLE_EQ(crane_supervisor::decide(config, input).tracking_error, 0.30);
 
-  // A second, larger deviation on a *length* axis wins, and that it wins across
-  // a change of unit is exactly why the number is an indicator and the verdict
-  // is per axis.
   for (auto & axis : input.controller_state.axes) {
     if (axis.joint == "q4_big_telescope") {
       axis.position_error = 0.44;
@@ -915,16 +722,11 @@ TEST(SupervisorCore, TheReportedErrorIsTheMaxOverTheActuatedJointsOfThePositionE
   }
   EXPECT_DOUBLE_EQ(crane_supervisor::decide(config, input).tracking_error, 0.44);
 
-  // The reduction on its own, over an empty report: nothing measured is zero,
-  // and the stream's absence is what says so -- not this number.
   EXPECT_DOUBLE_EQ(crane_supervisor::max_position_error({}), 0.0);
 }
 
 TEST(SupervisorCore, TheReportedErrorIsCarriedWhateverTheFaultIs)
 {
-  // Like `deadman_held`, and for the same reason: a field that vanished in the
-  // cycles where something more consequential owned `fault` would hide the
-  // deviation exactly when someone was looking for it.
   const auto config = default_config();
   auto input = healthy_input();
   input.controller_state = with_error("theta1_slewing_joint", 0.12, 0.0);
@@ -937,9 +739,6 @@ TEST(SupervisorCore, TheReportedErrorIsCarriedWhateverTheFaultIs)
 
 TEST(SupervisorCore, WithNoToleranceNoTrackingFaultIsRaisedAndTheReportSaysSo)
 {
-  // An axis that is wildly out raises no FAULT_TRACKING when nobody has measured
-  // what "out" means, and the clear report does not get to imply a check that
-  // was never made.
   const auto config = default_config();
   auto input = healthy_input();
   input.controller_state = with_error("theta2_boom_joint", 5.0, 5.0);
@@ -951,8 +750,6 @@ TEST(SupervisorCore, WithNoToleranceNoTrackingFaultIsRaisedAndTheReportSaysSo)
     << decision.message;
   EXPECT_NE(decision.message.find("human-only"), std::string::npos) << decision.message;
 
-  // A tolerance that is present and negative -- the state the shipped file is
-  // actually in -- reads exactly the same way.
   crane_supervisor::SupervisorConfig negative = config_with_tolerances();
   for (auto & axis : negative.tracking_tolerance) {
     axis.dq_a = -1.0;
@@ -964,15 +761,9 @@ TEST(SupervisorCore, WithNoToleranceNoTrackingFaultIsRaisedAndTheReportSaysSo)
 
 TEST(SupervisorCore, AVelocityErrorPastItsOwnToleranceIsATypedCauseThatNamesTheAxis)
 {
-  // wiki/control_architecture.md §5 row 1 and §5.0: the tree branches on this
-  // instead of inferring a stall from a deliberately tight goal tolerance.  The
-  // comparison is per axis and in the tolerance's own unit -- `dq_a`, rad/s and
-  // m/s -- because a max over two units decides nothing.
   const auto config = config_with_tolerances();
   auto input = healthy_input();
 
-  // theta2_boom_joint's tolerance is 0.02 rad/s here.  One hair under is not a
-  // fault; one hair over is.
   input.controller_state = with_error("theta2_boom_joint", 0.0, 0.02);
   EXPECT_EQ(crane_supervisor::decide(config, input).fault, crane_supervisor::Fault::None);
 
@@ -990,18 +781,12 @@ TEST(SupervisorCore, AVelocityErrorPastItsOwnToleranceIsATypedCauseThatNamesTheA
 
 TEST(SupervisorCore, ALengthAxisIsComparedInItsOwnUnitAndSaysWhichItIs)
 {
-  // Four axes are angles and two are lengths.  Reporting m/s as rad/s is the
-  // hidden mixed unit the issue exists to remove, so the unit is read off the
-  // axis and printed with the number.
   const auto config = config_with_tolerances();
   auto input = healthy_input();
   input.controller_state = with_error("q9_left_rail_joint", 0.0, 0.5);
 
   const auto decision = crane_supervisor::decide(config, input);
   EXPECT_EQ(decision.fault, crane_supervisor::Fault::Tracking);
-  // The sentence the fault composed, without the settled clause every report
-  // ends in: that clause reports the two passive rates and is in rad/s by
-  // construction, so the mixed-unit assertion is about the tracking half.
   const std::string tracking = without_settled_clause(decision.message);
   EXPECT_NE(tracking.find("q9_left_rail_joint"), std::string::npos) << tracking;
   EXPECT_NE(tracking.find("m/s"), std::string::npos) << tracking;
@@ -1010,14 +795,9 @@ TEST(SupervisorCore, ALengthAxisIsComparedInItsOwnUnitAndSaysWhichItIs)
 
 TEST(SupervisorCore, AxesArePairedByNameAndTheWorstOffenderIsNamedFirst)
 {
-  // The controller's `joint_names` ordering is its own, and it is not obliged to
-  // match the configuration's.  Pairing by index would compare an angle against
-  // a length's tolerance and never say so.
   const auto config = config_with_tolerances();
   auto input = healthy_input();
 
-  // Reversed order, and two axes out: theta1 by 3x its 0.01 tolerance,
-  // theta8_rotator_joint by 2x its 0.05 one.
   crane_supervisor::ControllerStateReport reversed;
   for (auto it = actuated_joints().rbegin(); it != actuated_joints().rend(); ++it) {
     crane_supervisor::AxisError axis;
@@ -1035,8 +815,6 @@ TEST(SupervisorCore, AxesArePairedByNameAndTheWorstOffenderIsNamedFirst)
 
   const auto breaches = crane_supervisor::tracking_breaches(config, reversed);
   ASSERT_EQ(breaches.size(), 2u);
-  // Worst by how far past its own tolerance it is, not by the raw number: the
-  // rotator's 0.10 is the larger error and the slewing axis is the further out.
   EXPECT_EQ(breaches[0].joint, "theta1_slewing_joint");
   EXPECT_DOUBLE_EQ(breaches[0].tolerance, 0.01);
   EXPECT_EQ(breaches[1].joint, "theta8_rotator_joint");
@@ -1051,11 +829,6 @@ TEST(SupervisorCore, AxesArePairedByNameAndTheWorstOffenderIsNamedFirst)
 
 TEST(SupervisorCore, AnAxisTheControllerReportsNoVelocityErrorForIsNotCompared)
 {
-  // The trajectory controller fills `error.velocities` only when it holds a
-  // velocity state interface and a velocity or effort command interface.  An
-  // empty field read as a zero error would be a crane that tracks perfectly by
-  // construction, so the absence is carried and the report says which absence
-  // it is.
   const auto config = config_with_tolerances();
   auto input = healthy_input();
   for (auto & axis : input.controller_state.axes) {
@@ -1074,9 +847,6 @@ TEST(SupervisorCore, AnAxisTheControllerReportsNoVelocityErrorForIsNotCompared)
 
 TEST(SupervisorCore, AControllerThatStoppedPublishingIsNotACraneTrackingPerfectly)
 {
-  // §5.3 applied to the third input.  All three absences are faults, none of
-  // them is a tracking_error of zero standing on its own, and no two of them
-  // say the same thing.
   const auto config = default_config();
 
   auto stopped = stale(config, Input::ControllerState, Staleness::StoppedArriving);
@@ -1089,8 +859,6 @@ TEST(SupervisorCore, AControllerThatStoppedPublishingIsNotACraneTrackingPerfectl
   {
     const auto decision = crane_supervisor::decide(config, input);
     EXPECT_EQ(decision.fault, crane_supervisor::Fault::StateHealth);
-    // The error the last sample carried is not republished as if it were
-    // current, and the zero is never the only thing said about the stream.
     EXPECT_DOUBLE_EQ(decision.tracking_error, 0.0);
     EXPECT_FALSE(decision.message.empty());
     messages.push_back(decision.message);
@@ -1104,10 +872,6 @@ TEST(SupervisorCore, AControllerThatStoppedPublishingIsNotACraneTrackingPerfectl
 
 TEST(SupervisorCore, AnInnerLoopThatStoppedReportingIsNotAnInnerLoopWithNothingToReport)
 {
-  // §5.3 applied to the fourth input.  It is the one absence with a consequence
-  // the other three do not have: an uncommissioned axis reported to nobody is
-  // the state this whole stream exists to end, so a report that is not arriving
-  // must not read as a loop that is saying nothing is wrong.
   const auto config = default_config();
 
   auto stopped = stale(config, Input::ControllerHealth, Staleness::StoppedArriving);
@@ -1126,8 +890,6 @@ TEST(SupervisorCore, AnInnerLoopThatStoppedReportingIsNotAnInnerLoopWithNothingT
   EXPECT_NE(messages[0], messages[1]);
   EXPECT_NE(messages[1], messages[2]);
   EXPECT_NE(messages[0], messages[2]);
-  // The stale report's own code is not republished as if it were current: what
-  // is reported is that nobody knows, not what the loop last said.
   EXPECT_EQ(messages[1].find("not commissioned"), std::string::npos) << messages[1];
   EXPECT_NE(messages[1].find("stopped reporting its own health"), std::string::npos)
     << messages[1];
@@ -1136,10 +898,6 @@ TEST(SupervisorCore, AnInnerLoopThatStoppedReportingIsNotAnInnerLoopWithNothingT
 
 TEST(SupervisorCore, TheInnerLoopsOwnCodesAreCarriedRatherThanTranslated)
 {
-  // The loop computes its verdict from the state interfaces it claims itself
-  // and from the identified map of the tool it is driving, and nothing above
-  // the controller manager can see either.  So the code arrives as a
-  // `crane_msgs/SupervisorStatus` constant and is merged, not translated.
   const auto config = default_config();
   auto input = healthy_input();
 
@@ -1152,13 +910,8 @@ TEST(SupervisorCore, TheInnerLoopsOwnCodesAreCarriedRatherThanTranslated)
   const auto expired = crane_supervisor::decide(config, input);
   EXPECT_EQ(expired.fault, crane_supervisor::Fault::ReferenceStale);
   EXPECT_NE(expired.message.find("horizon"), std::string::npos) << expired.message;
-  // A horizon that ran out is not a measurement that went bad, and the two are
-  // separate constants for the same reason the commissioning code is its own.
   EXPECT_NE(degraded.message, expired.message);
 
-  // A fourth code would mean the controller's own `static_assert` block and the
-  // frozen message have drifted apart.  Inventing a cause here would hide the
-  // drift, so the value is carried through unedited and the report says so.
   input.controller_health = inner_loop_fault(crane_supervisor::Fault::Sway);
   const auto drifted = crane_supervisor::decide(config, input);
   EXPECT_EQ(drifted.fault, crane_supervisor::Fault::Sway);
@@ -1168,9 +921,6 @@ TEST(SupervisorCore, TheInnerLoopsOwnCodesAreCarriedRatherThanTranslated)
 
 TEST(SupervisorCore, AMissingCalibrationNamesTheAxisItIsMissingFor)
 {
-  // The point of carrying the flags per axis with the joint names beside them:
-  // a panel that says "q9_left_rail_joint" tells an operator which calibration
-  // to run, and one that says "one axis" does not.
   const auto config = default_config();
   auto input = healthy_input();
   input.controller_health = uncommissioned_gripper();
@@ -1178,22 +928,15 @@ TEST(SupervisorCore, AMissingCalibrationNamesTheAxisItIsMissingFor)
   const auto decision = crane_supervisor::decide(config, input);
   EXPECT_EQ(decision.fault, crane_supervisor::Fault::NotCommissioned);
   EXPECT_NE(decision.message.find("q9_left_rail_joint"), std::string::npos) << decision.message;
-  // And it says what it is asking for, because a calibration and a sensor check
-  // are the two different things this constant exists to separate
-  // (wiki/implementation/commissioning_prerequisites.md §2).
   EXPECT_NE(decision.message.find("calibration"), std::string::npos) << decision.message;
   // Nothing was acted on here either.
   EXPECT_NE(decision.message.find("Nothing was stopped"), std::string::npos) << decision.message;
 
-  // Two axes, both named: a tool whose sixth valve channel is uncalibrated and
-  // an axis that lost its map is one report, not a count of two.
   input.controller_health.feedforward_free_joints = {"theta8_rotator_joint", "q9_left_rail_joint"};
   const auto both = crane_supervisor::decide(config, input);
   EXPECT_NE(both.message.find("theta8_rotator_joint"), std::string::npos) << both.message;
   EXPECT_NE(both.message.find("q9_left_rail_joint"), std::string::npos) << both.message;
 
-  // A commissioning code with no axis behind it is a defect in the report, and
-  // is reported as one rather than as a fault with nothing to act on.
   input.controller_health.feedforward_free_joints.clear();
   const auto unnamed = crane_supervisor::decide(config, input);
   EXPECT_EQ(unnamed.fault, crane_supervisor::Fault::NotCommissioned);
@@ -1202,10 +945,6 @@ TEST(SupervisorCore, AMissingCalibrationNamesTheAxisItIsMissingFor)
 
 TEST(SupervisorCore, TheHealthCodeIsReportedInPreferenceToTheCommissioningCode)
 {
-  // wiki/implementation/commissioning_prerequisites.md §2, which is what this
-  // ordering is and not this package's preference: the missing calibration will
-  // still be missing next cycle, while a state that just went stale is the one
-  // an operator has to act on now.
   const auto config = default_config();
 
   // On its own the commissioning code is what is reported.
@@ -1215,8 +954,6 @@ TEST(SupervisorCore, TheHealthCodeIsReportedInPreferenceToTheCommissioningCode)
     crane_supervisor::decide(config, only_commissioning).fault,
     crane_supervisor::Fault::NotCommissioned);
 
-  // Beside a health cause of the supervisor's own it is not.  Every one of the
-  // health causes wins, whichever input raised it.
   auto degraded_state = only_commissioning;
   degraded_state.pendulum_state.valid = false;
   degraded_state.pendulum_state.status = "the upstream IMU on K5 does not report itself healthy";
@@ -1230,9 +967,6 @@ TEST(SupervisorCore, TheHealthCodeIsReportedInPreferenceToTheCommissioningCode)
   EXPECT_EQ(
     crane_supervisor::decide(config, dead_controller).fault, crane_supervisor::Fault::StateHealth);
 
-  // Including the health code the *same* loop raises: a report can carry only
-  // one code, so this is the cycle where the loop found a measurement of its
-  // own bad while an axis was still uncalibrated.  It reports the measurement.
   auto inner_health = only_commissioning;
   inner_health.controller_health.fault = crane_supervisor::Fault::StateHealth;
   const auto against_inner = crane_supervisor::decide(config, inner_health);
@@ -1240,19 +974,12 @@ TEST(SupervisorCore, TheHealthCodeIsReportedInPreferenceToTheCommissioningCode)
   EXPECT_NE(against_inner.message.find("inner velocity loop"), std::string::npos)
     << against_inner.message;
 
-  // And a horizon that expired is a health cause in this ordering too: it is
-  // the producer that is gone, and that is also this cycle's news.
   auto stale_reference = only_commissioning;
   stale_reference.controller_health.fault = crane_supervisor::Fault::ReferenceStale;
   EXPECT_EQ(
     crane_supervisor::decide(config, stale_reference).fault,
     crane_supervisor::Fault::ReferenceStale);
 
-  // Below it sits only the interlock, and deliberately: on the `hardware`
-  // profile the commissioning condition is *standing*, while a released deadman
-  // is the ordinary resting state of the machine.  Nothing is lost by it --
-  // `deadman_held` is a field of its own on every report and the commissioning
-  // code has none.
   auto released = only_commissioning;
   released.remote_ctrl.deadman_held = false;
   const auto over_interlock = crane_supervisor::decide(config, released);
@@ -1262,12 +989,6 @@ TEST(SupervisorCore, TheHealthCodeIsReportedInPreferenceToTheCommissioningCode)
 
 TEST(SupervisorCore, TheProfileSwitchIsTheControllersAndThisPackageAddsNoSecondOne)
 {
-  // wiki/implementation/commissioning_prerequisites.md §3: only the `hardware`
-  // profile reports a missing calibration, and the thing that decides it is
-  // `crane_velocity_controller`'s own `profile` parameter.  This package holds
-  // no profile, no rig name and no second switch -- it reports the code it was
-  // sent -- so the two rigs are two different reports on the wire and nothing
-  // else.
   const auto config = default_config();
 
   // What the `hardware` profile publishes today.
@@ -1276,26 +997,16 @@ TEST(SupervisorCore, TheProfileSwitchIsTheControllersAndThisPackageAddsNoSecondO
   const auto reported = crane_supervisor::decide(config, hardware);
   EXPECT_EQ(reported.fault, crane_supervisor::Fault::NotCommissioned);
 
-  // What the `fake` profile publishes for the very same machine state: the
-  // gripper axis still ran PI only and the flag still says which axis, and the
-  // loop still raises no commissioning fault because a rig with no hydraulics
-  // has nothing to commission.
   auto fake = healthy_input();
   fake.controller_health = healthy_inner_loop();
   fake.controller_health.feedforward_free_joints = {"q9_left_rail_joint"};
   const auto quiet = crane_supervisor::decide(config, fake);
   EXPECT_EQ(quiet.fault, crane_supervisor::Fault::None);
-  // And the clear report does not go looking for the axis and raise the fault
-  // on its own: the flags are not a second switch either.
   EXPECT_EQ(quiet.message.find("not commissioned"), std::string::npos) << quiet.message;
 }
 
 TEST(SupervisorCore, TheStopAndTheStateOutrankTrackingAndTrackingOutranksTheInterlock)
 {
-  // Precedence, stated once.  A tracking excess is a defect and a released
-  // deadman is the ordinary resting state of the machine, so tracking sits
-  // above the interlock; the passive state sits above tracking because a
-  // supervisor whose own view of the crane is stale should say that first.
   const auto config = config_with_tolerances();
 
   auto everything = healthy_input();
@@ -1313,9 +1024,6 @@ TEST(SupervisorCore, TheStopAndTheStateOutrankTrackingAndTrackingOutranksTheInte
 
 TEST(SupervisorCore, APassiveRatePastItsBoundIsATypedCauseThatNamesTheCoordinate)
 {
-  // wiki/control_architecture.md §5 row 7.  Per coordinate and on the *rate*,
-  // because the published angle carries an uncalibrated constant offset that
-  // nothing in this workspace has measured and the rate does not.
   const auto config = default_config();
 
   // One hair under the bound is not a fault; one hair over is.
@@ -1331,9 +1039,6 @@ TEST(SupervisorCore, APassiveRatePastItsBoundIsATypedCauseThatNamesTheCoordinate
   EXPECT_EQ(decision.message.find("theta6_tip_joint"), std::string::npos) << decision.message;
   EXPECT_NE(decision.message.find("0.9000"), std::string::npos) << decision.message;
   EXPECT_NE(decision.message.find("0.4000"), std::string::npos) << decision.message;
-  // Nothing was acted on, on this cause least of all: refusing a motion needs an
-  // authority over a mode that this supervisor does not have yet, and damping is
-  // a later slice.
   EXPECT_NE(decision.message.find("Nothing was stopped"), std::string::npos) << decision.message;
   // And a rate past the fault bound is certainly not settled.
   EXPECT_EQ(decision.sway.settled, crane_supervisor::SwaySettled::NotSettled);
@@ -1341,12 +1046,6 @@ TEST(SupervisorCore, APassiveRatePastItsBoundIsATypedCauseThatNamesTheCoordinate
 
 TEST(SupervisorCore, ADegradedEstimateIsStateHealthAndNeverSway)
 {
-  // The distinction the whole duty rests on.  A sensor that stopped saying
-  // anything is a different fact from a load that is swinging, and an operator
-  // does different things about them: one is a check of the graph and the other
-  // is a wait.  So a degraded estimate carrying a wild rate is reported as
-  // FAULT_STATE_HEALTH and the predicate goes to unknown, rather than the rate
-  // being taken at face value and reported as a swing.
   const auto config = default_config();
 
   auto invalid = swinging(9.0);
@@ -1370,12 +1069,6 @@ TEST(SupervisorCore, ADegradedEstimateIsStateHealthAndNeverSway)
 
 TEST(SupervisorCore, TheSwayFaultSitsBelowEveryHealthCauseAndAboveTracking)
 {
-  // Precedence, stated once.  Below the health causes because a supervisor whose
-  // own view of the crane is degraded should say that before it says anything
-  // derived from it -- and above tracking because of the two, sway is the one
-  // with no field of its own: `tracking_error` is filled on every report, so a
-  // tracking excess stays visible in a cycle sway owns, while a swinging load
-  // reported behind a tracking fault would be invisible.
   const auto config = config_with_tolerances();
 
   auto both_wrong = swinging(0.9);
@@ -1395,8 +1088,6 @@ TEST(SupervisorCore, TheSwayFaultSitsBelowEveryHealthCauseAndAboveTracking)
   EXPECT_EQ(
     crane_supervisor::decide(config, dead_controller).fault, crane_supervisor::Fault::StateHealth);
 
-  // And the commissioning code and the interlock sit below it, because both of
-  // them are conditions that will still be there next cycle.
   auto uncommissioned = both_wrong;
   uncommissioned.controller_health = uncommissioned_gripper();
   uncommissioned.remote_ctrl.deadman_held = false;
@@ -1412,18 +1103,10 @@ TEST(SupervisorCore, TheSwayFaultSitsBelowEveryHealthCauseAndAboveTracking)
 
 TEST(SupervisorCore, TheDwellRunsThroughCyclesThatReportSomethingElseEntirely)
 {
-  // The dwell is judged before the precedence chain and not inside it, for the
-  // reason `deadman_held` and `tracking_error` are filled before any branch
-  // returns.  A dwell that only advanced on the cycles where sway was what went
-  // wrong would restart every time the operator let go of the deadman -- and the
-  // predicate exists precisely so that a grip can be gated on it without the
-  // task layer having to keep its own timer.
   const auto config = default_config();
   auto input = healthy_input();
   input.remote_ctrl.deadman_held = false;
 
-  // Enough cycles to cover the dwell twice over, every one of them reporting the
-  // released deadman rather than anything about the sway.
   const int cycles = 2 * static_cast<int>(config.sway.settle_dwell / kCycle);
   crane_supervisor::SwaySettled settled = crane_supervisor::SwaySettled::Unknown;
   for (int cycle = 0; cycle < cycles; ++cycle) {
@@ -1433,8 +1116,6 @@ TEST(SupervisorCore, TheDwellRunsThroughCyclesThatReportSomethingElseEntirely)
   }
   EXPECT_EQ(settled, crane_supervisor::SwaySettled::Settled);
 
-  // And the crane starting to swing drops it again, in a cycle whose report is
-  // still about the deadman.
   input.pendulum_state.velocity = {{0.2, 0.0}};
   const auto moving = step(config, input);
   EXPECT_EQ(moving.fault, crane_supervisor::Fault::Interlock);
@@ -1443,13 +1124,6 @@ TEST(SupervisorCore, TheDwellRunsThroughCyclesThatReportSomethingElseEntirely)
 
 TEST(SupervisorCore, NothingHereActs)
 {
-  // The whole action of `decide()` is to report.  There is no stop, no ramp, no
-  // deactivation and no command in the decision it returns -- on a tracking
-  // fault least of all, which is the whole of §5.0: the signal is fixed and the
-  // decision stays in the task layer.  `solver_handback()` is the one function
-  // in this core that answers a question about an action, and it is still only
-  // an answer: `TheHandBackIsAPredicateAndActsOnNothing` below asserts that, and
-  // the switch itself needs a controller manager this binary does not link.
   const auto config = config_with_tolerances();
   auto input = healthy_input();
   input.controller_state = with_error("theta3_arm_joint", 0.2, 1.0);
@@ -1482,12 +1156,6 @@ std::vector<crane_supervisor::ControllerHealthReport> every_inner_loop_report()
 }
 
 /// The two things outside the four inputs that the solver branch reads.
-/**
- * Which mode holds the claim, and what the horizon producer last said about
- * itself. They are swept together because the branch depends on both at once:
- * the same `FAULT_SOLVER` is the live command path having stopped in `MODE_MPC`
- * and a shadow solve that drove nothing in `MODE_FOLLOW`.
- */
 struct HorizonContext
 {
   crane_supervisor::ControllerManagerReport manager;
@@ -1539,14 +1207,7 @@ std::vector<HorizonContext> every_horizon_context()
     "crane_velocity_controller", "trajectory_controller_a2b"};
   const std::vector<std::string> mpc{"crane_velocity_controller"};
   return {
-    // No manager on the graph and no producer ever heard from: the state a
-    // supervisor is in on a stack that composed neither, and the one every case
-    // below this file's solver branch was written for departs from.
     HorizonContext{},
-    // The producer failing while the *trajectory* controller drives. This is
-    // shadow, it is the state every switch into MODE_MPC is made from, and a
-    // fault reported here would stand on every profile from the day crane_mpc
-    // was composed.
     HorizonContext{
       claim_held_by(follow),
       reported(0.01, crane_supervisor::SolveOutcome::Failed, crane_supervisor::Fault::Solver,
@@ -1556,14 +1217,10 @@ std::vector<HorizonContext> every_horizon_context()
       claim_held_by(mpc),
       reported(0.01, crane_supervisor::SolveOutcome::Converged, crane_supervisor::Fault::None,
       false)},
-    // MODE_MPC with wiki/mpc.md §6's repeated-failure escalation: nothing went
-    // out on the horizon at all.
     HorizonContext{
       claim_held_by(mpc),
       reported(0.01, crane_supervisor::SolveOutcome::Failed, crane_supervisor::Fault::Solver,
       false)},
-    // MODE_MPC with a producer whose newest verdict is older than its own
-    // deadline. A code nobody has heard since is not an observation.
     HorizonContext{
       claim_held_by(mpc),
       reported(100.0, crane_supervisor::SolveOutcome::Failed, crane_supervisor::Fault::Solver,
@@ -1571,12 +1228,6 @@ std::vector<HorizonContext> every_horizon_context()
 }
 
 /// The whole reachable input space of this slice, one struct per combination.
-/**
- * Swept rather than enumerated by hand, because the cases that go wrong are the
- * ones nobody thought to name. The transport half is swept over the registry --
- * every input arriving or not, at every age -- so an input added to `Input` is
- * swept the day it is added rather than the day somebody remembers it.
- */
 std::vector<crane_supervisor::SupervisorInput> every_input()
 {
   std::vector<crane_supervisor::SupervisorInput> inputs;
@@ -1623,11 +1274,6 @@ std::vector<crane_supervisor::SupervisorInput> every_input()
     }
   }
 
-  // The passive rate, applied over the whole set rather than as a twelfth nested
-  // loop. Three values and not two: still, between the settle bound and the
-  // fault bound, and past the fault bound -- which is the reachable space of the
-  // sway duty in a single cycle. The dwell needs a sequence and is swept in
-  // `test_sway_monitor.cpp`, where the clock is an argument.
   std::vector<crane_supervisor::SupervisorInput> swept;
   swept.reserve(inputs.size() * 3);
   for (const double dq_u : {0.0, 0.1, 9.0}) {
@@ -1637,14 +1283,6 @@ std::vector<crane_supervisor::SupervisorInput> every_input()
     }
   }
 
-  // And the mode and the producer, applied the same way rather than as two more
-  // nested loops. Five combinations and not a full product: what the solver
-  // branch turns on is *which* of the two producers holds the command path and
-  // whether the newest verdict is one this supervisor can still observe, and
-  // each of those questions has a small answer set. Without this the sweep would
-  // carry no controller-manager answer at all and could not reach the branch --
-  // an untested branch that the sweep silently declared unreachable is exactly
-  // what "the cases that go wrong are the ones nobody thought to name" is about.
   std::vector<crane_supervisor::SupervisorInput> composed;
   const std::vector<HorizonContext> contexts = every_horizon_context();
   composed.reserve(swept.size() * contexts.size());
@@ -1662,33 +1300,18 @@ std::vector<crane_supervisor::SupervisorInput> every_input()
 
 TEST(SupervisorCore, EveryReachableDecisionCarriesACause)
 {
-  // PRD user story 53, asserted over the whole reachable input space rather
-  // than over the cases the tests above happen to name: a report with a fault
-  // and no words is the inferred abort §5.0 removes, back again.
   for (const auto & config : {default_config(), config_with_tolerances()}) {
     for (const auto & input : every_input()) {
       const auto decision = crane_supervisor::decide(config, input);
       EXPECT_FALSE(decision.message.empty());
-      // The mode is re-derived from the controller manager's own answer on
-      // every cycle, so what is asserted here is that `decide()` reports what
-      // `active_mode()` read rather than anything of its own. A view this
-      // supervisor does not have reads as MODE_IDLE -- the reading that claims
-      // the least -- and never as the last mode it happened to see.
       const auto active = crane_supervisor::active_mode(config, input.controller_manager);
       EXPECT_EQ(decision.mode, active.mode);
       if (!active.known) {
         EXPECT_EQ(decision.mode, crane_supervisor::Mode::Idle);
       }
-      // And the clause that says so is on every one of them, whatever the fault
-      // is: MODE_IDLE on a report whose manager is silent and MODE_IDLE on one
-      // whose arm claim is free are the same byte and different facts.
       EXPECT_NE(decision.message.find(crane_supervisor::kModeClausePrefix), std::string::npos)
         << decision.message;
-      // The working cell is still not computed in this slice, and carries the
-      // value that claims nothing rather than a stub that claims something.
       EXPECT_FALSE(decision.inside_working_cell);
-      // The tracking error is a measurement of what arrived, and it is zero in
-      // exactly the case where nothing usable did.
       if (decision.tracking_error != 0.0) {
         EXPECT_TRUE(input.stream(Input::ControllerState).received);
       }
@@ -1705,10 +1328,6 @@ TEST(SupervisorCore, EveryReachableDecisionCarriesACause)
 
 TEST(SupervisorCore, NoInputThatIsNotFreshIsEverReportedAsFaultFree)
 {
-  // §5.3's rule, over the whole reachable input space: an input outside its own
-  // deadline never ends in FAULT_NONE, whichever input it is and however healthy
-  // everything else is.  This is the assertion that would fail first if a fifth
-  // subscription were added and left out of the precedence chain.
   for (const auto & config : {default_config(), config_with_tolerances()}) {
     for (const auto & input : every_input()) {
       const auto causes = crane_supervisor::freshness(config, input);
@@ -1723,10 +1342,6 @@ TEST(SupervisorCore, NoInputThatIsNotFreshIsEverReportedAsFaultFree)
 
 TEST(SupervisorCore, TheSettledPredicateIsOnEveryDecisionAndIsNeverSettledWhileUnknowable)
 {
-  // Three states and not two, over the whole reachable input space: an estimate
-  // that is absent, stale or marked unusable makes "settled" unanswerable, and a
-  // grip action gated on a two-valued predicate would descend onto a swinging
-  // block the moment the bracketing IMU stopped answering.
   for (const auto & config : {default_config(), config_with_tolerances()}) {
     for (const auto & input : every_input()) {
       const auto decision = crane_supervisor::decide(config, input);
@@ -1738,9 +1353,6 @@ TEST(SupervisorCore, TheSettledPredicateIsOnEveryDecisionAndIsNeverSettledWhileU
       } else {
         EXPECT_EQ(decision.sway.settled, crane_supervisor::SwaySettled::Unknown);
       }
-      // And it is said out loud on every report, whatever `fault` is: the
-      // predicate has no field of its own, so a cycle that dropped the clause
-      // would drop it exactly when a more consequential cause was in the way.
       EXPECT_NE(decision.message.find(crane_supervisor::kSettledClausePrefix), std::string::npos)
         << decision.message;
     }
@@ -1749,8 +1361,6 @@ TEST(SupervisorCore, TheSettledPredicateIsOnEveryDecisionAndIsNeverSettledWhileU
 
 TEST(SupervisorCore, NoTrackingFaultIsReachableWithoutATolerance)
 {
-  // With no number to compare against, FAULT_TRACKING is not reachable at all --
-  // however far out any axis is.
   const auto config = default_config();
   for (const auto & input : every_input()) {
     EXPECT_NE(crane_supervisor::decide(config, input).fault, crane_supervisor::Fault::Tracking);
@@ -1759,16 +1369,6 @@ TEST(SupervisorCore, NoTrackingFaultIsReachableWithoutATolerance)
 
 TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheOtherLoopsFour)
 {
-  // The working cell is the one cause of the §5 table this stack still cannot
-  // raise: nothing on any input can produce it, and a supervisor that raised it
-  // anyway would be reporting a check it never made.
-  //
-  // Three of the nine are not this package's verdicts at all.  FAULT_REFERENCE_STALE
-  // and FAULT_NOT_COMMISSIONED are the inner velocity loop's and FAULT_SOLVER is
-  // the horizon producer's, and all three are merged as their producer numbered
-  // them (wiki/implementation/ros2_interfaces.md §4).  FAULT_SWAY is this
-  // package's and is reachable from exactly one place: the passive rate past its
-  // own configured bound.
   for (const auto & config : {default_config(), config_with_tolerances()}) {
     for (const auto & input : every_input()) {
       const auto fault = crane_supervisor::decide(config, input).fault;
@@ -1783,18 +1383,12 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheOtherLoopsFour)
         fault == crane_supervisor::Fault::Interlock ||
         fault == crane_supervisor::Fault::NotCommissioned)
         << static_cast<int>(fault);
-      // And the two that are not this package's are reported only when the loop
-      // sent them: neither is derivable from anything else this supervisor holds.
       if (fault == crane_supervisor::Fault::ReferenceStale ||
         fault == crane_supervisor::Fault::NotCommissioned)
       {
         EXPECT_EQ(fault, input.controller_health.fault);
         EXPECT_TRUE(input.stream(Input::ControllerHealth).received);
       }
-      // FAULT_SOLVER the same way, and with the one condition that is not about
-      // the stream: the producer only owns the command path in MODE_MPC, so its
-      // verdict is reported there and nowhere else.  A failed *shadow* solve is
-      // a solve that drove nothing.
       if (fault == crane_supervisor::Fault::Solver) {
         EXPECT_EQ(fault, input.horizon.fault);
         const auto active = crane_supervisor::active_mode(config, input.controller_manager);
@@ -1804,10 +1398,6 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheOtherLoopsFour)
           crane_supervisor::freshness_of(config.horizon_deadline, input.horizon.health),
           Staleness::Fresh);
       }
-      // And FAULT_SWAY is reachable only from a rate this supervisor was
-      // entitled to believe.  A degraded estimate is FAULT_STATE_HEALTH, never
-      // this: a sensor that stopped saying anything is a different fact from a
-      // load that is swinging.
       if (fault == crane_supervisor::Fault::Sway) {
         EXPECT_TRUE(input.stream(Input::PendulumState).received);
         EXPECT_TRUE(input.pendulum_state.valid);
@@ -1816,11 +1406,6 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheOtherLoopsFour)
   }
 }
 
-// --------------------------------------------------------------------------
-// The horizon producer's verdict on the operator's stream, and the hand-back it
-// can end in (wiki/control_architecture.md §5 row 3, wiki/mpc.md §6,
-// wiki/implementation/ros2_interfaces.md §4).
-// --------------------------------------------------------------------------
 
 namespace
 {
@@ -1848,17 +1433,12 @@ const std::vector<std::string> & follow_claim()
   return claim;
 }
 
-/// wiki/mpc.md §6's escalation as it reaches this supervisor: FAULT_SOLVER with
-/// nothing published, which is the producer saying it stopped rather than that
-/// it shifted.
 crane_supervisor::HorizonReport escalated()
 {
   return reported(
     0.01, crane_supervisor::SolveOutcome::Failed, crane_supervisor::Fault::Solver, false);
 }
 
-/// The defined fallback of the same page: one solve did not converge and the
-/// previous solution shifted by one step went out in its place.
 crane_supervisor::HorizonReport shifted()
 {
   return reported(
@@ -1877,25 +1457,13 @@ crane_supervisor::ActiveMode mode_of(
 
 TEST(SupervisorSolver, TheProducersCodeIsCarriedRatherThanTranslated)
 {
-  // wiki/implementation/ros2_interfaces.md §4's rule for VelocityControllerHealth,
-  // applied to the second stream that carries a SupervisorStatus code: merged,
-  // not renumbered and not re-derived.  This is what "FAULT_SOLVER reaches the
-  // operator" means -- the value on /crane/supervisor/status is the value
-  // crane_mpc put on /crane/mpc/solver_health.
   const auto config = default_config();
   const auto decision = crane_supervisor::decide(config, driving(mpc_claim(), escalated()));
 
   EXPECT_EQ(decision.fault, crane_supervisor::Fault::Solver);
   EXPECT_EQ(static_cast<std::uint8_t>(decision.fault), 3U) << "the code was renumbered on the way";
-  // And the producer's own account of the cycle is carried through rather than
-  // restated, for the reason the broadcaster's `status` is: crane_mpc separates
-  // an escalation from a shifted fallback from a cold start in that string, and
-  // a supervisor that rewrote it would flatten the distinction.
   EXPECT_NE(decision.message.find("the producer's own account"), std::string::npos)
     << decision.message;
-  // The escalation's own half of the sentence: nothing went out at all, which is
-  // a different fact from a plan having gone out that the optimizer no longer
-  // believes.
   EXPECT_NE(decision.message.find("nothing went out on the horizon"), std::string::npos)
     << decision.message;
   EXPECT_EQ(decision.mode, crane_supervisor::Mode::Mpc);
@@ -1903,10 +1471,6 @@ TEST(SupervisorSolver, TheProducersCodeIsCarriedRatherThanTranslated)
 
 TEST(SupervisorSolver, AShiftedPreviousSolutionSaysSoRatherThanClaimingSilence)
 {
-  // The same code and a different sentence.  wiki/mpc.md §6 gives one
-  // non-convergent solve a defined fallback -- the previous solution shifted by
-  // one step -- and an operator reading FAULT_SOLVER is owed which of the two
-  // happened, because only one of them means the horizon has stopped.
   const auto config = default_config();
   const auto decision = crane_supervisor::decide(config, driving(mpc_claim(), shifted()));
 
@@ -1918,13 +1482,6 @@ TEST(SupervisorSolver, AShiftedPreviousSolutionSaysSoRatherThanClaimingSilence)
 
 TEST(SupervisorSolver, AFailedShadowSolveDroveNothingAndIsNotReported)
 {
-  // The one condition that is about the mode rather than about the stream.  In
-  // MODE_FOLLOW crane_mpc is shadowing (issue 053): it solves, it publishes its
-  // verdict, and it drives nothing.  Reporting FAULT_SOLVER there would put a
-  // standing fault on the operator's stream on every profile from the day the
-  // producer was composed, which is exactly why `HorizonReport` is not an
-  // `Input` -- and why its *code* being merged is a different question from its
-  // absence being watched.
   const auto config = default_config();
   const auto decision = crane_supervisor::decide(config, driving(follow_claim(), escalated()));
 
@@ -1937,12 +1494,6 @@ TEST(SupervisorSolver, AFailedShadowSolveDroveNothingAndIsNotReported)
 
 TEST(SupervisorSolver, AVerdictNobodyHasHeardSinceIsNotAnObservation)
 {
-  // Judged on a *fresh* report, against the producer's own margin.  A code off a
-  // report this supervisor has not heard since is a fault it cannot still
-  // observe, and standing by it would be the latch §5.3 spends its whole table
-  // avoiding.  What an operator gets when the producer goes silent altogether is
-  // the receiver running out of plan, which is the only thing either node can
-  // still see.
   const auto config = default_config();
   crane_supervisor::HorizonReport old = escalated();
   old.health.age = 10.0 * config.horizon_deadline;
@@ -1954,19 +1505,12 @@ TEST(SupervisorSolver, AVerdictNobodyHasHeardSinceIsNotAnObservation)
 
 TEST(SupervisorSolver, TheProducersCauseOutranksTheReceiversSymptom)
 {
-  // §5.0, as a precedence.  When the optimizer stops, the receiver runs out of
-  // plan and raises FAULT_REFERENCE_STALE -- the consequence, one layer down, of
-  // this cause.  A supervisor that reported the symptom while the cause went
-  // unread would be handing the task layer exactly the inferred signal §5.0
-  // exists to replace.
   const auto config = default_config();
   auto input = driving(mpc_claim(), escalated());
   input.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
 
   EXPECT_EQ(crane_supervisor::decide(config, input).fault, crane_supervisor::Fault::Solver);
 
-  // And with the producer healthy the receiver's own verdict is what is reported:
-  // the branch above outranks it, it does not replace it.
   auto stale_only = driving(
     mpc_claim(),
     reported(
@@ -1978,11 +1522,6 @@ TEST(SupervisorSolver, TheProducersCauseOutranksTheReceiversSymptom)
 
 TEST(SupervisorSolver, TheStopAndTheDegradedEstimateStillOutrankIt)
 {
-  // The solver sits below everything that removes part of this supervisor's own
-  // view of the crane, for the reason sway and tracking do: a stack that cannot
-  // see the machine should say so before it says anything derived from what it
-  // cannot see.  The stop outranks all of them because it is the only cause with
-  // no field of its own.
   const auto config = default_config();
 
   auto stopped = driving(mpc_claim(), escalated());
@@ -1996,12 +1535,6 @@ TEST(SupervisorSolver, TheStopAndTheDegradedEstimateStillOutrankIt)
 
 TEST(SupervisorSolver, TheHandBackWaitsForTheReceiverToRunOutOfPlan)
 {
-  // The ordering of wiki/control_architecture.md §5 row 3 -- "fall back, *then*
-  // stop and report" -- as a condition and not as a comment.  The fall back is
-  // crane_velocity_controller's `horizon_expiry_ramp`; releasing the claim on
-  // the escalation itself would take the command interface off a receiver that
-  // still had a second of good plan in hand, and put on it exactly the commanded
-  // step §5.2 step 3 and wiki/mpc.md §6 both refuse.
   const auto config = default_config();
 
   const auto still_executing = driving(mpc_claim(), escalated());
@@ -2017,18 +1550,11 @@ TEST(SupervisorSolver, TheHandBackWaitsForTheReceiverToRunOutOfPlan)
   ASSERT_TRUE(handback.required);
   EXPECT_NE(handback.message.find("handed control back"), std::string::npos) << handback.message;
   EXPECT_NE(handback.message.find("MODE_IDLE"), std::string::npos) << handback.message;
-  // And why it is not MODE_FOLLOW, on the sentence rather than only in a header:
-  // resuming a motion is the task layer's decision (§5) and PRD §10 step 4 needs
-  // a reference this supervisor cannot produce.
   EXPECT_NE(handback.message.find("task layer"), std::string::npos) << handback.message;
 }
 
 TEST(SupervisorSolver, AShiftedFallbackIsNotAHandBack)
 {
-  // One non-convergent solve with the previous solution shifted into its place is
-  // the defined behaviour of wiki/mpc.md §6, not a producer handing control back.
-  // A supervisor that released the claim on it would end a motion on the first
-  // budget miss, which is the opposite of what requirement 3 is for.
   const auto config = default_config();
   auto input = driving(mpc_claim(), shifted());
   input.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
@@ -2038,11 +1564,6 @@ TEST(SupervisorSolver, AShiftedFallbackIsNotAHandBack)
 
 TEST(SupervisorSolver, AnInnerLoopThatStoppedReportingAsksForNoHandBack)
 {
-  // The receiver's verdict is the condition, so a receiver that stopped
-  // publishing is not one that ran out of plan.  §5.3's rule read the safe way
-  // round: the absence is reported as FAULT_STATE_HEALTH by the chain above, and
-  // it does not authorise this supervisor to take the claim off a controller it
-  // can no longer hear from.
   const auto config = default_config();
   auto input = driving(mpc_claim(), escalated());
   input.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
@@ -2053,10 +1574,6 @@ TEST(SupervisorSolver, AnInnerLoopThatStoppedReportingAsksForNoHandBack)
 
 TEST(SupervisorSolver, NoHandBackFromAModeThatIsNotMpcOrFromAViewNobodyHas)
 {
-  // Two more of the four conditions.  In MODE_FOLLOW the escalation stops a
-  // horizon nobody is executing, and with no answer from the controller manager
-  // there is no mode to leave -- `arbitrate_mode()` would refuse the release for
-  // want of a view anyway, and asking it to is a switch issued blind.
   const auto config = default_config();
 
   auto following = driving(follow_claim(), escalated());
@@ -2073,11 +1590,6 @@ TEST(SupervisorSolver, NoHandBackFromAModeThatIsNotMpcOrFromAViewNobodyHas)
 
 TEST(SupervisorSolver, TheHandBackIsAPredicateAndActsOnNothing)
 {
-  // `NothingHereActs`, for the one function in this core that is about an action.
-  // `solver_handback()` returns whether the claim is owed a release and the
-  // sentence that says why; the switch itself is `SupervisorNode`'s and needs a
-  // controller manager, which this binary does not link.  Called twice on the
-  // same observation it answers the same thing, because it carries no state.
   const auto config = default_config();
   auto input = driving(mpc_claim(), escalated());
   input.controller_health = inner_loop_fault(crane_supervisor::Fault::ReferenceStale);
@@ -2089,12 +1601,6 @@ TEST(SupervisorSolver, TheHandBackIsAPredicateAndActsOnNothing)
   EXPECT_EQ(first.message, second.message);
 }
 
-// --------------------------------------------------------------------------
-// The mode, and the one authority this supervisor has.  Everything below is
-// offline: `arbitrate_mode()` decides and returns a plan, and nothing in this
-// binary can switch anything.  What a real switch does against a real
-// controller manager is `test_mode_switch.cpp`.
-// --------------------------------------------------------------------------
 
 namespace
 {
@@ -2110,15 +1616,6 @@ constexpr char kManualController[] = "manual_velocity_controller";
 constexpr char kToolController[] = "tool_velocity_controller";
 
 /// The shipped configuration with a manual controller and a tool claim added.
-/**
- * Today's profiles have neither -- no CBS profile composes a manual controller,
- * and `crane_velocity_controller` holds all six `velocity` interfaces including
- * the gripper axis, so the deployment has one claim.  A test of the arbitration
- * has to have both, because what is being asserted is that the *model* carries
- * a second claim and a mode it does not implement, which is exactly what a
- * deployment that only ever had one would never exercise
- * (wiki/control_architecture.md §7.3).
- */
 crane_supervisor::SupervisorConfig config_with_modes()
 {
   crane_supervisor::SupervisorConfig config = default_config();
@@ -2149,8 +1646,6 @@ ControllerManagerReport answered(std::vector<ControllerReport> controllers)
   return report;
 }
 
-/// Everything loaded and inactive: the state after a manager comes up with the
-/// controllers configured and nothing spawned.
 ControllerManagerReport all_inactive()
 {
   return answered(
@@ -2177,13 +1672,6 @@ ControllerManagerReport unchained()
 }
 
 /// What the horizon producer would have reported, `age` seconds ago.
-/**
- * The evidence PRD §10 step 2 is verified against, and it is
- * `crane_msgs/SolverHealth` rather than the horizon itself for a reason the
- * core's `HorizonReport` states: in shadow -- the state every switch into
- * `MODE_MPC` is made from -- `crane_mpc` publishes nothing at all on
- * `/crane/mpc/horizon`, so a check against the horizon could never pass.
- */
 crane_supervisor::HorizonReport solving(
   double age = 0.01,
   crane_supervisor::SolveOutcome outcome = crane_supervisor::SolveOutcome::Converged)
@@ -2199,11 +1687,6 @@ crane_supervisor::HorizonReport solving(
 }
 
 /// A healthy observation with the controller manager answering.
-/**
- * The horizon producer is left as it is on a stack that never composed one:
- * nothing has arrived, which is what makes a `MODE_MPC` request refused unless
- * a test says otherwise. `warm()` is how a test says otherwise.
- */
 crane_supervisor::SupervisorInput input_with(ControllerManagerReport manager)
 {
   crane_supervisor::SupervisorInput input = healthy_input();
@@ -2233,8 +1716,6 @@ TEST(SupervisorMode, TheActiveModeIsReadOffTheManagerAndNotRemembered)
 {
   const auto config = config_with_modes();
 
-  // Nothing active: the arm claim is free, and that is MODE_IDLE as an
-  // observation rather than as a default.
   const ActiveMode idle = crane_supervisor::active_mode(config, all_inactive());
   EXPECT_TRUE(idle.known);
   EXPECT_EQ(idle.mode, Mode::Idle);
@@ -2249,12 +1730,6 @@ TEST(SupervisorMode, TheActiveModeIsReadOffTheManagerAndNotRemembered)
   EXPECT_EQ(
     follow.active_controllers, (std::vector<std::string>{kVelocityController, kFollower}));
 
-  // The inner loop alone: **MODE_MPC**, and not a half-state of MODE_FOLLOW.
-  // That is the whole of what slice 6 changed about this function.  PRD §10
-  // step 3 puts the same `crane_velocity_controller` instance on both paths, so
-  // MODE_MPC's claim *is* MODE_FOLLOW's minus the trajectory controller, and
-  // matching by containment would have called this drift while calling
-  // MODE_FOLLOW ambiguous.  Matching by set equality answers both exactly.
   ControllerManagerReport unchained = following();
   unchained.controllers[1].state = "inactive";
   const ActiveMode mpc = crane_supervisor::active_mode(config, unchained);
@@ -2263,14 +1738,8 @@ TEST(SupervisorMode, TheActiveModeIsReadOffTheManagerAndNotRemembered)
   EXPECT_EQ(mpc.mode, Mode::Mpc);
   EXPECT_EQ(mpc.active_controllers, (std::vector<std::string>{kVelocityController}));
 
-  // And MODE_FOLLOW is still answered exactly rather than being satisfied by
-  // MODE_MPC's list as well: one mode matches, not two.
   EXPECT_EQ(crane_supervisor::active_mode(config, following()).mode, Mode::Follow);
 
-  // The trajectory controller alone, with the inner loop it chains onto down:
-  // *that* is a half-state, and a half-state is not a mode.  MODE_IDLE is what
-  // claims the least, and the clause says which controller is up rather than
-  // rounding the drift off into a mode nobody can act on.
   ControllerManagerReport half = following();
   half.controllers[0].state = "inactive";
   const ActiveMode drifted = crane_supervisor::active_mode(config, half);
@@ -2285,9 +1754,6 @@ TEST(SupervisorMode, AManagerThatIsNotAnsweringLeavesTheModeNotKnown)
 {
   const auto config = config_with_modes();
 
-  // Never answered.  MODE_IDLE goes on the wire because no motion mode can be
-  // confirmed, and the clause says outright that this is not an observation
-  // that nothing is running.
   const ActiveMode silent = crane_supervisor::active_mode(config, {});
   EXPECT_FALSE(silent.known);
   EXPECT_EQ(silent.mode, Mode::Idle);
@@ -2295,8 +1761,6 @@ TEST(SupervisorMode, AManagerThatIsNotAnsweringLeavesTheModeNotKnown)
   EXPECT_NE(
     crane_supervisor::mode_clause(config, silent).find("not known"), std::string::npos);
 
-  // Answered once and then stopped.  A remembered mode would stand on the wire
-  // for ever; this ages out, and the two absences do not read the same.
   ControllerManagerReport stale = following();
   stale.answer.age = 10.0 * config.controller_manager_deadline;
   const ActiveMode aged = crane_supervisor::active_mode(config, stale);
@@ -2309,8 +1773,6 @@ TEST(SupervisorMode, AManagerThatIsNotAnsweringLeavesTheModeNotKnown)
 
 TEST(SupervisorMode, TheStatusModeIsWhatTheManagerSaysAndNothingElse)
 {
-  // End of the path the acceptance criterion is about: `decide()` reports what
-  // was read, and a clear report is not a claim about the mode.
   const auto config = config_with_modes();
   auto input = input_with(following());
   const auto decision = crane_supervisor::decide(config, input);
@@ -2339,27 +1801,16 @@ TEST(SupervisorMode, AValueThatIsNotAModeIsRefusedRatherThanCast)
 
 TEST(SupervisorMode, AStaleHorizonRefusesMpcAndTheTrajectoryControllerIsNotPlannedAway)
 {
-  // PRD §10 step 2 and user story 35.  The freshness of the horizon is verified
-  // *before* the trajectory controller is deactivated -- no freshness, no
-  // switch -- and what makes that an assertion rather than a claim is that the
-  // plan comes back **empty**: nothing was deactivated, because nothing was
-  // planned to be.
   const auto config = config_with_modes();
 
-  // Nothing has ever arrived, which is also what a deployment that composes no
-  // producer at all looks like from here.
   const auto absent = ask(config, Mode::Mpc, following());
   EXPECT_FALSE(absent.accepted);
   EXPECT_TRUE(absent.deactivate.empty()) << "the trajectory controller was planned away";
   EXPECT_TRUE(absent.activate.empty());
   EXPECT_NE(absent.message.find("freshness"), std::string::npos) << absent.message;
   EXPECT_NE(absent.message.find("Nothing was deactivated"), std::string::npos) << absent.message;
-  // The machine is reported in the mode it is still in, not in the one that was
-  // asked for (user story 36).
   EXPECT_EQ(absent.active.mode, Mode::Follow);
 
-  // It was arriving and stopped, which is a different thing to chase and reads
-  // as one: the age and the deadline are both in the sentence.
   crane_supervisor::HorizonReport late = solving(10.0 * config.horizon_deadline);
   const auto stale = crane_supervisor::arbitrate_mode(
     config, static_cast<std::uint8_t>(Mode::Mpc), warm(input_with(following()), late));
@@ -2369,8 +1820,6 @@ TEST(SupervisorMode, AStaleHorizonRefusesMpcAndTheTrajectoryControllerIsNotPlann
   EXPECT_NE(stale.message.find("0.300 s"), std::string::npos) << stale.message;
   EXPECT_NE(stale.message, absent.message);
 
-  // A stamp further in this node's future than the margin allows is not a fresh
-  // sample either, and it names the clock rather than the optimizer.
   crane_supervisor::HorizonReport ahead = solving(-10.0 * config.horizon_deadline);
   const auto skewed = crane_supervisor::arbitrate_mode(
     config, static_cast<std::uint8_t>(Mode::Mpc), warm(input_with(following()), ahead));
@@ -2381,10 +1830,6 @@ TEST(SupervisorMode, AStaleHorizonRefusesMpcAndTheTrajectoryControllerIsNotPlann
 
 TEST(SupervisorMode, AProducerThatIsAliveAndNotConvergingIsTheDeadMpcStepTwoRefuses)
 {
-  // The half freshness alone cannot see.  An optimizer that publishes at rate
-  // and fails every solve reads as fresh, and it is exactly the dead MPC user
-  // story 35 refuses to switch into: PRD §10 step 1 wants it *warm*, and shadow
-  // mode already implies it solves.
   const auto config = config_with_modes();
 
   for (const crane_supervisor::SolveOutcome outcome :
@@ -2404,8 +1849,6 @@ TEST(SupervisorMode, AProducerThatIsAliveAndNotConvergingIsTheDeadMpcStepTwoRefu
     EXPECT_NE(
       refused.message.find(crane_supervisor::solve_outcome_name(outcome)), std::string::npos)
       << refused.message;
-    // The producer's own account of the cycle is carried rather than restated,
-    // the way the broadcaster's status string is.
     EXPECT_NE(refused.message.find("30 ms budget"), std::string::npos) << refused.message;
   }
 
@@ -2415,10 +1858,6 @@ TEST(SupervisorMode, AProducerThatIsAliveAndNotConvergingIsTheDeadMpcStepTwoRefu
 
 TEST(SupervisorMode, TheFreshnessCheckIsAFunctionOfItsOwnAndItAnswersOnlyAboutMpc)
 {
-  // The order is the assertion, and it is what makes the node able to run this
-  // check *before it asks the controller manager for anything at all*.  A
-  // request for any other mode has to come back empty from it, or the node's
-  // early exit would refuse switches that have nothing to do with the horizon.
   const auto config = config_with_modes();
   const crane_supervisor::SupervisorInput cold = input_with(following());
 
@@ -2427,21 +1866,13 @@ TEST(SupervisorMode, TheFreshnessCheckIsAFunctionOfItsOwnAndItAnswersOnlyAboutMp
       crane_supervisor::mpc_horizon_refusal(config, static_cast<std::uint8_t>(mode), cold).empty())
       << crane_supervisor::mode_name(mode);
   }
-  // A value that is not a mode is not this check's to refuse either:
-  // `arbitrate_mode()` answers that one and says which values exist.
   EXPECT_TRUE(crane_supervisor::mpc_horizon_refusal(config, 200, cold).empty());
 
-  // MODE_MPC with nothing arriving is the one case it answers, and the sentence
-  // it returns is the one the arbitration puts on the response -- one function,
-  // two call sites, so the early answer and the arbitration cannot disagree.
   const std::string refusal =
     crane_supervisor::mpc_horizon_refusal(config, static_cast<std::uint8_t>(Mode::Mpc), cold);
   EXPECT_FALSE(refusal.empty());
   EXPECT_EQ(refusal, ask(config, Mode::Mpc, following()).message);
 
-  // And it is checked *above* the view of the controller manager: a supervisor
-  // that cannot see the manager still refuses MODE_MPC for the horizon, which
-  // is the reason that is actually true and the one an operator can act on.
   crane_supervisor::SupervisorInput blind = healthy_input();
   EXPECT_EQ(
     crane_supervisor::arbitrate_mode(config, static_cast<std::uint8_t>(Mode::Mpc), blind).message,
@@ -2450,12 +1881,6 @@ TEST(SupervisorMode, TheFreshnessCheckIsAFunctionOfItsOwnAndItAnswersOnlyAboutMp
 
 TEST(SupervisorMode, AWarmHorizonAdmitsMpcAndThePlanNeverNamesTheInnerLoop)
 {
-  // PRD §10 step 3 as a plan: "Same controller instance across both paths, so
-  // the handover is an ordinary seam, not new machinery."  The switch out of
-  // MODE_FOLLOW names the trajectory controller and **nothing else** -- a plan
-  // that named the inner loop would be asking for the sole claimant of the six
-  // velocity command interfaces to be released and re-claimed, which would
-  // destroy the very thing step 3 clamps the first B-spline to.
   const auto config = config_with_modes();
   const auto accepted = crane_supervisor::arbitrate_mode(
     config, static_cast<std::uint8_t>(Mode::Mpc), warm(input_with(following())));
@@ -2466,8 +1891,6 @@ TEST(SupervisorMode, AWarmHorizonAdmitsMpcAndThePlanNeverNamesTheInnerLoop)
   // The other half of the switch, and this supervisor's alone.
   EXPECT_TRUE(accepted.horizon_producer_active);
 
-  // And back.  Only the trajectory controller is activated, nothing is
-  // deactivated at all, and the producer goes back to shadow.
   const auto back = crane_supervisor::arbitrate_mode(
     config, static_cast<std::uint8_t>(Mode::Follow), warm(input_with(unchained())));
   ASSERT_TRUE(back.accepted) << back.message;
@@ -2475,8 +1898,6 @@ TEST(SupervisorMode, AWarmHorizonAdmitsMpcAndThePlanNeverNamesTheInnerLoop)
   EXPECT_TRUE(back.deactivate.empty()) << "the inner loop was planned away across the handover";
   EXPECT_FALSE(back.horizon_producer_active);
 
-  // Every other mode leaves the producer in shadow, so the flag is the mode and
-  // not a second decision.
   for (const Mode mode : {Mode::Idle, Mode::Manual}) {
     EXPECT_FALSE(
       crane_supervisor::arbitrate_mode(
@@ -2488,21 +1909,12 @@ TEST(SupervisorMode, AWarmHorizonAdmitsMpcAndThePlanNeverNamesTheInnerLoop)
 
 TEST(SupervisorMode, TheHorizonProducerHasADeadlineAndItIsNotAnyOfTheInputDeadlines)
 {
-  // The producer's stream is deliberately not an `Input` -- an optimizer that is
-  // quiet while the machine is in MODE_FOLLOW is the ordinary state of this
-  // stack, and ROS 2 Interfaces §4 makes merging FAULT_SOLVER onto the status a
-  // slice of its own.  §5.3's rule is met the way the polled controller-manager
-  // view meets it: its own margin, refused when absent, and a defined
-  // consequence at the point it matters.
   std::string reason;
   auto undated = config_with_modes();
   undated.horizon_deadline = 0.0;
   EXPECT_FALSE(crane_supervisor::validate(undated, reason));
   EXPECT_NE(reason.find("horizon"), std::string::npos) << reason;
 
-  // And a producer that stopped raises no fault on the status stream at all:
-  // the decision is unchanged by it, which is the property the registry's
-  // absence is there to give.
   const auto config = config_with_modes();
   crane_supervisor::SupervisorInput quiet = input_with(following());
   const auto without = crane_supervisor::decide(config, quiet);
@@ -2534,21 +1946,15 @@ TEST(SupervisorMode, ALatchedFaultRefusesAMotionModeAndCarriesTheLatchedCause)
     crane_supervisor::arbitrate_mode(config, static_cast<std::uint8_t>(Mode::Follow), input);
   EXPECT_FALSE(refused.accepted);
   EXPECT_TRUE(refused.deactivate.empty());
-  // The latched cause is the reason, carried rather than restated, and it names
-  // where the acknowledgement goes.
   EXPECT_NE(refused.message.find("emergency stop"), std::string::npos) << refused.message;
   EXPECT_NE(refused.message.find("/crane/clear_fault"), std::string::npos) << refused.message;
 
-  // Absence of the stop signal is asserted, so it latches the same way and
-  // refuses the same switch (§6.1).
   crane_supervisor::SupervisorInput absent = input_with(all_inactive());
   absent.stream(Input::RemoteCtrl).received = false;
   EXPECT_FALSE(
     crane_supervisor::arbitrate_mode(config, static_cast<std::uint8_t>(Mode::Manual), absent)
     .accepted);
 
-  // MODE_IDLE is not refused by it: releasing the claim is the one direction a
-  // latched stop does not argue against.
   crane_supervisor::SupervisorInput latched_and_following = input_with(following());
   latched_and_following.estop_latched = true;
   const auto to_idle = crane_supervisor::arbitrate_mode(
@@ -2559,10 +1965,6 @@ TEST(SupervisorMode, ALatchedFaultRefusesAMotionModeAndCarriesTheLatchedCause)
 
 TEST(SupervisorMode, EveryPreconditionIsCheckedBeforeAnythingIsPlannedAwayFromTheActiveMode)
 {
-  // PRD §10 step 2 and user story 35, as a property of the plan rather than of
-  // the timing: on every refusal there is nothing to deactivate, so a switch
-  // that cannot succeed leaves the machine in the mode it is already in and is
-  // never discovered half-way.
   const auto config = config_with_modes();
 
   // A mode this deployment configures no controller for.
@@ -2591,8 +1993,6 @@ TEST(SupervisorMode, EveryPreconditionIsCheckedBeforeAnythingIsPlannedAwayFromTh
   EXPECT_TRUE(stuck.deactivate.empty());
   EXPECT_NE(stuck.message.find("unconfigured"), std::string::npos) << stuck.message;
 
-  // Every one of them says what was *not* done, so an operator is never left
-  // with an unexplained no-op (PRD user story 36).
   for (const auto & refusal : {unconfigured, missing, stuck}) {
     EXPECT_FALSE(refusal.message.empty());
     EXPECT_NE(refusal.message.find("Nothing was deactivated"), std::string::npos)
@@ -2603,11 +2003,6 @@ TEST(SupervisorMode, EveryPreconditionIsCheckedBeforeAnythingIsPlannedAwayFromTh
 
 TEST(SupervisorMode, TheModesAreMutuallyExclusiveAndTheSwitchIsOneCall)
 {
-  // §7: manual and autonomous already exclude each other by resource claim, and
-  // what this adds is the arbitrated decision in front of it.  The plan carries
-  // the deactivation of the outgoing mode and the activation of the incoming
-  // one together, so the machine passes from one to the other inside one of the
-  // manager's cycles rather than through a state that is neither.
   const auto config = config_with_modes();
   const auto to_manual = ask(config, Mode::Manual, following());
   ASSERT_TRUE(to_manual.accepted) << to_manual.message;
@@ -2615,9 +2010,6 @@ TEST(SupervisorMode, TheModesAreMutuallyExclusiveAndTheSwitchIsOneCall)
   EXPECT_EQ(to_manual.activate, (std::vector<std::string>{kManualController}));
   EXPECT_EQ(to_manual.deactivate, (std::vector<std::string>{kVelocityController, kFollower}));
 
-  // The order of the activation is the deployment's own and is not sorted:
-  // PRD §5's cascade brings the inner loop up before anything chains onto its
-  // reference interfaces.
   const auto to_follow = ask(config, Mode::Follow, all_inactive());
   ASSERT_TRUE(to_follow.accepted) << to_follow.message;
   EXPECT_EQ(to_follow.activate, (std::vector<std::string>{kVelocityController, kFollower}));
@@ -2626,10 +2018,6 @@ TEST(SupervisorMode, TheModesAreMutuallyExclusiveAndTheSwitchIsOneCall)
 
 TEST(SupervisorMode, TheToolClaimIsNeverSwitchedByAModeRequest)
 {
-  // §7.3: with the block gripper the tool axis is on its own controller and can
-  // move while the arm controller is inactive -- a second, independent claim on
-  // the same pump.  A mode model that assumed one claim per machine would
-  // deactivate it here, silently, on every arm mode change.
   const auto config = config_with_modes();
   ControllerManagerReport with_tool = following();
   with_tool.controllers[3].state = "active";
@@ -2645,14 +2033,10 @@ TEST(SupervisorMode, TheToolClaimIsNeverSwitchedByAModeRequest)
     std::find(to_manual.activate.begin(), to_manual.activate.end(), kToolController),
     to_manual.activate.end());
 
-  // Releasing the arm claim does not release it either: MODE_IDLE is a mode of
-  // the arm and not of the machine.
   const auto to_idle = ask(config, Mode::Idle, with_tool);
   ASSERT_TRUE(to_idle.accepted) << to_idle.message;
   EXPECT_EQ(to_idle.deactivate, (std::vector<std::string>{kVelocityController, kFollower}));
 
-  // And it is reported, so a caller can see that a gripper action and an arm
-  // motion are two claims rather than one machine.
   const ActiveMode active = crane_supervisor::active_mode(config, with_tool);
   EXPECT_EQ(active.active_tool_controllers, (std::vector<std::string>{kToolController}));
   const std::string clause = crane_supervisor::mode_clause(config, active);
@@ -2662,11 +2046,6 @@ TEST(SupervisorMode, TheToolClaimIsNeverSwitchedByAModeRequest)
 
 TEST(SupervisorMode, ADeploymentWithNoToolClaimSaysSoRatherThanImplyingOneClaim)
 {
-  // The shipped state: `crane_velocity_controller` holds all six `velocity`
-  // interfaces including `q9_left_rail_joint`, so this composition has one
-  // claim.  The clause reports the absence rather than staying quiet, because a
-  // report that mentioned the tool only when it was held would be a
-  // one-claim-per-machine model with an exception in it.
   const auto config = default_config();
   const std::string clause =
     crane_supervisor::mode_clause(config, crane_supervisor::active_mode(config, following()));
@@ -2676,11 +2055,6 @@ TEST(SupervisorMode, ADeploymentWithNoToolClaimSaysSoRatherThanImplyingOneClaim)
 
 TEST(SupervisorMode, AClaimTheConfigurationDoesNotDescribeIsReportedRatherThanIgnored)
 {
-  // The other half of "not one claim per machine": something active that owns a
-  // command interface and belongs to no configured mode and to no tool claim.
-  // It is reported and not refused on -- a broadcaster owns none and would be a
-  // false alarm -- and it can still block a switch by holding an interface the
-  // incoming controller needs.
   const auto config = config_with_modes();
   ControllerManagerReport report = following();
   report.controllers.push_back(controller("joint_state_broadcaster", "active"));
@@ -2709,10 +2083,6 @@ TEST(SupervisorMode, TheModeAlreadyActiveIsANoOpAndIsReportedAsOne)
 
 TEST(SupervisorMode, ReleasingTheClaimIsAModeChangeAndSaysItIsNotAStop)
 {
-  // The one place this issue comes closest to §5.2's withheld stop path, and
-  // the report is where the difference is stated: nothing is zeroed at the
-  // driver boundary, and §7.2 measured that a manual controller which
-  // deactivates leaves its last velocity latched on the interface it released.
   const auto config = config_with_modes();
   const auto to_idle = ask(config, Mode::Idle, following());
   ASSERT_TRUE(to_idle.accepted) << to_idle.message;
@@ -2725,10 +2095,6 @@ TEST(SupervisorMode, ReleasingTheClaimIsAModeChangeAndSaysItIsNotAStop)
 
 TEST(SupervisorMode, EveryRequestIsAnsweredWithACauseAndNeverWithAnEmptyResult)
 {
-  // ROS 2 Interfaces §1 and PRD user story 36, over every mode against every
-  // state of the machine this core can be handed.  A refused switch that leaves
-  // an operator with an unexplained no-op is the failure this sweep is written
-  // against.
   const std::vector<ControllerManagerReport> machines{
     ControllerManagerReport{}, all_inactive(), following()};
   for (const auto & config : {default_config(), config_with_modes()}) {
@@ -2739,14 +2105,10 @@ TEST(SupervisorMode, EveryRequestIsAnsweredWithACauseAndNeverWithAnEmptyResult)
           input.estop_latched = latched;
           const auto arbitration = crane_supervisor::arbitrate_mode(config, value, input);
           EXPECT_FALSE(arbitration.message.empty()) << static_cast<int>(value);
-          // A refusal never plans anything away, and an accepted no-op never
-          // plans anything either.
           if (!arbitration.accepted || !arbitration.switch_required) {
             EXPECT_TRUE(arbitration.activate.empty()) << arbitration.message;
             EXPECT_TRUE(arbitration.deactivate.empty()) << arbitration.message;
           }
-          // Nothing is ever planned that is not a controller of a mode: the
-          // tool claim is out of reach of a mode request by construction.
           for (const auto & name : arbitration.deactivate) {
             EXPECT_NE(name, kToolController) << arbitration.message;
           }
@@ -2760,34 +2122,20 @@ TEST(SupervisorMode, ValidateRefusesAConfigurationTheArbitrationCouldNotAnswerFr
 {
   std::string reason;
 
-  // Two modes with the *same set* of controllers: both would read as active at
-  // once and the answer would depend on which list was checked first.  This is
-  // what replaced the old pairwise-disjoint rule, and it keeps the defect
-  // that rule was aimed at while letting through the overlap PRD §10 step 3
-  // requires.
   auto indistinguishable = config_with_modes();
   indistinguishable.mode_controllers[crane_supervisor::index_of(Mode::Manual)] = {
     kVelocityController};
   EXPECT_FALSE(crane_supervisor::validate(indistinguishable, reason));
   EXPECT_NE(reason.find("same set"), std::string::npos) << reason;
 
-  // The overlap itself is admitted, and it has to be: `MODE_MPC` is
-  // `MODE_FOLLOW` without the trajectory controller because the same inner loop
-  // carries both paths, and a rule that outlawed that would outlaw the
-  // architecture.  This is the shipped configuration.
   EXPECT_TRUE(crane_supervisor::validate(config_with_modes(), reason)) << reason;
 
-  // A name twice in one list: the list's length stops counting its controllers,
-  // so the set comparison could never match and the mode would be unreachable.
   auto repeated = config_with_modes();
   repeated.mode_controllers[crane_supervisor::index_of(Mode::Manual)] = {
     kManualController, kManualController};
   EXPECT_FALSE(crane_supervisor::validate(repeated, reason));
   EXPECT_NE(reason.find("twice"), std::string::npos) << reason;
 
-  // MODE_MPC implemented with no producer named: the claim would move to a path
-  // whose producer publishes nothing, and the inner loop would be unchained
-  // with no horizon.
   auto unnamed = config_with_modes();
   unnamed.mpc_node.clear();
   EXPECT_FALSE(crane_supervisor::validate(unnamed, reason));
@@ -2798,8 +2146,6 @@ TEST(SupervisorMode, ValidateRefusesAConfigurationTheArbitrationCouldNotAnswerFr
   without_mpc.mode_controllers[crane_supervisor::index_of(Mode::Mpc)].clear();
   EXPECT_TRUE(crane_supervisor::validate(without_mpc, reason)) << reason;
 
-  // A controller that is both a mode's and the tool claim's: an arm mode change
-  // would deactivate the gripper it is supposed to leave alone (§7.3).
   auto shared_tool = config_with_modes();
   shared_tool.tool_controllers = {kFollower};
   EXPECT_FALSE(crane_supervisor::validate(shared_tool, reason));
@@ -2811,8 +2157,6 @@ TEST(SupervisorMode, ValidateRefusesAConfigurationTheArbitrationCouldNotAnswerFr
   EXPECT_FALSE(crane_supervisor::validate(busy_idle, reason));
   EXPECT_NE(reason.find("MODE_IDLE"), std::string::npos) << reason;
 
-  // And the polled view has a deadline like everything else, or the mode would
-  // either always be unknown or never be.
   auto undated = config_with_modes();
   undated.controller_manager_deadline = 0.0;
   EXPECT_FALSE(crane_supervisor::validate(undated, reason));

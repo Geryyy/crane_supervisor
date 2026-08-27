@@ -1,7 +1,3 @@
-// The `crane_supervisor` executable of ROS 2 Interfaces §2. It is a process
-// around one node and holds nothing of its own -- the default single-threaded
-// executor is what serialises the subscription callback against the status
-// timer, and that serialisation is the reason the node needs no lock.
 
 #include <memory>
 

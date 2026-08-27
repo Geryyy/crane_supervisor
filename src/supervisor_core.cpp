@@ -14,11 +14,6 @@ namespace crane_supervisor
 namespace
 {
 
-// The parts of a staleness report that do not depend on which input it is
-// about. Everything that does comes off that input's `InputPolicy` row, so a
-// fifth input gets a report by being described once rather than by having three
-// more messages written for it -- which is how the four this package already
-// carries came to be judged by four copies of the same three comparisons.
 constexpr char kNoStatusGiven[] =
   "(the producer set no status string, which is itself a defect -- the message carries the cause "
   "in that field)";
@@ -43,10 +38,6 @@ constexpr char kObserving[] =
   "(wiki/control_architecture.md 6.3). Read FAULT_NONE as 'nothing this supervisor watches is "
   "wrong', not as 'the machine is safe'.";
 
-// The tracking duty of wiki/control_architecture.md §5 row 1, decided from the
-// trajectory controller's own state publication. The typed cause §5.0 exists to
-// produce, in place of the stall inferred from a deliberately tight goal
-// tolerance.
 constexpr char kTrackingExceeded[] =
   "tracking: the velocity-tracking tolerance is exceeded on ";
 
@@ -80,10 +71,6 @@ constexpr char kNoVelocityErrorReported[] =
   "effort command interface; a profile that gives it neither leaves the field empty, and an empty "
   "field must not be read as a zero error.";
 
-// The inner velocity loop's own codes, carried through rather than restated:
-// the controller computes them from the state interfaces it claims itself and
-// from the identified map of the tool it is driving, and nothing above the
-// controller manager can see either.
 constexpr char kInnerLoopStateHealth[] =
   "state health: the inner velocity loop reports a measurement of its own as stale or degraded. "
   "It judges that per cycle from the state interfaces it claims itself -- the joint position and "
@@ -137,11 +124,6 @@ constexpr char kNoticeTail[] =
   "crane_control/config/tracking_tolerance.yaml -- read by the seam clamp, by the MPC's "
   "constraint margin and by this supervisor, so that one number cannot become three.";
 
-// The emergency stop and the deadman. Every one of these says the same thing
-// about what it is for, because the sentence is the point: this software path is
-// diagnosis and clean recovery (wiki/control_architecture.md §6.1), the hardware
-// and PLC chain is the protection, and an operator reading FAULT_ESTOP off a
-// panel must not take the report for the function.
 constexpr char kDiagnosisNotProtection[] =
   " This report is diagnosis and recovery, not protection: the stop chain is hardware and PLC, it "
   "acts whether or not this software is running, and nothing here stopped, ramped or deactivated "
@@ -169,9 +151,6 @@ constexpr char kDeadmanReleasedTail[] =
   "of a motion, so this clears itself the cycle after the button is pressed and needs no "
   "acknowledgement.";
 
-// The three answers /crane/clear_fault can give. None of them is an empty
-// success (ROS 2 Interfaces §1): the refusal names the condition that is still
-// true, and the clear says what it lowered and what may happen next.
 constexpr char kClearRefusedAsserted[] =
   "refused: em_stop is still asserted on /crane/remote_ctrl_states. The latch is not what is "
   "holding the fault up -- the condition behind it is -- so clearing it now would report a success "
@@ -193,10 +172,6 @@ constexpr char kCleared[] =
   "changes the latch is raised again on the next status cycle, which is the specified behaviour "
   "and not a failed clear. Nothing was started, resumed or commanded by this call.";
 
-// The mode, and the one authority this supervisor has. Every one of these says
-// what was and was not done, because the failure they are written against is a
-// refused switch that leaves an operator with an unexplained no-op (ROS 2
-// Interfaces §1, PRD user story 36).
 constexpr char kActiveState[] = "active";
 constexpr char kInactiveState[] = "inactive";
 
@@ -205,11 +180,6 @@ constexpr char kModeNotAValue[] =
   "MODE_IDLE (0), MODE_MANUAL (1), MODE_FOLLOW (2) and MODE_MPC (3). Nothing was switched, and the "
   "machine is in the mode the response reports.";
 
-// PRD §10 step 2, in the form slice 6 can implement it: there is a producer
-// now, so the check reads it instead of reporting its absence. Every branch
-// ends in the same two clauses -- what is lost, and that nothing was
-// deactivated -- because the whole point of checking first is that the machine
-// keeps the claim it has.
 constexpr char kHorizonRefusedHead[] =
   "refused: MODE_MPC needs a horizon and the freshness of the one behind it cannot be established. "
   "PRD 10 step 2 requires that to be verified *before* the trajectory controller is deactivated -- "
@@ -281,11 +251,6 @@ constexpr char kHorizonNoAccount[] =
 constexpr char kHorizonProducerFault[] =
   " It is also raising FAULT_SOLVER on that stream, which is the one code it raises.";
 
-// ------------------------------------------------------------------------
-// FAULT_SOLVER on the status stream, and the hand-back it can end in
-// (wiki/control_architecture.md 5 row 3, wiki/mpc.md 6,
-// wiki/implementation/ros2_interfaces.md 4).
-// ------------------------------------------------------------------------
 
 constexpr char kSolverFaultHead[] =
   "solver: the horizon producer is the live command path and it is reporting a fault on "
@@ -402,9 +367,6 @@ constexpr char kSwitchNoAccount[] =
   "(the controller manager returned no message, which is itself worth reporting: the service "
   "carries one for exactly this case)";
 
-// The horizon producer's own mode, reported beside the claim. It is a second
-// process and a second thing that can fail, so the report says which of the two
-// moved rather than letting a silent horizon be the only evidence.
 constexpr char kProducerActive[] = "active";
 constexpr char kProducerShadow[] = "shadow";
 
@@ -481,11 +443,6 @@ constexpr char kUnmodelledClaimantsTail[] =
   "incoming controller needs.";
 
 /// Seconds as text, to the millisecond.
-/**
- * `std::to_string` prints six decimals of a number this stack knows to three,
- * and a status line an operator reads is the wrong place for three digits of
- * false precision.
- */
 std::string seconds_text(double seconds)
 {
   char buffer[32];
@@ -493,9 +450,6 @@ std::string seconds_text(double seconds)
   return std::string(buffer);
 }
 
-/// A joint-space quantity as text. Four decimals, which is a tenth of a
-/// milliradian and a tenth of a millimetre -- finer than anything this machine
-/// resolves, and coarse enough not to print a double's tail at an operator.
 std::string quantity_text(double value)
 {
   char buffer[32];
@@ -504,13 +458,6 @@ std::string quantity_text(double value)
 }
 
 /// The unit of one axis, from its URDF name.
-/**
- * ROS 2 Interfaces §3.1 splits the actuated set into four `theta*` revolute
- * axes and two `q*` prismatic ones, and the split is what makes the max in
- * `tracking_error` a mixed-unit number. The unit is read off the name rather
- * than tabulated, because a table would be a second place for the split to be
- * written down and the naming rule is nomenclature §4's, not this file's.
- */
 const char * angular_or_linear(const std::string & joint, bool per_second)
 {
   const bool angular = !joint.empty() && joint.front() == 't';
@@ -520,8 +467,6 @@ const char * angular_or_linear(const std::string & joint, bool per_second)
   return angular ? "rad" : "m";
 }
 
-/// How a report about one fault opens, so an operator reads the constant in
-/// words before reading the observation behind it.
 const char * fault_head(Fault fault)
 {
   switch (fault) {
@@ -549,15 +494,6 @@ std::string joined(const std::vector<std::string> & items)
 }
 
 /// The account of the emergency stop, whichever of its causes holds.
-/**
- * The absences go through the same generator every other input's do, because
- * §6.1's rule that a dead reader and a released button must not look alike is
- * §5.3's rule with a different constant on it. What is added here is the
- * sentence that must be on every one of them: this is diagnosis, not protection.
- *
- * `Fresh` reaches this only through the latch, which is the case where the
- * condition is gone and the acknowledgement is what is still owed.
- */
 std::string stop_message(
   const SupervisorConfig & config, const SupervisorInput & input, Staleness cause)
 {
@@ -573,15 +509,6 @@ std::string stop_message(
 }
 
 /// Whether the emergency stop is latched as of this observation.
-/**
- * One expression, called from both places that need it: the status cycle and
- * the mode arbitration. They must not be able to disagree -- an arbitration
- * that admitted a switch the next status report would still be refusing would
- * be two answers to one question -- and two copies of `||` in two functions is
- * exactly how that happens.
- *
- * §6.1: asserted latches, and absence is asserted.
- */
 bool stop_is_latched(const SupervisorConfig & config, const SupervisorInput & input)
 {
   const Staleness cause =
@@ -590,11 +517,6 @@ bool stop_is_latched(const SupervisorConfig & config, const SupervisorInput & in
 }
 
 /// Why no axis was compared this cycle, or empty when at least one was.
-/**
- * Two different absences, and they are not the same thing to chase: nobody has
- * measured the tolerance yet, or the tolerance exists and the controller is not
- * publishing the quantity it applies to.
- */
 std::string nothing_compared_reason(
   const SupervisorConfig & config, const ControllerStateReport & report)
 {
@@ -614,10 +536,6 @@ std::string nothing_compared_reason(
 }
 
 /// The inner loop's own account of one of its codes, in the operator's terms.
-/**
- * `NotCommissioned` is deliberately absent: it is answered where the axes it
- * names are available, and it is reported at a different place in the order.
- */
 const char * inner_loop_message(Fault fault)
 {
   switch (fault) {
@@ -650,9 +568,6 @@ const char * solve_outcome_name(SolveOutcome outcome) noexcept
 {
   switch (outcome) {
     case SolveOutcome::Unknown:
-      // The wire's zero, and the wire says outright why it is `unknown` rather
-      // than a healthy solve: a message nobody filled must not read as an
-      // optimizer that converged.
       return "SOLVE_UNKNOWN -- nothing filled the verdict on that report";
     case SolveOutcome::Converged:
       return "SOLVE_CONVERGED";
@@ -682,11 +597,6 @@ const char * mode_name(Mode mode) noexcept
 
 bool validate(const SupervisorConfig & config, std::string & reason)
 {
-  // Over `Input` rather than over a list written here, so that an input added to
-  // the enum is checked without this function being touched -- and, until
-  // somebody gives it a margin, refused. A deadline that were merely *absent*
-  // would make that input exempt from §5.3, which is the one failure a warning
-  // could not catch, because there would be nothing to warn about.
   for (std::size_t i = 0; i < kInputCount; ++i) {
     const InputPolicy & policy = kInputPolicies[i];
     const double deadline = config.freshness_deadline[i];
@@ -702,9 +612,6 @@ bool validate(const SupervisorConfig & config, std::string & reason)
       return false;
     }
   }
-  // The polled view of the controller manager. Not one of the four above --
-  // it is a service and not a stream -- but held to the same rule, because a
-  // snapshot with no margin on it is a mode nobody can date.
   if (
     !std::isfinite(config.controller_manager_deadline) ||
     config.controller_manager_deadline <= 0.0)
@@ -718,11 +625,6 @@ bool validate(const SupervisorConfig & config, std::string & reason)
       "src/crane_supervisor_parameters.yaml.";
     return false;
   }
-  // The horizon producer's report. Held to the same rule the polled view is,
-  // and for the same reason: a producer nobody can date is a switch into
-  // MODE_MPC that would be admitted or refused by a number nobody chose, and
-  // PRD §10 step 2's whole content is that the age is compared against
-  // something.
   if (!std::isfinite(config.horizon_deadline) || config.horizon_deadline <= 0.0) {
     reason =
       "the horizon producer's report has a freshness deadline of " +
@@ -733,21 +635,6 @@ bool validate(const SupervisorConfig & config, std::string & reason)
       "src/crane_supervisor_parameters.yaml.";
     return false;
   }
-  // The mode lists. Every rule here is what makes `active_mode()` able to give
-  // one answer: a name that is empty pairs with nothing, a name twice in one
-  // list makes that list's size stop counting its controllers, two modes with
-  // the same set of controllers both match the machine at once, and a
-  // controller that is both a mode's and the tool's would be deactivated by a
-  // mode switch that is supposed never to touch the tool claim (§7.3).
-  //
-  // What is deliberately *not* a rule any more is that the lists be pairwise
-  // disjoint. It was one until slice 6 and it was right while `MODE_MPC` was
-  // empty; populating it makes it wrong, because PRD §10 step 3 puts the same
-  // `crane_velocity_controller` instance on both paths on purpose -- "so the
-  // handover is an ordinary seam, not new machinery" -- and a rule that
-  // outlawed the overlap would outlaw the architecture. `active_mode()` matches
-  // by set equality instead of containment, which answers a nested pair exactly,
-  // and the rule that keeps that answer unique is the one below.
   if (!config.mode_controllers[index_of(Mode::Idle)].empty()) {
     reason =
       "MODE_IDLE is configured with controllers, and it is the absence of a motion claim rather "
@@ -779,10 +666,6 @@ bool validate(const SupervisorConfig & config, std::string & reason)
         in_a_mode.push_back(name);
       }
     }
-    // The rule that replaced the pairwise-disjoint one. Two modes naming the same set both
-    // match the machine at once and the answer would depend on which was
-    // checked first -- which is the defect the old rule was aimed at, kept,
-    // while the overlap PRD §10 step 3 requires is allowed through.
     for (std::size_t k = 0; k < i; ++k) {
       if (controllers.empty() || config.mode_controllers[k].size() != controllers.size()) {
         continue;
@@ -822,11 +705,6 @@ bool validate(const SupervisorConfig & config, std::string & reason)
       return false;
     }
   }
-  // The producer behind MODE_MPC. A deployment that implements the mode has to
-  // name the node whose mode this supervisor drives, because the claim moving
-  // to the MPC path while the producer stays in shadow leaves the inner loop
-  // unchained with no horizon -- which ramps its command to zero and reports
-  // FAULT_REFERENCE_STALE, a hole in the handover rather than a seam.
   if (!config.mode_controllers[index_of(Mode::Mpc)].empty() && config.mpc_node.empty()) {
     reason =
       "MODE_MPC is configured with controllers and no horizon producer is named. Which path is "
@@ -846,10 +724,6 @@ bool validate(const SupervisorConfig & config, std::string & reason)
       return false;
     }
   }
-  // Refused rather than reported, unlike the tracking tolerance above: these
-  // numbers ship with the package, so a deployment without one has been
-  // misconfigured and a supervisor that went on publishing would report
-  // FAULT_NONE for a duty it had quietly stopped performing.
   if (!validate_sway(config.sway, reason)) {
     return false;
   }
@@ -1001,22 +875,12 @@ namespace
 {
 
 /// The cause of one cycle, with the sway already judged.
-/**
- * The precedence chain, and nothing else. It is split out from `decide()` so
- * that the settled clause every report ends in is appended in exactly one place:
- * a clause added at each of the ten `return`s below is a clause the eleventh
- * would be missing.
- */
 SupervisorDecision resolve(
   const SupervisorConfig & config, const SupervisorInput & input,
   const std::array<Staleness, kInputCount> & staleness, const SwayVerdict & sway,
   const ActiveMode & active)
 {
   SupervisorDecision decision;
-  // `mode` is filled by `decide()` from the controller manager's own answer,
-  // once, after this chain has run: it is owed on every report whatever the
-  // fault is, and a branch that set it would be one more place for the
-  // supervisor's model of the world to drift from the world.
 
   const Staleness remote_cause = staleness[index_of(Input::RemoteCtrl)];
 
@@ -1024,44 +888,20 @@ SupervisorDecision resolve(
   const ControllerStateReport & controller = input.controller_state;
   const ControllerHealthReport & inner_loop = input.controller_health;
 
-  // Filled before any branch returns, for the same reason `deadman_held` is: it
-  // is a field of its own on every report, so the largest deviation on the crane
-  // stays visible in the cycles where a more consequential cause owns `fault`.
-  // Zero while the stream is not arriving -- and that case is itself a fault
-  // below, so the zero is never the only thing said about it.
   if (staleness[index_of(Input::ControllerState)] == Staleness::Fresh) {
     decision.tracking_error = max_position_error(controller);
   }
 
-  // Filled before any branch returns, because it is owed on *every* status and
-  // not only on the ones where the deadman is what went wrong. It is also the
-  // reason the interlock can sit below state health below: a released deadman
-  // stays visible in this field even in a cycle whose `fault` is something else,
-  // where a state-health fault that lost the field would be invisible.
   decision.deadman_held = remote_cause == Staleness::Fresh && input.remote_ctrl.deadman_held;
 
-  // §6.1: asserted latches, and absence is asserted. The latch is raised here
-  // and lowered in exactly one place -- an acknowledged `/crane/clear_fault` --
-  // and it is the only input whose fault does not clear itself, which is what
-  // `InputPolicy::latches` records. The expression is shared with the mode
-  // arbitration, so the two cannot disagree about what is latched.
   decision.estop_latched = stop_is_latched(config, input);
 
-  // The stop outranks everything else this supervisor watches, and it has to:
-  // it is the only cause here with no field of its own, so a cycle that reported
-  // something else instead would not report it at all. A stale passive state is
-  // a defect in a stream; a stop is the machine having been stopped.
   if (decision.estop_latched) {
     decision.fault = policy_of(Input::RemoteCtrl).fault;
     decision.message = stop_message(config, input, remote_cause);
     return decision;
   }
 
-  // Resolved in the order of how much of the estimate the cause removes, the
-  // same ordering pendulum_state_broadcaster resolves its own causes in: an
-  // input that is not there leaves nothing to judge, one whose age is unknowable
-  // leaves numbers nobody can place in time, and one that arrived leaves numbers
-  // the estimator has already had its say about.
   if (staleness[index_of(Input::PendulumState)] != Staleness::Fresh) {
     decision.fault = policy_of(Input::PendulumState).fault;
     decision.message = staleness_message(
@@ -1070,11 +910,6 @@ SupervisorDecision resolve(
     return decision;
   }
 
-  // The one cause of the three this supervisor cannot measure off a topic: the
-  // producer's own flag. Its account is carried through rather than restated,
-  // because the broadcaster separates six causes behind that flag -- the sample
-  // that stopped refreshing among them -- and restating it here would flatten a
-  // distinction the estimator went to some trouble to make.
   if (!state.valid) {
     decision.fault = policy_of(Input::PendulumState).fault;
     decision.message = staleness_message(
@@ -1083,12 +918,6 @@ SupervisorDecision resolve(
     return decision;
   }
 
-  // The two remaining inputs, judged before anything derived from them is:
-  // §5.3 allows no input to stop arriving without a defined consequence, and
-  // here the consequences are that the tracking error is unmeasured rather than
-  // zero, and that the inner loop's verdict on itself is unread rather than
-  // clear. Both are swept in a loop over the registry, so a fifth input judged
-  // by the same rule needs no fifth branch.
   for (const Input stream_input : {Input::ControllerState, Input::ControllerHealth}) {
     const Staleness cause = staleness[index_of(stream_input)];
     if (cause != Staleness::Fresh) {
@@ -1099,36 +928,6 @@ SupervisorDecision resolve(
     }
   }
 
-  // The horizon producer's own code, merged as `crane_mpc` numbered it, exactly
-  // as the inner loop's is below (wiki/implementation/ros2_interfaces.md §4).
-  // `FAULT_SOLVER` is the one code that producer raises.
-  //
-  // **Scoped to the mode and not to the stream.** In `MODE_FOLLOW` this producer
-  // is shadowing: it solves, it publishes its verdict, and it drives nothing, so
-  // a failed shadow solve is not a fault of the machine and would stand on the
-  // operator's stream on every profile from the moment `crane_mpc` was composed.
-  // In `MODE_MPC` the same failure is the command path having stopped producing.
-  // That is why `HorizonReport` is not an `Input` and its code is merged all the
-  // same: absence and content are different questions.
-  //
-  // **Above the inner loop's codes, and that is the whole point of the branch.**
-  // When the producer stops, the receiver runs out of plan and raises
-  // `FAULT_REFERENCE_STALE` -- the consequence, one layer down, of this cause.
-  // §5.0 is explicit that what the task layer is owed is the typed cause rather
-  // than a symptom it has to infer, and reporting the receiver's verdict while
-  // the producer's went unread would be exactly the inferred signal the
-  // supervisor exists to replace. The cost is that the inner loop's own
-  // `FAULT_STATE_HEALTH` is outranked for as long as the optimizer is failing in
-  // `MODE_MPC`; it is a real cost, it is bounded by the escalation clearing the
-  // moment a solve converges again, and it is the smaller of the two losses.
-  //
-  // Judged on a **fresh** report, against the producer's own margin and by the
-  // same `freshness_of()` every stream here is judged by. A code off a report
-  // nobody has heard since is a fault this supervisor cannot still observe, and
-  // reporting it would be the latch §5.3 spends its whole table avoiding. A
-  // producer that goes silent altogether in `MODE_MPC` is therefore *not*
-  // reported as a solver fault: what the operator gets is the receiver running
-  // out of plan, which is the only thing either node can actually still see.
   const HorizonReport & horizon = input.horizon;
   const bool horizon_fresh =
     freshness_of(config.horizon_deadline, horizon.health) == Staleness::Fresh;
@@ -1142,38 +941,18 @@ SupervisorDecision resolve(
     return decision;
   }
 
-  // The inner loop's *health* codes, merged as the loop numbered them. Above
-  // tracking for the reason the passive state is above it -- a supervisor whose
-  // view of the crane is degraded should say so before it says anything derived
-  // -- and above the commissioning code for the reason
-  // wiki/implementation/commissioning_prerequisites.md §2 gives: the missing
-  // calibration will still be missing next cycle, and the state that just went
-  // stale is the one an operator has to act on now.
   if (inner_loop.fault != Fault::None && inner_loop.fault != Fault::NotCommissioned) {
     decision.fault = inner_loop.fault;
     decision.message = inner_loop_message(inner_loop.fault);
     return decision;
   }
 
-  // §5 row 7, as a typed cause. Below every health cause, because a supervisor
-  // whose own view of the crane is degraded should say that before it says
-  // anything derived from it -- and a degraded estimate cannot reach here at all,
-  // since `judge_sway()` raises no breach off a rate it was told not to trust.
-  // Above tracking, because of the two this is the one with no field of its own:
-  // `tracking_error` is filled on every report whatever `fault` says, so a
-  // tracking excess stays visible in a cycle sway owns, while a swinging load
-  // reported behind a tracking fault would be invisible. It is the same rule
-  // that puts the commissioning code above the interlock.
   if (!sway.breaches.empty()) {
     decision.fault = Fault::Sway;
     decision.message = sway_breach_message(sway.breaches);
     return decision;
   }
 
-  // §5 row 1, as a typed cause. Per axis and in the tolerance's own unit,
-  // because a max over rad/s and m/s decides nothing; the single number on the
-  // wire is the indicator and this is the verdict. The decision about what to do
-  // next is not made here and is not made by this supervisor at all (§5.0).
   const std::vector<TrackingBreach> breaches = tracking_breaches(config, controller);
   if (!breaches.empty()) {
     std::vector<std::string> texts;
@@ -1186,14 +965,6 @@ SupervisorDecision resolve(
     return decision;
   }
 
-  // The commissioning code, below every health cause and below tracking, and
-  // above the interlock. Above it deliberately: on the hardware profile this
-  // condition is *standing* -- prerequisite 4 will hold until someone records a
-  // calibration -- while a released deadman is the ordinary resting state of the
-  // machine, so putting the interlock first would hide the report this stream
-  // exists to deliver behind the routine. Nothing is lost by the ordering,
-  // because `deadman_held` is a field of its own on every report and the
-  // commissioning code has none.
   if (inner_loop.fault == Fault::NotCommissioned) {
     decision.fault = Fault::NotCommissioned;
     decision.message = inner_loop.feedforward_free_joints.empty()
@@ -1202,11 +973,6 @@ SupervisorDecision resolve(
     return decision;
   }
 
-  // Last of the five, and continuous rather than checked once at the start of a
-  // motion (§6.2). It is last because it is the only one of them that is a fact
-  // about the operator rather than a defect: a released deadman is the ordinary
-  // resting state of the machine, and letting it outrank a dead publisher would
-  // hide the defect behind the routine.
   if (!decision.deadman_held) {
     decision.fault = Fault::Interlock;
     decision.message =
@@ -1216,8 +982,6 @@ SupervisorDecision resolve(
 
   decision.fault = Fault::None;
   decision.message = kObserving;
-  // A clear report must not imply a check nobody made. When no axis could be
-  // compared, the sentence above is amended rather than left to stand.
   const std::string uncompared = nothing_compared_reason(config, controller);
   if (!uncompared.empty()) {
     decision.message += kNoAxisCompared + uncompared;
@@ -1229,52 +993,19 @@ SupervisorDecision resolve(
 
 SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput & input)
 {
-  // One pass over every input, on the status cycle: `kInputCount` comparisons,
-  // no allocation, and no dependence on a message arriving. A deadline that were
-  // evaluated only in a subscription callback could never fire, because the case
-  // it exists for is the one where no callback runs again
-  // (wiki/control_architecture.md §5.3).
   const std::array<Staleness, kInputCount> staleness = freshness(config, input);
 
-  // The one place that decides whether the passive estimate is to be believed,
-  // and it is the same answer the precedence chain reports on: the stream inside
-  // its own deadline *and* the broadcaster marking the sample usable. A second
-  // opinion here is how a rate gets judged against a bound in a cycle whose
-  // report says the estimate was unusable.
   const bool estimate_trusted =
     staleness[index_of(Input::PendulumState)] == Staleness::Fresh && input.pendulum_state.valid;
 
-  // Judged before the chain runs, not inside it, for the reason `deadman_held`
-  // and `tracking_error` are filled before any branch returns: the dwell is owed
-  // on every cycle, and one that stopped advancing whenever something more
-  // consequential owned `fault` would restart every time the operator let go of
-  // the deadman.
   const SwayVerdict sway = judge_sway(
     config.sway, input.pendulum_state.velocity, estimate_trusted, input.sampled_at, input.sway);
 
-  // What is *active*, read off the controller manager's own answer rather than
-  // remembered from the last successful `/crane/set_mode` call. A supervisor
-  // whose model of the world drifts from the world is worse than one that
-  // admits it does not know, and a remembered mode is exactly that drift: a
-  // controller that died, was never spawned, or was switched by something else
-  // would leave the last remembered mode standing on the wire for ever.
-  //
-  // Read **before** the precedence chain and handed to it, because one branch
-  // depends on it: the horizon producer's fault is the command path's only while
-  // the MPC is the command path, and in `MODE_FOLLOW` the same report describes a
-  // shadow solve that drove nothing. It is still assigned once, below, so no
-  // branch can set the field.
   const ActiveMode active = active_mode(config, input.controller_manager);
 
   SupervisorDecision decision = resolve(config, input, staleness, sway, active);
   decision.mode = active.mode;
   decision.sway = sway.state;
-  // Both clauses are on every report, whatever `fault` says, and both are
-  // appended here rather than at each of the branches above so that the
-  // eleventh branch cannot be the one that forgets them. The mode has a field
-  // of its own and the clause is still owed: `MODE_IDLE` on a report whose
-  // manager is not answering and `MODE_IDLE` on one whose arm claim is free are
-  // the same byte and different facts.
   decision.message += mode_clause(config, active);
   decision.message += settled_clause(config.sway, input.pendulum_state.velocity, sway);
   return decision;
@@ -1290,9 +1021,6 @@ ClearFaultOutcome clear_fault(const SupervisorConfig & config, const SupervisorI
     return outcome;
   }
 
-  // Judged from the same view of the same signal `decide()` uses, and against
-  // the same deadline, so that the acknowledgement and the next status cycle
-  // cannot disagree about whether the condition is still there.
   const Staleness cause =
     freshness_of(config.deadline(Input::RemoteCtrl), input.stream(Input::RemoteCtrl));
   if (cause == Staleness::Fresh && input.remote_ctrl.em_stop) {
@@ -1333,9 +1061,6 @@ bool is_controller_active(const ControllerManagerReport & report, const std::str
   return controller != nullptr && controller->state == kActiveState;
 }
 
-/// True when `name` is a controller of any configured mode, or of the tool
-/// claim. Anything else that is active and owns an interface is a claim this
-/// configuration never described (§7.3).
 bool is_modelled(const SupervisorConfig & config, const std::string & name)
 {
   for (std::size_t i = 0; i < kModeCount; ++i) {
@@ -1377,16 +1102,12 @@ std::string controller_manager_account(const SupervisorConfig & config, Stalenes
 ActiveMode active_mode(const SupervisorConfig & config, const ControllerManagerReport & report)
 {
   ActiveMode active;
-  // Judged by the same three comparisons every input is judged by. A snapshot
-  // nobody dated is a mode nobody can defend.
   active.cause = freshness_of(config.controller_manager_deadline, report.answer);
   if (active.cause != Staleness::Fresh) {
     return active;
   }
   active.known = true;
 
-  // Every controller of the arm claim that is up right now, once each and in
-  // configuration order. This is the set the modes are matched against.
   for (std::size_t i = 0; i < kModeCount; ++i) {
     for (const std::string & name : config.mode_controllers[i]) {
       if (
@@ -1399,15 +1120,6 @@ ActiveMode active_mode(const SupervisorConfig & config, const ControllerManagerR
     }
   }
 
-  // A mode is active when its controllers are *exactly* the ones that are up --
-  // equality and not containment. Containment was the rule while `MODE_MPC` was
-  // empty and it stops being sound the moment it is populated: PRD §10 step 3
-  // puts the same inner loop on both paths, so `MODE_MPC`'s list is
-  // `MODE_FOLLOW`'s minus the trajectory controller, and under containment
-  // FOLLOW holding the claim would satisfy MPC as well while MPC holding it
-  // would leave FOLLOW half up and read as drift. `validate()` has refused two
-  // modes with the same set, so at most one can match -- and if two somehow do,
-  // that is reported as drift rather than resolved by whichever came first.
   std::size_t matched = 0;
   for (std::size_t i = 0; i < kModeCount; ++i) {
     const std::vector<std::string> & controllers = config.mode_controllers[i];
@@ -1426,10 +1138,6 @@ ActiveMode active_mode(const SupervisorConfig & config, const ControllerManagerR
       active.mode = static_cast<Mode>(i);
     }
   }
-  // A half-state is not a mode. `Idle` is what claims the least, and the clause
-  // names what is up so that the drift is visible rather than rounded off. With
-  // nothing up at all there is no drift to report: that is the arm claim being
-  // free, which is `MODE_IDLE` as an observation.
   if (matched != 1) {
     active.mode = Mode::Idle;
     active.partial = !active.active_controllers.empty();
@@ -1441,9 +1149,6 @@ ActiveMode active_mode(const SupervisorConfig & config, const ControllerManagerR
     }
   }
 
-  // Reported, never refused on: the broadcasters own no command interface and
-  // would be false alarms, while a controller that does own one is a claim this
-  // configuration does not describe.
   for (const ControllerReport & controller : report.controllers) {
     if (
       controller.state == kActiveState && !controller.claimed_interfaces.empty() &&
@@ -1473,9 +1178,6 @@ std::string mode_clause(const SupervisorConfig & config, const ActiveMode & acti
     text += std::string(kModeClauseActive) + joined(active.active_controllers) + ".";
   }
 
-  // The second claim, always said, whichever way it stands: a report that
-  // mentioned the tool only when it was held would be a one-claim model with an
-  // exception in it.
   if (config.tool_controllers.empty()) {
     text += kToolClauseAbsent;
   } else if (active.active_tool_controllers.empty()) {
@@ -1496,9 +1198,6 @@ HorizonPrecondition horizon_precondition(
 {
   HorizonPrecondition precondition;
   precondition.cause = freshness_of(config.horizon_deadline, report.health);
-  // Both halves, and the second is not implied by the first: a producer that is
-  // alive, publishing at rate and failing every solve is exactly the dead MPC
-  // user story 35 refuses to switch into, and it reads as fresh.
   precondition.fresh =
     precondition.cause == Staleness::Fresh && report.outcome == SolveOutcome::Converged;
   return precondition;
@@ -1507,10 +1206,6 @@ HorizonPrecondition horizon_precondition(
 std::string mpc_horizon_refusal(
   const SupervisorConfig & config, std::uint8_t requested, const SupervisorInput & input)
 {
-  // Silent about every request that is not for the MPC path, so that the node
-  // can run this first without it having an opinion about anything else. A
-  // value that is not a mode is not this check's to refuse either --
-  // `arbitrate_mode()` answers that one, and says which values exist.
   if (!is_mode(requested) || static_cast<Mode>(requested) != Mode::Mpc) {
     return {};
   }
@@ -1537,19 +1232,11 @@ std::string mpc_horizon_refusal(
       break;
     case Staleness::Fresh:
     case Staleness::ProducerUnhealthy:
-      // The stream is fine and the *solve* is not, which is the half freshness
-      // alone cannot see. `ProducerUnhealthy` cannot arise here -- nothing sets
-      // it on this report -- and it lands in the same branch rather than in a
-      // default, so a value added to `Staleness` fails to compile instead of
-      // falling through to a sentence about a converged solve.
       text += kHorizonOutcomeHead + deadline + kHorizonOutcomeMid +
         solve_outcome_name(horizon.outcome) + kHorizonOutcomeTail;
       break;
   }
 
-  // The timing, whenever the producer has reported one at all: a solve that is
-  // losing its deadline says so in the sentence that refuses the switch rather
-  // than only in its own stream.
   if (horizon.health.received && horizon.solve_budget > 0.0) {
     text += kHorizonSolveTiming + seconds_text(horizon.solve_time) + kHorizonSolveBudget +
       seconds_text(horizon.solve_budget) +
@@ -1571,48 +1258,19 @@ SolverHandback solver_handback(
 {
   SolverHandback handback;
 
-  // 1. The MPC has to be the live command path. In `MODE_FOLLOW` this producer
-  //    is shadowing and an escalation there costs nothing: it stops publishing a
-  //    horizon nobody is executing.
   if (!active.known || active.partial || active.mode != Mode::Mpc) {
     return handback;
   }
 
-  // 2. Judged on a fresh report and on the producer's own margin, for the reason
-  //    `resolve()` is: a verdict nobody has heard since is not an observation.
   const HorizonReport & horizon = input.horizon;
   if (freshness_of(config.horizon_deadline, horizon.health) != Staleness::Fresh) {
     return handback;
   }
 
-  // 3. The escalation's observable. `crane_msgs/SolverHealth` has no field of
-  //    its own for wiki/mpc.md §6's repeated-failure escalation -- crane_mpc's
-  //    README says outright that a supervisor's action on it is the same as on a
-  //    standing `FAULT_SOLVER` with no horizon arriving, and that adding a field
-  //    would be a `crane_msgs` change, which PRD §15 makes a slice of its own.
-  //    So it is read off the two fields that do carry it: the code, and
-  //    `applied_previous_solution == false`, which is the producer saying that
-  //    **nothing went out** rather than that a shifted plan did.
   if (horizon.fault != Fault::Solver || horizon.applied_previous_solution) {
     return handback;
   }
 
-  // 4. And the receiver has run out of plan. This is the ordering of
-  //    wiki/control_architecture.md §5 row 3 -- "fall back, *then* stop and
-  //    report" -- as a condition rather than as a comment. The fall back is
-  //    `crane_velocity_controller`'s `horizon_expiry_ramp`, which takes the
-  //    velocity command to zero over its own configured time and raises
-  //    `FAULT_REFERENCE_STALE` while it does; the stop is this supervisor's, and
-  //    a stop issued the instant the escalation is first seen would cut a plan
-  //    the receiver still had and put on the command interface exactly the step
-  //    §5.2 step 3 and wiki/mpc.md §6 both refuse.
-  //
-  //    What it cannot wait for is the ramp *finishing*: neither
-  //    `VelocityControllerHealth` nor `SolverHealth` carries a field for it, and
-  //    inventing one is a field add. So the release lands inside the ramp rather
-  //    than after it, and what bounds the residual step is `horizon_expiry_ramp`
-  //    -- 0.2 s of a command already on its way down -- instead of the speed the
-  //    crane happened to be moving at.
   if (
     freshness_of(config.deadline(Input::ControllerHealth), input.stream(Input::ControllerHealth)) !=
     Staleness::Fresh || input.controller_health.fault != Fault::ReferenceStale)
@@ -1631,9 +1289,6 @@ ModeArbitration arbitrate_mode(
   const SupervisorConfig & config, std::uint8_t requested, const SupervisorInput & input)
 {
   ModeArbitration arbitration;
-  // Read once, at the top, and carried onto every answer below: a refusal
-  // leaves the machine in the mode it was already in, and the response says
-  // which that is rather than echoing what was asked for.
   arbitration.active = active_mode(config, input.controller_manager);
 
   // 1. A uint8 off the wire is not a mode until it has been checked.
@@ -1643,13 +1298,6 @@ ModeArbitration arbitrate_mode(
   }
   const Mode mode = static_cast<Mode>(requested);
 
-  // 2. PRD §10 step 2 and user story 35. The refusal is here -- above the view,
-  // above the latch, above every deployment question -- because it depends on
-  // none of them and an operator asking for MODE_MPC is owed the reason that is
-  // actually true. `SupervisorNode::set_mode()` runs the same function before it
-  // asks the controller manager for anything at all, so the order this position
-  // states is the order the node keeps: nothing is deactivated, and nothing is
-  // even polled, until the horizon has been verified.
   {
     const std::string refusal = mpc_horizon_refusal(config, requested, input);
     if (!refusal.empty()) {
@@ -1665,9 +1313,6 @@ ModeArbitration arbitrate_mode(
     return arbitration;
   }
 
-  // 4. The request for the mode that is already active. A no-op, reported as
-  // one: `success` is true because the mode asked for is the mode that holds
-  // after the call, which is what `active_mode` on the response means.
   if (mode == arbitration.active.mode && !arbitration.active.partial) {
     arbitration.accepted = true;
     arbitration.message =
@@ -1675,9 +1320,6 @@ ModeArbitration arbitrate_mode(
     return arbitration;
   }
 
-  // 5. The latch, from the same observation `decide()` judges it from. Motion
-  // modes only: MODE_IDLE releases the claim, and a latched stop does not argue
-  // against that direction.
   if (mode != Mode::Idle && stop_is_latched(config, input)) {
     const Staleness remote_cause =
       freshness_of(config.deadline(Input::RemoteCtrl), input.stream(Input::RemoteCtrl));
@@ -1685,18 +1327,12 @@ ModeArbitration arbitrate_mode(
     return arbitration;
   }
 
-  // 6. What this deployment configured for the mode. Empty is a refusal with a
-  // reason and not a switch that does nothing.
   const std::vector<std::string> & wanted = config.mode_controllers[index_of(mode)];
   if (mode != Mode::Idle && wanted.empty()) {
     arbitration.message = std::string(mode_name(mode)) + kModeRefusedNoControllers;
     return arbitration;
   }
 
-  // 7. Every controller the mode needs, on the manager and in a state a switch
-  // can move. This is the check that keeps a doomed switch from being started:
-  // it runs against the snapshot taken above, before a single deactivation is
-  // planned, let alone issued.
   for (const std::string & name : wanted) {
     const ControllerReport * const controller =
       controller_named(input.controller_manager, name);
@@ -1717,9 +1353,6 @@ ModeArbitration arbitrate_mode(
     }
   }
 
-  // The plan. One activate list and one deactivate list for a single strict
-  // call, so the machine passes from one mode to the other inside one of the
-  // manager's cycles rather than through a state that is neither.
   arbitration.accepted = true;
   arbitration.horizon_producer_active = mode == Mode::Mpc;
   for (const std::string & name : wanted) {
@@ -1727,19 +1360,6 @@ ModeArbitration arbitrate_mode(
       arbitration.activate.push_back(name);
     }
   }
-  // Only the arm claim, only what is actually up, and **never a controller the
-  // incoming mode also wants**. That last exclusion is PRD §10 step 3 as a line
-  // of code: the same `crane_velocity_controller` instance carries both paths,
-  // so the change between FOLLOW and MPC names the trajectory controller and
-  // nothing else. A plan that named the inner loop as well would be asking for
-  // it to be released and re-claimed -- which is a *different* thing from the
-  // chained-mode transition the manager performs on it internally, and one the
-  // controller is not written to survive: what `on_activate` preserves across
-  // that transition is the reference interfaces and the seam clamp's anchor,
-  // which is exactly what step 3 clamps the first B-spline to.
-  //
-  // The tool claim is not walked at all: §7.3's second claim is reported and
-  // never switched by a mode request.
   for (std::size_t i = 0; i < kModeCount; ++i) {
     if (i == index_of(mode)) {
       continue;
@@ -1758,10 +1378,6 @@ ModeArbitration arbitrate_mode(
   arbitration.switch_required = !arbitration.activate.empty() || !arbitration.deactivate.empty();
 
   if (!arbitration.switch_required) {
-    // Reachable only from the drift case above: the mode asked for has all of
-    // its controllers up and something else is up too, and that something is
-    // not a controller of any mode. Nothing to switch, and saying so is better
-    // than issuing an empty call.
     arbitration.message =
       kModeAlreadyActiveHead + std::string(mode_name(mode)) + kModeAlreadyActiveTail;
     return arbitration;
@@ -1790,10 +1406,6 @@ std::string mode_switch_message(
         kSwitchLandedElsewhereTail;
     }
   }
-  // The other half of the switch, always said when it was attempted and
-  // whichever way it went. A claim that moved and a producer that did not is
-  // the one state ROS 2 Interfaces §4 forbids, and the report is where it
-  // becomes visible instead of a silent horizon being the only evidence.
   if (producer.attempted) {
     const char * const wanted = producer.active ? kProducerActive : kProducerShadow;
     if (producer.accepted) {

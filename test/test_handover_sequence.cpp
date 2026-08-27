@@ -1,59 +1,3 @@
-// PRD §10's sequence, in process, against a controller manager that can be
-// watched and a horizon producer that can be read.
-//
-// `test_mode_switch.cpp` asserts what a switch does against a **real**
-// `controller_manager::ControllerManager`: the claim really moves, the mode
-// really comes back off the manager, and two real controllers really exclude
-// each other. What it cannot assert is what this file exists for, because a
-// real manager keeps no record of who called it:
-//
-//   * that with a stale or absent horizon `switch_controller` is **never
-//     called** -- not called and refused, not called and undone. "The order is
-//     the assertion" (PRD §10 step 2, user story 35), and an outcome that is
-//     indistinguishable from a switch that failed proves nothing about order.
-//   * that the freshness check runs **before this node asks the manager for
-//     anything at all**. The first test below takes the manager off the graph
-//     entirely: a supervisor that consulted it first would refuse for want of a
-//     view, and the one that refuses for the horizon is the one that checked
-//     first. That is a dynamic proof of ordering rather than a reading of the
-//     source.
-//   * that the switch drives `crane_mpc` between the shadow and active states
-//     issue 053 built, in the asymmetric order §10 needs -- the producer active
-//     *before* the claim moves into `MODE_MPC` and back to shadow *after* it has
-//     moved out -- and that a producer which refuses is reported rather than
-//     assumed.
-//   * that `MODE_MPC` and `FAULT_SOLVER` reach **the status stream** and not only
-//     a `/crane/set_mode` response. A response says what one caller was told;
-//     `/crane/supervisor/status` is what the task layer branches on and what an
-//     operator panel renders, and until issue 055 the mode on it had never been
-//     `MODE_MPC` on any profile.
-//   * that wiki/mpc.md §6's repeated-failure escalation takes the mode out of
-//     `MODE_MPC`, and that it does so *after* the receiver has run out of plan
-//     rather than the instant the escalation is seen. Both halves need a spy: the
-//     switch that must not happen yet is not observable from an outcome.
-//
-// So the controller manager here is a **spy**: it serves the two service names
-// ROS 2 Interfaces §5 puts behind the supervisor, answers `list_controllers`
-// from a scripted table, counts every `switch_controller` call and applies it to
-// that table. It is not a stand-in for a controller manager's behaviour -- there
-// is no control loop and no hardware -- it is an instrument for observing which
-// calls this node makes and in what order.
-//
-// The horizon producer is a stub named `crane_mpc`, with a `mode` parameter
-// declared the way `crane_mpc` declares it and a `/crane/mpc/solver_health`
-// publisher. It records the spy's switch count at the instant its mode changes,
-// which is what turns "the producer went active" into "the producer went active
-// *before* the claim moved".
-//
-// The mode lists mirror the deployment's, nesting and all:
-// `MODE_MPC` is `MODE_FOLLOW` without the trajectory controller, because PRD §10
-// step 3 puts the same inner loop on both paths. Against a scripted manager that
-// costs nothing, and it is the shape the plan is actually built for.
-//
-// No launch, no simulator, no live graph: the two DDS variables are scrubbed
-// here, localhost-only transport is forced, and the domain is stepped again off
-// the one this run was given -- a different step from `test_mode_switch.cpp`'s
-// and `test_status_stream.cpp`'s, because colcon runs all three at once.
 
 #include <gtest/gtest.h>
 
@@ -101,19 +45,9 @@ constexpr char kFollower[] = "trajectory_controller_a2b";
 /// The node `crane_bringup` composes the horizon producer under.
 constexpr char kProducerNode[] = "crane_mpc";
 
-/// How long any one wait may take before the test fails, s. It bounds a failure
-/// rather than a success: every wait returns as soon as its predicate holds.
 constexpr double kBudget = 20.0;
 constexpr std::chrono::milliseconds kPollPeriod{2};
 
-/// The domain this binary runs on: one step off the one it was given, and a
-/// different step from the two other binaries colcon runs beside it.
-/**
- * `test_status_stream.cpp` offsets by 0 and `test_mode_switch.cpp` by 50; 25 is
- * congruent to neither modulo 101, so no two of the three can land on the same
- * domain whatever they were given. The range 1..101 is the one ROS 2 keeps clear
- * of the Linux ephemeral ports.
- */
 std::string stepped_domain()
 {
   const char * const given = ::getenv("ROS_DOMAIN_ID");
@@ -139,13 +73,6 @@ public:
   ::testing::AddGlobalTestEnvironment(new RclcppEnvironment);
 
 /// A controller manager that answers, remembers and counts.
-/**
- * The point of it is the counting. Everything else -- the scripted states, the
- * activation applied to them -- is the least that lets the supervisor's own
- * logic run to completion, so that "the switch was never issued" and "the switch
- * was issued and the manager refused it" are two different observations here
- * rather than the same one.
- */
 class ManagerSpy : public rclcpp::Node
 {
 public:
@@ -164,9 +91,6 @@ public:
           controller.name = entry.first;
           controller.state = entry.second;
           if (entry.second == "active") {
-            // Any command interface at all: the supervisor reads this to tell a
-            // broadcaster from a claimant, and an entry with none would be
-            // reported as an unmodelled claimant rather than as a mode's.
             controller.claimed_interfaces = {entry.first + "/theta1_slewing_joint/velocity"};
           }
           response->controller.push_back(controller);
@@ -239,13 +163,6 @@ private:
 };
 
 /// The horizon producer, as much of it as this sequence depends on.
-/**
- * A `mode` parameter declared the way `crane_mpc` declares it -- a plain string
- * that is deliberately *not* read-only, which is what issue 053 left for this
- * one to move -- and the `/crane/mpc/solver_health` stream PRD §10 step 2's
- * freshness is judged on. `crane_mpc` itself is issue 053's and is driven here,
- * not linked: what this file asserts is the supervisor's half of the seam.
- */
 class ProducerStub : public rclcpp::Node
 {
 public:
@@ -264,9 +181,6 @@ public:
           const std::lock_guard<std::mutex> lock(mutex_);
           for (const rclcpp::Parameter & parameter : parameters) {
             if (parameter.get_name() == crane_supervisor::kHorizonProducerModeParameter) {
-              // The whole reason this stub exists: what the claim was doing at
-              // the instant the producer moved. `switch_calls()` takes the spy's
-              // own lock, and no lock of this node's is held by the caller.
               changes_.push_back({parameter.as_string(), manager_.switch_calls()});
             }
           }
@@ -276,13 +190,6 @@ public:
   }
 
   /// One `SolverHealth`, stamped now, as a producer that solved would publish it.
-  /**
-   * `applied_previous_solution` is the field that separates wiki/mpc.md §6's two
-   * non-convergent outcomes, and it defaults to the ordinary one: a solve that
-   * did not converge and whose previous solution went out shifted by one step.
-   * `false` beside `FAULT_SOLVER` is the repeated-failure escalation -- nothing
-   * was published at all -- which is the state the supervisor hands back from.
-   */
   void publish_health(std::uint8_t outcome, bool applied_previous_solution = true)
   {
     SolverHealth message;
@@ -331,11 +238,6 @@ class HandoverSequence : public ::testing::Test
 {
 protected:
   /// Whether this test wants a controller manager on the graph at all.
-  /**
-   * The first test does not, and its absence is the instrument: a supervisor
-   * that consulted the manager before checking the horizon would refuse for want
-   * of a view, and the one that refuses for the horizon checked first.
-   */
   virtual bool compose_manager() const {return true;}
 
   void SetUp() override
@@ -346,10 +248,6 @@ protected:
     if (compose_manager()) {
       manager_ = std::make_shared<ManagerSpy>();
     } else {
-      // Still constructed, because the producer stub reads its switch count --
-      // it is simply never added to the executor, so it advertises nothing and
-      // answers nothing. A manager that is not on the graph is what a supervisor
-      // sees while the manager is starting, crashed, or on another domain.
       manager_ = std::make_shared<ManagerSpy>();
     }
     producer_ = std::make_shared<ProducerStub>(*manager_);
@@ -419,15 +317,8 @@ protected:
         rclcpp::Parameter("controller_state_timeout", 0.5),
         rclcpp::Parameter("controller_health_timeout", 0.5),
         rclcpp::Parameter("controller_manager_timeout", 2.0),
-        // The producer's own margin. Generous for the same reason the manager's
-        // is: the poll shares a callback group with a status timer that a mode
-        // switch blocks, and a margin tuned for a quiet node would report the
-        // producer stale for a reason this harness created.
         rclcpp::Parameter("horizon_timeout", 2.0),
         rclcpp::Parameter("mpc_node", std::string(kProducerNode)),
-        // MODE_MPC is MODE_FOLLOW without the trajectory controller: PRD §10
-        // step 3 puts the same inner loop on both paths, which is exactly what
-        // makes the handover an ordinary seam.
         rclcpp::Parameter(
           "mode_controllers.follow", std::vector<std::string>{kInnerLoop, kFollower}),
         rclcpp::Parameter("mode_controllers.mpc", std::vector<std::string>{kInnerLoop})});
@@ -450,16 +341,6 @@ protected:
   }
 
   /// All four of the supervisor's inputs, healthy and stamped now.
-  /**
-   * The three beside the remote are here because `FAULT_SOLVER` sits **below**
-   * every cause that removes part of this supervisor's own view of the crane.  A
-   * fixture that left the passive state and the two controller streams unpublished
-   * would report `FAULT_STATE_HEALTH` on every cycle, and a test asserting that
-   * the producer's code reaches the operator would be asserting it against a
-   * report that could never carry it.  `inner_loop_fault_` is what a test moves:
-   * it is the receiver's own verdict, and `FAULT_REFERENCE_STALE` on it is the
-   * receiver saying it has run out of plan.
-   */
   void publish_inputs()
   {
     const rclcpp::Time stamp = observer_->now();
@@ -474,8 +355,6 @@ protected:
     pendulum.header.stamp = stamp;
     pendulum.valid = true;
     pendulum.status = "complementary filter on the two bracketing IMUs";
-    // A still crane. NaN would be the absence of a measurement, which leaves the
-    // settled predicate unknowable and is not what this fixture is about.
     pendulum.velocity = {0.0, 0.0};
     pendulum_state_->publish(pendulum);
 
@@ -527,13 +406,8 @@ protected:
     });
   }
 
-  /// One request with the producer solving underneath it, which is what a
-  /// producer at 25 Hz looks like from here.
   SetMode::Response::SharedPtr request_while_solving(std::uint8_t mode, std::uint8_t outcome)
   {
-    // The supervisor needs at least one report in hand before the request, or
-    // the refusal is about a stream that never connected rather than about the
-    // solve.
     if (!solve_until(outcome, [this]() {return set_mode_->service_is_ready();})) {
       return nullptr;
     }
@@ -554,11 +428,6 @@ protected:
   }
 
   /// Whether the supervisor's own stream is reporting `mode` **and** `fault`.
-  /**
-   * Both at once, because a report is one cycle's verdict: a stream that showed
-   * `MODE_MPC` on one cycle and `FAULT_SOLVER` on another would satisfy two
-   * separate waits without either ever having been true of the same report.
-   */
   bool saw(std::uint8_t mode, std::uint8_t fault)
   {
     const std::lock_guard<std::mutex> lock(status_mutex_);
@@ -566,14 +435,6 @@ protected:
   }
 
   /// The mode the supervisor's own stream reports, re-derived from the spy.
-  /**
-   * The poll is asynchronous by design -- a 20 Hz contract with a service call
-   * in the middle of it is a status stream that stops whenever the manager does
-   * -- so a request issued the instant the spy first answers is arbitrated
-   * against a view that has not landed yet. Waiting on this is waiting for the
-   * supervisor to have seen the machine, which is what a test about the *mode*
-   * needs before it asks about one.
-   */
   bool saw_mode(std::uint8_t mode)
   {
     const std::lock_guard<std::mutex> lock(status_mutex_);
@@ -591,8 +452,6 @@ protected:
   rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
     controller_state_;
   rclcpp::Publisher<crane_msgs::msg::VelocityControllerHealth>::SharedPtr controller_health_;
-  /// What the inner velocity loop is saying about itself. Written from the test
-  /// thread and read from `publish_inputs()` on it too, so no lock is owed.
   std::uint8_t inner_loop_fault_{SupervisorStatus::FAULT_NONE};
   rclcpp::Client<SetMode>::SharedPtr set_mode_;
   rclcpp::Client<Trigger>::SharedPtr clear_fault_;
@@ -612,12 +471,6 @@ protected:
 
 TEST_F(NoControllerManager, FreshnessIsVerifiedBeforeTheManagerIsAskedForAnything)
 {
-  // PRD §10 step 2, as an ordering rather than as an outcome. There is no
-  // controller manager on this graph at all, so a supervisor that consulted it
-  // first would have exactly one thing to say -- that it cannot see the manager
-  // and will not switch blind. The refusal that comes back names the *horizon*,
-  // which is only possible if the freshness check ran before the manager was
-  // asked for anything.
   clear_the_starting_latch();
 
   const auto refused = request(SupervisorStatus::MODE_MPC);
@@ -632,9 +485,6 @@ TEST_F(NoControllerManager, FreshnessIsVerifiedBeforeTheManagerIsAskedForAnythin
   // And nothing was called, because there was nothing to call it on.
   EXPECT_EQ(manager_->switch_calls(), 0);
 
-  // A request for any other mode still gets the answer that is true for it: the
-  // freshness check answers only about MODE_MPC, or the early exit would refuse
-  // switches that have nothing to do with the horizon.
   const auto follow = request(SupervisorStatus::MODE_FOLLOW);
   ASSERT_NE(follow, nullptr);
   EXPECT_FALSE(follow->success);
@@ -644,17 +494,9 @@ TEST_F(NoControllerManager, FreshnessIsVerifiedBeforeTheManagerIsAskedForAnythin
 
 TEST_F(HandoverSequence, AStaleOrAbsentHorizonNeverReachesTheSwitchService)
 {
-  // The acceptance criterion this issue is written around: *not* that the
-  // switch was called and failed, but that it was never called. A switch into a
-  // dead MPC that is discovered rather than refused is the defect step 2 exists
-  // to prevent, and the two are indistinguishable from the outcome alone.
   clear_the_starting_latch();
   manager_->set_state(kInnerLoop, "active");
   manager_->set_state(kFollower, "active");
-  // Waited on the supervisor's own stream rather than on the spy's call count:
-  // the poll is asynchronous, so the first answer the spy gives is taken on a
-  // later status cycle and a request issued before that is arbitrated against a
-  // view that has not landed.
   ASSERT_TRUE(wait_until([this]() {return saw_mode(SupervisorStatus::MODE_FOLLOW);}));
 
   // Nothing has ever published `/crane/mpc/solver_health` in this test.
@@ -669,8 +511,6 @@ TEST_F(HandoverSequence, AStaleOrAbsentHorizonNeverReachesTheSwitchService)
   EXPECT_EQ(manager_->state_of(kFollower), "active")
     << "a refused switch deactivated the trajectory controller";
 
-  // A producer that is alive and not converging is refused the same way, and it
-  // is the half freshness alone cannot see.
   const auto failing =
     request_while_solving(SupervisorStatus::MODE_MPC, SolverHealth::SOLVE_FAILED);
   ASSERT_NE(failing, nullptr);
@@ -690,10 +530,6 @@ TEST_F(HandoverSequence, AWarmHorizonMovesTheClaimAndTheProducerInTheOrderStepTw
   clear_the_starting_latch();
   manager_->set_state(kInnerLoop, "active");
   manager_->set_state(kFollower, "active");
-  // Waited on the supervisor's own stream rather than on the spy's call count:
-  // the poll is asynchronous, so the first answer the spy gives is taken on a
-  // later status cycle and a request issued before that is arbitrated against a
-  // view that has not landed.
   ASSERT_TRUE(wait_until([this]() {return saw_mode(SupervisorStatus::MODE_FOLLOW);}));
 
   const auto to_mpc =
@@ -702,20 +538,11 @@ TEST_F(HandoverSequence, AWarmHorizonMovesTheClaimAndTheProducerInTheOrderStepTw
   EXPECT_TRUE(to_mpc->success) << to_mpc->message;
   EXPECT_EQ(to_mpc->active_mode, SupervisorStatus::MODE_MPC) << to_mpc->message;
 
-  // One call, and it moved the trajectory controller and **nothing else**. PRD
-  // §10 step 3: the same inner loop carries both paths, so the request never
-  // names it -- asking for the sole claimant of the six velocity command
-  // interfaces to be released and re-claimed would destroy the setpoint the
-  // incoming B-spline is clamped to.
   ASSERT_EQ(manager_->switch_calls(), 1);
   EXPECT_EQ(manager_->deactivated(), (std::vector<std::string>{kFollower}));
   EXPECT_TRUE(manager_->activated().empty()) << "the inner loop was cycled across the handover";
   EXPECT_EQ(manager_->state_of(kInnerLoop), "active");
 
-  // The producer went active, and it went active **before** the claim moved:
-  // the switch count at the instant of the change is zero. The other order
-  // leaves the inner loop unchained with no horizon for as long as the switch
-  // takes, which ramps its command to zero and raises FAULT_REFERENCE_STALE.
   ASSERT_EQ(producer_->changes().size(), 1U);
   EXPECT_EQ(producer_->changes().front().mode, "active");
   EXPECT_EQ(producer_->changes().front().switch_calls, 0)
@@ -724,9 +551,6 @@ TEST_F(HandoverSequence, AWarmHorizonMovesTheClaimAndTheProducerInTheOrderStepTw
   EXPECT_NE(to_mpc->message.find("horizon producer was put into active"), std::string::npos)
     << to_mpc->message;
 
-  // And back. The trajectory controller comes up, nothing is deactivated, and
-  // the producer goes back to shadow **after** the claim has moved -- the same
-  // argument read the other way.
   const auto to_follow =
     request_while_solving(SupervisorStatus::MODE_FOLLOW, SolverHealth::SOLVE_CONVERGED);
   ASSERT_NE(to_follow, nullptr);
@@ -747,27 +571,15 @@ TEST_F(HandoverSequence, AWarmHorizonMovesTheClaimAndTheProducerInTheOrderStepTw
 
 TEST_F(HandoverSequence, TheSupervisorAndNothingElseDecidesWhichPathIsLive)
 {
-  // ROS 2 Interfaces §4, "One command path": which path is live is the
-  // supervisor's decision alone and the two never drive at once. The half a
-  // package can assert is that *this* node keeps the producer's mode and the
-  // claim in step -- including in the direction nobody asks for, which is a mode
-  // that has nothing to do with the MPC.
   clear_the_starting_latch();
   manager_->set_state(kInnerLoop, "active");
   manager_->set_state(kFollower, "active");
-  // Waited on the supervisor's own stream rather than on the spy's call count:
-  // the poll is asynchronous, so the first answer the spy gives is taken on a
-  // later status cycle and a request issued before that is arbitrated against a
-  // view that has not landed.
   ASSERT_TRUE(wait_until([this]() {return saw_mode(SupervisorStatus::MODE_FOLLOW);}));
 
   ASSERT_NE(
     request_while_solving(SupervisorStatus::MODE_MPC, SolverHealth::SOLVE_CONVERGED), nullptr);
   ASSERT_EQ(producer_->mode(), "active");
 
-  // MODE_IDLE releases the arm claim, and the producer must not be left driving
-  // a path nothing holds. It is settled off the mode that was **read back**
-  // rather than off the request, so this needs no case of its own in the node.
   const auto to_idle = request(SupervisorStatus::MODE_IDLE);
   ASSERT_NE(to_idle, nullptr);
   EXPECT_TRUE(to_idle->success) << to_idle->message;
@@ -778,17 +590,9 @@ TEST_F(HandoverSequence, TheSupervisorAndNothingElseDecidesWhichPathIsLive)
 
 TEST_F(HandoverSequence, AProducerThatRefusesTheModeIsReportedRatherThanAssumed)
 {
-  // A parameter call is a call on another process and can be refused. A claim
-  // that moved while the producer did not is the one state ROS 2 Interfaces §4
-  // forbids, so it is named on the response instead of being left for a silent
-  // horizon to be the evidence of.
   clear_the_starting_latch();
   manager_->set_state(kInnerLoop, "active");
   manager_->set_state(kFollower, "active");
-  // Waited on the supervisor's own stream rather than on the spy's call count:
-  // the poll is asynchronous, so the first answer the spy gives is taken on a
-  // later status cycle and a request issued before that is arbitrated against a
-  // view that has not landed.
   ASSERT_TRUE(wait_until([this]() {return saw_mode(SupervisorStatus::MODE_FOLLOW);}));
   producer_->refuse();
 
@@ -805,10 +609,6 @@ TEST_F(HandoverSequence, AProducerThatRefusesTheModeIsReportedRatherThanAssumed)
 
 TEST_F(HandoverSequence, TheStatusStreamCarriesModeMpcAndTheProducersOwnCode)
 {
-  // The half a `/crane/set_mode` response cannot carry.  A response says what
-  // one caller was told; `/crane/supervisor/status` is what the task layer
-  // branches on and what an operator panel renders, and until this issue the
-  // mode on it had never been `MODE_MPC` on any profile.
   clear_the_starting_latch();
   manager_->set_state(kInnerLoop, "active");
   manager_->set_state(kFollower, "active");
@@ -819,9 +619,6 @@ TEST_F(HandoverSequence, TheStatusStreamCarriesModeMpcAndTheProducersOwnCode)
   ASSERT_NE(to_mpc, nullptr);
   ASSERT_TRUE(to_mpc->success) << to_mpc->message;
 
-  // Live, and with nothing wrong: every one of the supervisor's four inputs is
-  // arriving inside its deadline and the optimizer is converging, so the mode is
-  // MODE_MPC and the fault is none.  The two are read off one report.
   ASSERT_TRUE(
     solve_until(
       SolverHealth::SOLVE_CONVERGED, [this]() {
@@ -829,10 +626,6 @@ TEST_F(HandoverSequence, TheStatusStreamCarriesModeMpcAndTheProducersOwnCode)
       }))
     << "the stream never carried MODE_MPC with a clear report";
 
-  // And the producer's own code reaches the same stream, merged as crane_mpc
-  // numbered it (ROS 2 Interfaces §4).  One solve that did not converge is
-  // wiki/mpc.md §6's defined fallback -- the previous solution shifted by one
-  // step went out -- so the mode does **not** leave: what is owed is the report.
   ASSERT_TRUE(
     solve_until(
       SolverHealth::SOLVE_BUDGET_EXCEEDED, [this]() {
@@ -851,10 +644,6 @@ TEST_F(HandoverSequence, TheStatusStreamCarriesModeMpcAndTheProducersOwnCode)
 
 TEST_F(HandoverSequence, TheRepeatedFailureEscalationTakesTheModeOutOfMpc)
 {
-  // wiki/mpc.md §6's last line -- "on repeated failure, stop and hand control
-  // back to the supervisor" -- as the supervisor's own half of it.  crane_mpc
-  // stops publishing and says so on its health stream (issue 052); this is what
-  // the supervisor does about it.
   clear_the_starting_latch();
   manager_->set_state(kInnerLoop, "active");
   manager_->set_state(kFollower, "active");
@@ -866,12 +655,6 @@ TEST_F(HandoverSequence, TheRepeatedFailureEscalationTakesTheModeOutOfMpc)
   ASSERT_EQ(producer_->mode(), "active");
   const int switches_before = manager_->switch_calls();
 
-  // The escalation: FAULT_SOLVER with `applied_previous_solution` false, which is
-  // the producer saying **nothing went out** rather than that a shifted plan did.
-  // The receiver is still executing the last horizon it was given, so the claim
-  // must not move yet -- releasing it here would take the command interface off a
-  // controller that still has plan to run, which is the commanded step §5.2 step
-  // 3 refuses.
   const auto escalate = [this]() {
       producer_->publish_health(SolverHealth::SOLVE_FAILED, false);
     };
@@ -885,10 +668,6 @@ TEST_F(HandoverSequence, TheRepeatedFailureEscalationTakesTheModeOutOfMpc)
     << "the claim was released while the receiver still had plan to run";
   EXPECT_EQ(producer_->mode(), "active");
 
-  // Now the receiver says it has run out: `horizon_expiry_ramp` has engaged and
-  // the inner loop is reporting FAULT_REFERENCE_STALE.  The fall back has
-  // happened, so the stop is the part that is owed -- and it is MODE_IDLE,
-  // because choosing to resume a motion is the task layer's decision.
   inner_loop_fault_ = SupervisorStatus::FAULT_REFERENCE_STALE;
   ASSERT_TRUE(
     wait_until([this, &escalate]() {
@@ -903,17 +682,11 @@ TEST_F(HandoverSequence, TheRepeatedFailureEscalationTakesTheModeOutOfMpc)
   EXPECT_EQ(manager_->state_of(kFollower), "inactive")
     << "the supervisor chose what happens next instead of stopping";
 
-  // And the producer went back to shadow, **after** the claim moved: the same
-  // asymmetry PRD §10 gives the operator's own MODE_MPC → MODE_FOLLOW request,
-  // because it is the same handover run by a different caller.
   ASSERT_TRUE(wait_until([this]() {return producer_->mode() == "shadow";}));
   EXPECT_EQ(producer_->changes().back().mode, "shadow");
   EXPECT_EQ(producer_->changes().back().switch_calls, switches_before + 1)
     << "the producer was put back into shadow before the claim moved";
 
-  // One attempt and not one per cycle: the switch blocks this node's status
-  // timer, and a release the manager refused would be refused again.  The count
-  // above is the assertion; this waits long enough for a second to have happened.
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
   while (std::chrono::steady_clock::now() < deadline) {
     escalate();

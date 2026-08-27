@@ -13,11 +13,6 @@ namespace crane_supervisor
 namespace
 {
 
-// The sentences a sway report is built from. Every one of them says what the
-// supervisor did about it, which is nothing: wiki/control_architecture.md §5
-// gives this duty the action "refuse to *start* a motion that depends on sway
-// being settled; report", and the refusal half needs an authority over a mode
-// that this package does not have yet.
 constexpr char kSwayHead[] = "sway: the passive joint rate is past its bound on ";
 
 constexpr char kSwayTail[] =
@@ -55,9 +50,6 @@ constexpr char kUnboundedRatesHead[] = " Rates this cycle, judged against nothin
 
 constexpr char kNoRates[] = " No rate this cycle could be placed against a bound.";
 
-/// A joint-space rate as text. Four decimals, which is a tenth of a
-/// milliradian per second -- finer than this pendulum resolves, and coarse
-/// enough not to print a double's tail at an operator.
 std::string quantity_text(double value)
 {
   char buffer[32];
@@ -65,8 +57,6 @@ std::string quantity_text(double value)
   return std::string(buffer);
 }
 
-/// Seconds as text, to the millisecond, the way every other margin in this
-/// package is printed.
 std::string seconds_text(double seconds)
 {
   char buffer[32];
@@ -75,11 +65,6 @@ std::string seconds_text(double seconds)
 }
 
 /// The rate a coordinate has to stay inside to count as calm this cycle.
-/**
- * Higher on the way out than on the way in, which is the whole of the
- * hysteresis: without it a single noise sample past the bound would drop the
- * predicate and cost a full dwell to recover, twenty times a second.
- */
 double calm_threshold(const SwayBound & bound, std::size_t axis, bool was_settled)
 {
   const double entering = bound.dq_u_settled[axis];
@@ -176,11 +161,6 @@ SwayVerdict judge_sway(
 {
   SwayVerdict verdict;
 
-  // A rate nobody can place is not evidence of anything, in either direction:
-  // it raises no fault, and it leaves the predicate at the value that claims
-  // nothing. The distrust itself is reported as FAULT_STATE_HEALTH by the caller
-  // -- a sensor that stopped saying anything is a different fact from a load
-  // that is swinging.
   const bool readable = estimate_trusted && std::isfinite(sampled_at) &&
     std::isfinite(dq_u[index_of(PassiveAxis::Tip)]) &&
     std::isfinite(dq_u[index_of(PassiveAxis::Tilt)]);
@@ -194,18 +174,12 @@ SwayVerdict judge_sway(
       verdict.breaches.push_back({static_cast<PassiveAxis>(i), dq_u[i], bound.dq_u_max[i]});
     }
   }
-  // Worst by how far past its own bound a coordinate is, not by the raw rate:
-  // the two bounds are configured per coordinate and need not be equal.
   std::stable_sort(
     verdict.breaches.begin(), verdict.breaches.end(),
     [](const SwayBreach & left, const SwayBreach & right) {
       return std::abs(left.dq_u) / left.bound > std::abs(right.dq_u) / right.bound;
     });
 
-  // With no settle bound to judge against, the predicate is unknowable rather
-  // than false. `validate_sway()` refuses that configuration before a node
-  // starts, so this is the answer for a caller that assembled a `SwayBound` by
-  // hand -- and it is the honest one.
   if (!every_element_is_a_bound(bound.dq_u_settled) ||
     !std::isfinite(bound.settled_release_factor) || bound.settled_release_factor < 1.0 ||
     !std::isfinite(bound.settle_dwell) || bound.settle_dwell < 0.0)
@@ -226,16 +200,11 @@ SwayVerdict judge_sway(
     return verdict;
   }
 
-  // A clock that stepped backwards restarts the run rather than completing it
-  // early: `sampled_at - calm_since` would otherwise be negative or, worse,
-  // arbitrarily large after a step forward.
   double calm_since = previous.calm_since;
   if (!std::isfinite(calm_since) || sampled_at < calm_since) {
     calm_since = sampled_at;
   }
   verdict.state.calm_since = calm_since;
-  // Already settled and still calm stays settled without re-running the dwell;
-  // the hysteresis above is what decides whether it is still calm.
   verdict.state.settled = (was_settled || sampled_at - calm_since >= bound.settle_dwell)
     ? SwaySettled::Settled
     : SwaySettled::NotSettled;
@@ -263,10 +232,6 @@ std::string settled_clause(
 {
   std::string text = std::string(kSettledClausePrefix) + settled_word(verdict.state.settled);
 
-  // Unknown has two causes and they are not the same thing to chase: the
-  // estimate was not usable, or it was and this supervisor has no bound to judge
-  // it against. Blaming the sensor for the second would send an integrator after
-  // an IMU that is answering perfectly.
   if (verdict.state.settled == SwaySettled::Unknown) {
     if (!verdict.estimate_read) {
       return text + kUnknownExplained + kNoRates;

@@ -1,15 +1,3 @@
-// The contracts this package has with packages outside it: the installed
-// `crane_model` dynamics seam, the numbering of `crane_msgs/SupervisorStatus`,
-// and which of the twelve booleans of `epsilon_crane_msgs/RemoteCtrlStates` the
-// configured deadman selects.
-//
-// Message structs only -- no node is constructed, no clock read, no graph
-// joined, and the adapter is linked for one free function.  The mode/fault fixture
-// that used to live in this file as a private test double is gone: the real
-// decision core replaces it, and it is exercised in `test_supervisor_core.cpp`.
-// A double beside the implementation would be a second answer to the same
-// question, and the whole reason the core is ROS-free is that the real one is
-// reachable from a test without a runtime.
 
 #include <gtest/gtest.h>
 
@@ -35,9 +23,6 @@ TEST(CraneSupervisorContract, W08UsesInstalledModelDynamicsContract)
 
 TEST(CraneSupervisorContract, TheCoreIsNumberedAsTheMessageIsNumbered)
 {
-  // The core is ROS-free and cannot say this about itself.  Here is where it is
-  // said, so that the adapter above it stays a cast rather than a lookup table
-  // that can disagree with the wire.
   using Status = crane_msgs::msg::SupervisorStatus;
   using crane_supervisor::Fault;
   using crane_supervisor::Mode;
@@ -61,10 +46,6 @@ TEST(CraneSupervisorContract, TheCoreIsNumberedAsTheMessageIsNumbered)
 
 TEST(CraneSupervisorContract, TheSolveVerdictIsNumberedAsTheProducersOwnMessageNumbersIt)
 {
-  // The third cast the adapter makes, and the third place the core's enum has
-  // to agree with a wire it cannot include.  PRD §10 step 2 is decided on this
-  // value, so a numbering that drifted would admit a switch into an optimizer
-  // that had said the opposite.
   using Wire = crane_msgs::msg::SolverHealth;
   using Outcome = crane_supervisor::SolveOutcome;
 
@@ -73,16 +54,10 @@ TEST(CraneSupervisorContract, TheSolveVerdictIsNumberedAsTheProducersOwnMessageN
   EXPECT_EQ(static_cast<std::uint8_t>(Outcome::BudgetExceeded), Wire::SOLVE_BUDGET_EXCEEDED);
   EXPECT_EQ(static_cast<std::uint8_t>(Outcome::Failed), Wire::SOLVE_FAILED);
 
-  // And the value both sides start from is the unknown one, for the reason the
-  // settled predicate's zero is unknown: a message nobody filled must not read
-  // as an optimizer that converged, which is the one verdict this supervisor
-  // admits a switch on.
   EXPECT_EQ(static_cast<std::uint8_t>(crane_supervisor::HorizonReport{}.outcome),
     Wire::SOLVE_UNKNOWN);
   EXPECT_EQ(Wire{}.outcome, Wire::SOLVE_UNKNOWN);
 
-  // The producer's fault code travels unrenumbered as well, exactly as the
-  // inner loop's does: the supervisor merges rather than translates.
   EXPECT_EQ(
     static_cast<std::uint8_t>(crane_supervisor::Fault::Solver),
     crane_msgs::msg::SupervisorStatus::FAULT_SOLVER);
@@ -90,9 +65,6 @@ TEST(CraneSupervisorContract, TheSolveVerdictIsNumberedAsTheProducersOwnMessageN
 
 TEST(CraneSupervisorContract, TheSettledPredicateIsNumberedAsItsOwnMessageNumbersIt)
 {
-  // Same argument as the modes and the faults above, for the second stream: the
-  // core is ROS-free and cannot say this about itself, so the adapter's cast is
-  // held to the wire here rather than becoming a table that can drift from it.
   using Wire = crane_msgs::msg::SwaySettled;
   using Predicate = crane_supervisor::SwaySettled;
 
@@ -100,10 +72,6 @@ TEST(CraneSupervisorContract, TheSettledPredicateIsNumberedAsItsOwnMessageNumber
   EXPECT_EQ(static_cast<std::uint8_t>(Predicate::NotSettled), Wire::SETTLED_NO);
   EXPECT_EQ(static_cast<std::uint8_t>(Predicate::Settled), Wire::SETTLED_YES);
 
-  // And the value both sides start from is the unknown one.  A core whose dwell
-  // began at `Settled`, or a message whose zero meant it, would answer "the load
-  // is hanging still" before anything had been observed at all -- which is the
-  // one answer the three-valued design exists to refuse.
   EXPECT_EQ(
     static_cast<std::uint8_t>(crane_supervisor::SwayState{}.settled), Wire::SETTLED_UNKNOWN);
   EXPECT_EQ(Wire{}.settled, Wire::SETTLED_UNKNOWN);
@@ -111,14 +79,6 @@ TEST(CraneSupervisorContract, TheSettledPredicateIsNumberedAsItsOwnMessageNumber
 
 TEST(CraneSupervisorContract, TheRealCoreStartsFromAbsenceRatherThanFromHealth)
 {
-  // The decision a supervisor makes before anything has told it anything, in
-  // the wire's own constants as well as in the enum `test_supervisor_core.cpp`
-  // uses.  It is FAULT_ESTOP rather than the FAULT_STATE_HEALTH this asserted
-  // while the remote was not yet an input: with nothing arriving at all, the
-  // stop signal is among the things that are not arriving, and
-  // wiki/control_architecture.md §6.1 reads absence of the stop signal as
-  // asserted rather than as released.  A supervisor that started from a stale
-  // estimate instead would have started from the lesser of the two absences.
   const auto decision = crane_supervisor::decide(crane_supervisor::SupervisorConfig{}, {});
   EXPECT_EQ(
     static_cast<std::uint8_t>(decision.fault), crane_msgs::msg::SupervisorStatus::FAULT_ESTOP);
@@ -131,12 +91,6 @@ TEST(CraneSupervisorContract, TheRealCoreStartsFromAbsenceRatherThanFromHealth)
 
 TEST(CraneSupervisorContract, TheDeadmanIsReadOffTheFieldTheRetainedStackNames)
 {
-  // The number in the configuration is not the assertion; which *field* it
-  // selects is.  `epsilon_crane_msgs/RemoteCtrlStates` is the retained
-  // machine-telemetry boundary (ROS 2 Interfaces §9), and the retained approval
-  // gate reads `button12` off it -- so the default must select `button12` and
-  // nothing else.  This is the one place the ROS-free core's button number and
-  // the wire's twelve booleans are checked against each other.
   epsilon_crane_msgs::msg::RemoteCtrlStates message;
   message.button12 = true;
   EXPECT_TRUE(

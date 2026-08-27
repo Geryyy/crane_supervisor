@@ -25,9 +25,6 @@ DECLARATION = PACKAGE_ROOT / "src" / "crane_supervisor_parameters.yaml"
 SHIPPED_CONFIG = PACKAGE_ROOT / "config" / "crane_supervisor.yaml"
 CONFIG_DIRECTORY = PACKAGE_ROOT / "config"
 
-# `dq_a: <number>` with any sign, in any of the shapes a ROS parameter file
-# writes one.  The key is the tolerance file's own, so a copy that arrived here
-# under a different name would not be the drift this guard is about.
 TOLERANCE_VALUE = re.compile(r"dq_a\s*:\s*(-?[0-9.]+(?:[eE][-+]?[0-9]+)?)")
 
 

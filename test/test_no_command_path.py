@@ -66,10 +66,6 @@ PACKAGE_XML = PACKAGE_ROOT / "package.xml"
 
 NON_SOURCE_DIRECTORIES = {".git", "__pycache__", "build", "install", "log"}
 
-# The contract names of ROS 2 Interfaces 4 and 5 this package may know: the two
-# status streams it owns, the four inputs it carries end to end, the two services
-# it serves, and the two it calls on the controller manager.  Any other ROS name
-# in the sources is a reach this package does not have.
 STATUS_TOPIC = "/crane/supervisor/status"
 SWAY_SETTLED_TOPIC = "/crane/sway_settled"
 PENDULUM_STATE_TOPIC = "/crane/pendulum_state"
@@ -79,38 +75,13 @@ CONTROLLER_HEALTH_TOPIC = "/crane/velocity_controller/health"
 CLEAR_FAULT_SERVICE = "/crane/clear_fault"
 SET_MODE_SERVICE = "/crane/set_mode"
 
-# The two names of the first exception.  `list_controllers` is read-only by
-# construction -- the request carries no fields at all -- and `switch_controller`
-# is the one call in this package that reaches the machine.  Both are pinned as
-# literals so that a client cannot be pointed at a third service without this
-# file changing.
 LIST_CONTROLLERS_SERVICE = "/controller_manager/list_controllers"
 SWITCH_CONTROLLER_SERVICE = "/controller_manager/switch_controller"
 
-# The third exception, added by issue 054, and the one ROS name in this package
-# that is **not** written out whole.  ROS 2 Interfaces 4's "One command path"
-# makes which of the two producers is live the supervisor's decision alone, and
-# issue 053 made that a state of `crane_mpc` reachable through its own parameter
-# service.  Which node that is is a profile's decision -- it is the `mpc_node`
-# parameter -- so the source carries the suffix and composes the rest.
-#
-# That is a hole in the standalone-name scan below, because a single-segment
-# literal is not a ROS name to that expression, so it is closed by hand: the
-# scan for single-segment names is what pins this one, and nothing else in the
-# package may carry one.
 PARAMETER_SERVICE_SUFFIX = "/set_parameters"
 PERMITTED_NAME_FRAGMENTS = {PARAMETER_SERVICE_SUFFIX}
-# A ROS name with exactly one segment.  Only ever a fragment: a service or topic
-# this package actually used would be absolute and would have at least two.
 NAME_FRAGMENT = re.compile(r"/[A-Za-z_][A-Za-z0-9_]*")
 
-# The horizon producer's own status stream, and the evidence PRD 10 step 2's
-# freshness check is made against.  It is a subscription and stays one, and it
-# is deliberately `solver_health` rather than `/crane/mpc/horizon`: in shadow
-# mode -- the state every switch into MODE_MPC is made from -- `crane_mpc`
-# publishes nothing at all on the contract topic, so a check against the horizon
-# could never pass.  It also keeps this package clear of `trajectory_msgs`,
-# which is banned outright below.
 SOLVER_HEALTH_TOPIC = "/crane/mpc/solver_health"
 
 PERMITTED_ROS_NAMES = {
@@ -127,64 +98,14 @@ PERMITTED_ROS_NAMES = {
     SWITCH_CONTROLLER_SERVICE,
 }
 
-# The command path itself, which this package **mentions and never touches**.
-# The refusal PRD 10 step 2 composes has to say why the freshness of the horizon
-# is judged on the solver-health stream rather than on the horizon, and the
-# answer names the horizon: in shadow mode nothing is published on it at all, so
-# a check against it could never pass.  So it is admissible inside a sentence
-# and inadmissible as a name this package uses -- the standalone scan below is
-# exact and does not contain it, which is what keeps the distinction real.
 HORIZON_TOPIC = "/crane/mpc/horizon"
 MENTIONED_ROS_NAMES = PERMITTED_ROS_NAMES | {HORIZON_TOPIC}
 
-# A ROS name standing on its own, and a ROS name quoted inside a sentence.  The
-# second is needed because the status messages name the topic they are about,
-# which is the whole reason an operator can act on them.
 ROS_NAME = re.compile(r"/[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)+")
 CRANE_NAME = re.compile(r"/crane/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*")
 
-# Names of the machine-facing graph.  None of them may appear in a literal at
-# all: this package neither calls them nor mentions them in something it
-# publishes.  `/controller_manager` came off this list when the switch client
-# landed and was replaced by something narrower -- the exact two names above,
-# asserted as a set below -- because a blanket ban on the string would also have
-# banned the two calls ROS 2 Interfaces 5 puts here on purpose.
 FORBIDDEN_ROS_NAMES = ("/joint_states", "/cbs/")
 
-# Every way this package could reach the machine, by the name it would have to
-# use to do it.
-#
-# `create_service` came off it when `/crane/clear_fault` landed -- the reason it
-# was ever there was that the service was a later issue.  What replaced the
-# blanket ban is narrower and stricter: the test below names the services this
-# package may serve and the types it may serve them with.
-#
-# `create_client`, `controller_manager`, `SwitchController` and
-# `switch_controller` came off it the same way, in issue 026, and for the same
-# kind of reason: they were banned because the arbitration was a later issue, and
-# this is that issue.  ROS 2 Interfaces 5 makes the supervisor the only element
-# that calls `/controller_manager/switch_controller`, so a ban here would have to
-# be lifted somewhere for the stack to have an arbiter at all -- and the safest
-# place for it to be lifted is the one package whose every other reach is
-# asserted.  What replaces them is the client test below: two service types by
-# name, two service names by literal, and nothing else.
-#
-# What stays banned is everything that would let this package *hold* a piece of
-# the control loop rather than call the manager over the graph:
-# `controller_interface` and `hardware_interface` are how a package becomes a
-# controller, `command_interface` is how it writes one, and `load_controller`,
-# `unload_controller`, `configure_controller` and
-# `set_hardware_component_state` are the manager calls that go beyond arbitrating
-# a claim -- loading and unloading are a bringup authority this node does not
-# have, and a hardware component's state is the machine itself.
-#
-# `JointTrajectory` came off it earlier, and for the same kind of reason: it was
-# a stand-in for `trajectory_msgs`, the package a *commanded* trajectory is typed
-# with, and it also matched `control_msgs/JointTrajectoryControllerState` --
-# which is a controller describing itself, subscribed to and never published.
-# The ban is now on the package that carries the command type, so a
-# `trajectory_msgs::msg::JointTrajectory` publisher still cannot appear, and the
-# subscription test below pins the exact four types this node consumes.
 FORBIDDEN_IDENTIFIERS = (
     "load_controller",
     "unload_controller",
@@ -201,58 +122,22 @@ FORBIDDEN_IDENTIFIERS = (
     "create_generic_publisher",
 )
 
-# Every publisher this package holds, by type and in source order.  A publisher
-# is how a status node becomes a command node -- the topic would be new, the QoS
-# would be new, and nothing else about the package would look different -- so the
-# list is enumerated one entry at a time and never widened by a pattern.
-#
-# `crane_msgs/SwaySettled` was added in issue 028 and is the second and last
-# entry.  The argument for it is the one the README records: the settled
-# predicate is a *report*, its consumer is the task layer rather than a
-# controller, and the message carries a `uint8`, two rates and a sentence -- no
-# joint, no duration, no setpoint, so it is not a shape a motion command fits in.
-# What would *not* be admitted here is a publisher of a type that carries one,
-# whatever the topic were called: `trajectory_msgs` is banned outright above.
 PERMITTED_PUBLISHER_TYPES = [
     "crane_msgs::msg::SupervisorStatus",
     "crane_msgs::msg::SwaySettled",
 ]
 
-# The two services this package serves, and the only types it may serve them
-# with, in source order.  `std_srvs/Trigger` takes no arguments at all;
-# `crane_msgs/SetMode` takes one `uint8` and nothing else -- there is no
-# setpoint, no joint and no duration in either request, so neither is a shape a
-# caller can smuggle a motion command through.
 PERMITTED_SERVICE_TYPES = ["std_srvs::srv::Trigger", "crane_msgs::srv::SetMode"]
 
-# The three clients this package holds, and the only types it may hold them
-# with.  A fourth would be a reach this package does not have; the request field
-# of `ListControllers` is empty, the request field of `SwitchController` carries
-# controller names and no setpoint, and the `SetParameters` request is checked
-# below to carry one parameter whose name is a literal in this package.
-#
-# The third landed in issue 054 and it is named rather than the rule relaxed,
-# exactly as the first two were.  ROS 2 Interfaces 4's "One command path" ends
-# by saying that which of the two producers is live is the supervisor's decision
-# *alone* and that the two never drive at once; issue 053 made that a state of
-# `crane_mpc` and left its `mode` parameter writable so that this node could
-# move it.  A parameter call is not a setpoint: it decides which producer may
-# publish, and carries no joint, no duration and no value of the machine's.
 PERMITTED_CLIENT_TYPES = [
     "controller_manager_msgs::srv::ListControllers",
     "controller_manager_msgs::srv::SwitchController",
     "rcl_interfaces::srv::SetParameters",
 ]
 
-# The only parameter that client may ever carry, and the only two values it may
-# set it to.  Both are `crane_mpc`'s contract rather than this package's
-# setting, and pinning them here is what keeps the reach at "which producer may
-# publish" rather than at "any parameter of any node".
 PRODUCER_MODE_PARAMETER = "mode"
 PRODUCER_MODE_VALUES = ("active", "shadow")
 
-# What the package is allowed to build against.  A dependency is the cheapest
-# way to grow a reach, so the manifest is a whitelist and not a blacklist.
 PERMITTED_DEPENDENCIES = {
     "ament_cmake",
     "ament_cmake_gtest",
@@ -270,13 +155,6 @@ PERMITTED_DEPENDENCIES = {
     "velocity_controllers",
 }
 
-# `controller_manager` and `velocity_controllers` are *test* dependencies and
-# stay ones.  The S5 harness builds a manager inside the test process and
-# switches two real controllers in it; a runtime dependency on either would be
-# this package able to instantiate a controller rather than call a service over
-# the graph, which is a different reach entirely.  `crane_model` is here for the
-# reason it always was: the supervisor asserts the installed dynamics seam and
-# links no model into anything it runs.
 TEST_ONLY_DEPENDENCIES = {
     "ament_cmake_gtest",
     "ament_cmake_pytest",
@@ -406,23 +284,7 @@ def test_the_package_publishes_two_status_streams_and_only_reads_its_inputs():
         clients += re.findall(r"create_client<([A-Za-z0-9_:]+)>", body)
 
     assert publishers == PERMITTED_PUBLISHER_TYPES, publishers
-    # The exceptions, pinned by type.  A fourth client -- or any of these three
-    # replaced by something that carries a command -- is a reach this package
-    # does not have and a line this file has to gain.
     assert clients == PERMITTED_CLIENT_TYPES, clients
-    # `create_subscription` is called in exactly two places, and the second is
-    # named rather than the rule loosened.  The first is the `subscribe()`
-    # helper that every `Input` goes through, which takes an enumerator and
-    # therefore a freshness deadline (`test_every_input_has_a_deadline.py`
-    # asserts the registry side of that).  The second is the horizon producer's
-    # own status stream, which *cannot* go through the helper: an `Input` is by
-    # definition a stream whose absence raises a fault on the status, and this
-    # one's must not -- an optimizer that is quiet while the machine is in
-    # MODE_FOLLOW is the ordinary state of this stack.  Its `fault` is merged
-    # onto the status stream since issue 055 and that changes nothing here: a
-    # code that travels is not a command, and the merge is scoped by the mode
-    # rather than by the stream.  What stays pinned here is the set of message
-    # *types* this node consumes, because a command path would have to change it.
     assert subscriptions == ["MessageT", "crane_msgs::msg::SolverHealth"], subscriptions
     assert subscribed == [
         "crane_msgs::msg::PendulumState",
@@ -432,17 +294,9 @@ def test_the_package_publishes_two_status_streams_and_only_reads_its_inputs():
     ], subscribed
     assert services == PERMITTED_SERVICE_TYPES, services
 
-    # A literal that is nothing but a ROS name is one this package uses; a ROS
-    # name inside a sentence is one it tells an operator about.  Both are held
-    # to the same names.
     standalone = {literal for literal in literals if ROS_NAME.fullmatch(literal)}
     assert standalone == PERMITTED_ROS_NAMES, sorted(standalone)
 
-    # And the one name this package composes rather than writes out.  A
-    # single-segment literal is not a ROS name to the expression above, so it
-    # would slip through the set assertion; it is pinned here instead, and the
-    # set is exact, so a second fragment -- a suffix pointing a client at
-    # somebody else's service -- fails this line.
     fragments = {
         literal
         for literal in literals
@@ -479,8 +333,6 @@ def test_the_parameter_client_may_carry_one_parameter_and_two_values():
     for value in PRODUCER_MODE_VALUES:
         assert value in literals, value
 
-    # One `push_back` onto the request, so the call cannot grow a second
-    # parameter without this file changing.
     pushed = sum(
         len(re.findall(r"parameters\.push_back", body)) for _path, body in code
     )
@@ -508,8 +360,6 @@ def test_the_manifest_and_the_build_declare_no_way_to_reach_the_machine():
     found = set(re.findall(r"find_package\s*\(\s*([A-Za-z0-9_]+)", source))
     assert found <= PERMITTED_DEPENDENCIES, sorted(found - PERMITTED_DEPENDENCIES)
 
-    # And the test-only ones are found only inside `if(BUILD_TESTING)`, so a
-    # deployment build cannot link them even by accident.
     deployment = source[: source.index("if(BUILD_TESTING)")]
     deployed = set(re.findall(r"find_package\s*\(\s*([A-Za-z0-9_]+)", deployment))
     assert not (deployed & TEST_ONLY_DEPENDENCIES), sorted(

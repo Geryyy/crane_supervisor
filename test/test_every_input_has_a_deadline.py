@@ -54,16 +54,8 @@ NODE_HEADER = PACKAGE_ROOT / "include" / "crane_supervisor" / "supervisor_node.h
 NODE_SOURCE = PACKAGE_ROOT / "src" / "supervisor_node.cpp"
 PARAMETER_DECLARATION = PACKAGE_ROOT / "src" / "crane_supervisor_parameters.yaml"
 
-# Every `create_subscription` this package may hold, by type and in source
-# order.  The first is the `subscribe()` helper every `Input` goes through -- the
-# type is its template parameter, which is what makes "one call site" and "one
-# per input" different assertions.  The second is the horizon producer's own
-# status stream, which is deliberately not an `Input`; see the module docstring.
 PERMITTED_SUBSCRIPTION_TYPES = ["MessageT", "crane_msgs::msg::SolverHealth"]
 
-# A ROS name standing on its own.  The same expression the command-path guard
-# uses, for the same reason: a literal that is nothing but a ROS name is a name
-# this package uses, as opposed to one it tells an operator about.
 ROS_NAME = re.compile(r"/[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)+")
 
 

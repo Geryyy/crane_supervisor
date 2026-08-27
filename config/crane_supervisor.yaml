@@ -1,166 +1,14 @@
-# The `crane_supervisor` node of ROS 2 Interfaces 2, as the `fake` and
-# `hardware` profiles of crane_bringup compose it.
-#
-# Margins and wiring, because everything else about this node is a contract
-# rather than a setting: the topic and service names of ROS 2 Interfaces 4 and 5
-# and the 20 Hz status rate of ROS 2 Interfaces 2 are constants in the source, so
-# a deployment cannot rename or re-rate a stream the task layer and the operator
-# panel subscribe to. What is left is what is a property of a rig rather than of
-# the architecture: four margins and the wiring of one remote.
-#
-# **The four margins are the freshness deadlines of control_architecture.md 5.3,
-# one per input, and none of the supervisor's inputs is exempt from having one.**
-# They are four numbers and not one because the inputs do not go stale at the
-# same age: two of them come off the manager's 100 Hz cycle and two are 20 Hz
-# contracts. A profile that omitted one of these lines still gets the declared
-# default out of src/crane_supervisor_parameters.yaml; what cannot happen is an
-# input with no deadline at all, because its slot would be zero, validate()
-# refuses a zero and the node throws instead of publishing a status about a
-# stream nobody is watching.
-#
-# **`tracking_tolerance` is deliberately absent from this file, exactly as it is
-# from crane_control/config/follow_controllers.yaml.** It is the one number that
-# sizes the seam clamp, the MPC's constraint margin and FAULT_TRACKING here
-# (PRD 6), so it lives in crane_control/config/tracking_tolerance.yaml -- one
-# file, wildcard node key, read by every consumer -- rather than once per
-# consumer. A profile that wants this supervisor to raise FAULT_TRACKING passes
-# that file to this node as a second parameter file; without it every axis
-# reports no tolerance, the supervisor warns once at configuration and names the
-# axes, and tracking_error is still published as a measurement. Both command
-# profiles do pass it, and since issue 054 they pass the same file to crane_mpc
-# as well -- PRD 6's "one number" is a property of the composition, and
-# crane_bringup's test_one_number_reaches_both_of_its_consumers_or_neither
-# asserts the pair rather than each half. What still does not exist is the
-# number: the six values in that file are the -1.0 sentinel, so every consumer
-# including this one reads "no tolerance" and says so. The clamp is transparent
-# and FAULT_TRACKING is unreachable until merge gate (ii-b) or the slice 1b
-# campaign lands a measured value -- both human-only (PRD 14).
-#
-# `joints` is absent for a different reason: the six actuated joints are fixed by
-# ROS 2 Interfaces 3.2 and the declared default already is them. A deployment
-# that restated the list here would only be able to get it wrong.
 crane_supervisor:
   ros__parameters:
-    # Seconds. See src/crane_supervisor_parameters.yaml for the derivation and
-    # for why it is read-only. It is a topic-level deadline and is not the
-    # broadcaster's own health.max_measurement_age of 60 ms, which asks a
-    # different question one layer down.
     pendulum_state_timeout: 0.15
-    # Seconds. Past this the operator remote counts as absent, and absence of
-    # the stop signal is asserted rather than released (control_architecture.md
-    # 5.3, 6.1). Not a safety timing requirement -- the hardware and PLC chain
-    # has already acted; this margin only decides how fast the software says so.
     remote_ctrl_timeout: 0.25
-    # Seconds. Past this the trajectory controller counts as no longer
-    # publishing its own state, and the tracking error is reported as unmeasured
-    # rather than as zero: a controller that died must not look like a crane that
-    # is tracking perfectly (control_architecture.md 5.3). Same derivation and
-    # same number as pendulum_state_timeout -- both are 100 Hz streams out of the
-    # manager's cycle, sampled here at 20 Hz.
     controller_state_timeout: 0.15
-    # Seconds. Past this the inner velocity loop counts as no longer reporting
-    # its own health, and the fault it computes every cycle -- including a
-    # missing commissioning prerequisite -- is reported as unread rather than as
-    # clear (control_architecture.md 5.3,
-    # commissioning_prerequisites.md 2). Same derivation and same number as
-    # remote_ctrl_timeout: both are 20 Hz contracts sampled here at 20 Hz.
     controller_health_timeout: 0.25
-    # Seconds. How old the controller manager's newest answer may be and still
-    # say which mode is active. Past it the mode on the status stream reads as
-    # *not known* and every /crane/set_mode request is refused, because a
-    # precondition cannot be checked against a view this supervisor does not
-    # have (PRD 10 step 2). It is the one input here that is polled rather than
-    # subscribed -- see ControllerManagerReport in supervisor_core.hpp -- and its
-    # age is measured from arrival, because ListControllers carries no header.
-    # Same derivation and same number as the two 20 Hz margins above.
     controller_manager_timeout: 0.25
-    # Seconds. How old the horizon producer's newest crane_msgs/SolverHealth on
-    # /crane/mpc/solver_health may be and still say it is solving. Past it a
-    # request for MODE_MPC is refused with the age and this deadline in the
-    # sentence, before the trajectory controller is deactivated and before the
-    # controller manager is asked anything at all (PRD 10 step 2, user story
-    # 35). It is judged on that stream and not on /crane/mpc/horizon because in
-    # shadow mode -- the state every switch into MODE_MPC is made from --
-    # crane_mpc publishes nothing on the contract topic, so a check against the
-    # horizon could never pass. Derived from a 12.5 Hz contract sampled here at
-    # 20 Hz, the way the margins above are derived; see
-    # src/crane_supervisor_parameters.yaml.
-    #
-    # Since issue 055 it is judged against twice more, off the same reading. The
-    # producer's FAULT_SOLVER is merged onto /crane/supervisor/status while
-    # MODE_MPC is the live command path -- ROS 2 Interfaces §4's rule for
-    # VelocityControllerHealth, applied to the second stream that carries a
-    # SupervisorStatus code -- and mpc.md §6's repeated-failure escalation is
-    # read off the same report. Both are taken only from a report inside this
-    # margin: a code nobody has heard since is not a fault this supervisor can
-    # still observe, and standing by one would be the latch §5.3's whole table
-    # exists to avoid.
     horizon_timeout: 0.3
 
-    # The node crane_bringup composes the horizon producer under, and whose
-    # `mode` parameter this supervisor moves between `shadow` and `active`.
-    # ROS 2 Interfaces 4's "One command path" makes which of the two producers
-    # is live the supervisor's decision alone and says the two never drive at
-    # once; issue 053 made that a state of crane_mpc and left the parameter
-    # writable for exactly this. It is the default of the declaration as well,
-    # and it is written out here because it is the one name in this file that
-    # reaches a *node* rather than a controller.
     mpc_node: crane_mpc
 
-    # Which controller holds the arm claim in each mode
-    # (control_architecture.md 7). Names, because the controller manager loads
-    # by name and the profile chooses the names; the architecture fixes only the
-    # four modes.
-    #
-    # `follow` is the pair crane_bringup's `fake` and `hardware` profiles spawn,
-    # in the cascade's activation order of PRD 5: the inner velocity loop is
-    # active before anything chains onto its reference interfaces.
-    #
-    # `manual` is deliberately absent, and its absence is the honest state
-    # rather than an omission. The manual forwarding and proportional
-    # controllers of control_architecture.md 7.2 live in the retained stack and
-    # no CBS profile composes one, so MODE_MANUAL is a mode this deployment does
-    # not implement: the supervisor refuses the request and says so, instead of
-    # naming a controller that would fail to load.
-    #
-    # **`mpc` is `follow` without the trajectory controller, and the overlap is
-    # the architecture rather than an oversight.** PRD 10 step 3: "Same
-    # controller instance across both paths, so the handover is an ordinary
-    # seam, not new machinery." The inner loop is the sole claimant of the six
-    # velocity command interfaces in both modes and takes its command from the
-    # chained trajectory controller in one and from /crane/mpc/horizon in the
-    # other, so what a switch between them names is the trajectory controller
-    # alone -- the plan never deactivates a controller the incoming mode also
-    # wants, so the inner loop is never released and re-claimed. The manager
-    # still re-enters its activation callbacks to change its chained mode, and
-    # the controller is written around that: what it preserves there is the
-    # reference interfaces and the seam clamp's anchor.
-    #
-    # It was declared and left empty by issue 026 because there was no horizon
-    # producer; there is one now, `crane_mpc` runs in shadow on both profiles,
-    # and PRD 10 step 2's freshness check reads its solver-health stream instead
-    # of reporting its absence. Entering the mode also puts that producer into
-    # `active` -- see mpc_node above -- which is the half of the switch that
-    # happens outside the controller manager.
-    #
-    # **`mpc` is also the one mode this supervisor leaves without being asked.**
-    # control_architecture.md 5 row 3 ends in "fall back, then stop and report",
-    # and mpc.md 6's repeated-failure escalation is where the fall back has run
-    # out: crane_mpc stops publishing, crane_velocity_controller ramps the
-    # velocity command down over its own horizon_expiry_ramp and reports
-    # FAULT_REFERENCE_STALE, and at that point this node releases the claim --
-    # 5.2 step 1 -- to `idle` and puts the producer back into `shadow`. It is
-    # `idle` and not `follow` deliberately: choosing to resume a motion is the
-    # task layer's decision (5's "the supervisor stops, it does not decide what
-    # happens next"), and PRD 10 step 4 needs a reference that starts at the
-    # current MPC setpoint, which only the planner can produce. So `follow`
-    # below is never entered by anything but a /crane/set_mode request.
-    #
-    # The lists are therefore no longer pairwise disjoint. The rule that
-    # replaced that one is that no two modes name the same *set*:
-    # active_mode() matches by equality rather than containment, which answers a
-    # nested pair exactly, and two identical claims under two names would both
-    # read as active at once.
     mode_controllers:
       follow:
         - crane_velocity_controller
@@ -168,79 +16,12 @@ crane_supervisor:
       mpc:
         - crane_velocity_controller
 
-    # The tool claim of control_architecture.md 7.3 -- a second, independent
-    # claim on the same pump, which no mode switch touches.
-    #
-    # **Empty, and that is what this deployment actually is.** With the block
-    # gripper the tool axis runs on its own controller and can move while the
-    # arm controller is inactive, which is why the supervisor and not the
-    # controller layer is what keeps a gripper action from being issued during
-    # an arm motion. On the CBS profiles today crane_velocity_controller claims
-    # all six velocity interfaces including q9_left_rail_joint, so there is one
-    # claim and no separate tool controller to name. The model carries the
-    # second claim because the machine has one; the list is empty because this
-    # composition does not expose it yet, and a name invented here would be a
-    # controller nothing spawns.
-    #
-    # **Slice 6 closing does not change this, and it was never going to.** The
-    # second claim needs a tool controller in a profile, which is a composition
-    # question and belongs to whichever slice exposes the gripper axis
-    # separately; no slice of the CBS migration is that one. What slice 6 did
-    # add is a second reader of the list: active_mode() reports the tool claim on
-    # every status, and neither a /crane/set_mode request nor the escalation
-    # hand-back above ever switches it -- 7.3's second claim is reported and
-    # never moved by a mode change, in both directions.
     tool_controllers: []
 
-    # The sway duty of control_architecture.md 5 row 7: a bound on the passive
-    # joint *rate* that raises FAULT_SWAY and names which coordinate crossed it,
-    # and a three-valued settled predicate the task layer gates a grip action on
-    # instead of on a timeout.
-    #
-    # **All four are DESIGN values, not measured ones.** Nothing on this machine
-    # has been measured to produce them, and the full derivation of each -- plus
-    # what would replace it, and who owns that -- is in
-    # src/crane_supervisor_parameters.yaml, once. In short:
-    #
-    #   dq_u_max         0.4 rad/s   peak rate of a ~0.2 rad swing at the
-    #                                pendulum's own 2 rad/s. Replaced by
-    #                                q_sway_max, which slice 5's swing envelope
-    #                                and virtual working cell fix together.
-    #   dq_u_settled     0.04 rad/s  peak rate of a ~0.02 rad swing -- the order
-    #                                of a placement budget -- and about 7 sigma
-    #                                of the identified rate noise, so a still
-    #                                crane can actually be observed to be still.
-    #                                Replaced by a recording of a grip approach
-    #                                with the load swinging: machine and human,
-    #                                like merge gate (ii-b).
-    #   release factor   1.5         hysteresis on the way out, so one noise
-    #                                sample past the bound does not cost a whole
-    #                                dwell at 20 Hz.
-    #   settle_dwell     2.0 s       above the 1.57 s half period of a 2 rad/s
-    #                                pendulum, which is the shortest window that
-    #                                must contain a rate peak. Replaced by the
-    #                                longest period over the working range,
-    #                                measured -- l_tool changes with telescope
-    #                                extension and with the tool.
-    #
-    # The bound is on the rate and not on the angle because the published angle
-    # is read out on the nominal hinge axes and carries an uncalibrated constant
-    # offset, while the rate is composed from the two gyro readings and does not.
-    # velocity_covariance is not consulted at all: it is the identified noise of
-    # the sensor pair rather than a statement about the cycle in hand.
-    #
-    # Both arrays are [tip, tilt], the index order PendulumState publishes.
-    # Unlike tracking_tolerance these numbers are refused rather than reported
-    # when absent -- they ship with the package, so a deployment without one is
-    # misconfigured rather than waiting on a campaign.
     sway:
       dq_u_max: [0.4, 0.4]
       dq_u_settled: [0.04, 0.04]
       settled_release_factor: 1.5
       settle_dwell: 2.0
 
-    # Which RemoteCtrlStates button the deadman is. 12 is read from the retained
-    # stack -- epsilon_crane_behavior_tree's approval gate tests button12, and
-    # the TUI maps it to the z key control_architecture.md 6.2 names -- and not
-    # inferred from the number. See src/crane_supervisor_parameters.yaml.
     deadman_button: 12

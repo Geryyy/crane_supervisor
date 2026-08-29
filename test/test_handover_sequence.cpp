@@ -16,7 +16,6 @@
 #include "control_msgs/msg/joint_trajectory_controller_state.hpp"
 #include "controller_manager_msgs/srv/list_controllers.hpp"
 #include "controller_manager_msgs/srv/switch_controller.hpp"
-#include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/msg/solver_health.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
 #include "crane_msgs/msg/velocity_controller_health.hpp"
@@ -25,6 +24,7 @@
 #include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
 #include "rcl_interfaces/msg/set_parameters_result.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
 #include "std_srvs/srv/trigger.hpp"
 
 namespace
@@ -262,8 +262,8 @@ protected:
       });
     remote_ctrl_ = observer_->create_publisher<RemoteCtrlStates>(
       crane_supervisor::kRemoteCtrlStatesTopic, crane_supervisor::contract_qos());
-    pendulum_state_ = observer_->create_publisher<crane_msgs::msg::PendulumState>(
-      crane_supervisor::kPendulumStateTopic, crane_supervisor::contract_qos());
+    pendulum_state_ = observer_->create_publisher<sensor_msgs::msg::JointState>(
+      crane_supervisor::kPassiveStateTopic, crane_supervisor::contract_qos());
     controller_state_ =
       observer_->create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
       crane_supervisor::kControllerStateTopic, rclcpp::SystemDefaultsQoS());
@@ -351,11 +351,13 @@ protected:
     message.em_stop = false;
     remote_ctrl_->publish(message);
 
-    crane_msgs::msg::PendulumState pendulum;
+    sensor_msgs::msg::JointState pendulum;
     pendulum.header.stamp = stamp;
-    pendulum.valid = true;
-    pendulum.status = "complementary filter on the two bracketing IMUs";
-    pendulum.velocity = {0.0, 0.0};
+    for (const auto & axis : crane_supervisor::kPassiveAxisNames) {
+      pendulum.name.push_back(axis.joint);
+      pendulum.position.push_back(0.0);
+      pendulum.velocity.push_back(0.0);
+    }
     pendulum_state_->publish(pendulum);
 
     control_msgs::msg::JointTrajectoryControllerState controller_state;
@@ -448,7 +450,7 @@ protected:
   rclcpp::Node::SharedPtr observer_;
   rclcpp::Subscription<SupervisorStatus>::SharedPtr status_;
   rclcpp::Publisher<RemoteCtrlStates>::SharedPtr remote_ctrl_;
-  rclcpp::Publisher<crane_msgs::msg::PendulumState>::SharedPtr pendulum_state_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pendulum_state_;
   rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr
     controller_state_;
   rclcpp::Publisher<crane_msgs::msg::VelocityControllerHealth>::SharedPtr controller_health_;

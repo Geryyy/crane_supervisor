@@ -1,0 +1,12 @@
+# Test-only overrides, in the shape of `crane_control/config/tracking_tolerance.yaml`
+# (wildcard node key, the six URDF joint names, the `dq_a` key). Not tolerances for
+# any machine -- do not copy these into that file.
+/**:
+  ros__parameters:
+    tracking_tolerance:
+      theta1_slewing_joint: {dq_a: 0.01}   # rad/s -- fixture, not measured
+      theta2_boom_joint: {dq_a: 0.02}      # rad/s -- fixture, not measured
+      theta3_arm_joint: {dq_a: 0.03}       # rad/s -- fixture, not measured
+      q4_big_telescope: {dq_a: 0.04}       # m/s   -- fixture, not measured
+      theta8_rotator_joint: {dq_a: 0.05}   # rad/s -- fixture, not measured
+      q9_left_rail_joint: {dq_a: 0.06}     # m/s   -- fixture, not measured

@@ -33,6 +33,7 @@
   <depend>epsilon_crane_msgs</depend>
   <depend>generate_parameter_library</depend>
   <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
   <depend>std_srvs</depend>
 
   <!-- The one exception, and the reason it is here rather than anywhere else.

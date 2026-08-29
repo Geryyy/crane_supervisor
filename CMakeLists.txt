@@ -9,6 +9,7 @@ find_package(epsilon_crane_msgs REQUIRED)
 find_package(generate_parameter_library REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 
 # The decision core: an input struct in, a decision struct out. No node handle,
@@ -48,6 +49,7 @@ target_link_libraries(supervisor_node
     ${crane_msgs_TARGETS}
     ${epsilon_crane_msgs_TARGETS}
     ${rcl_interfaces_TARGETS}
+    ${sensor_msgs_TARGETS}
     ${std_srvs_TARGETS}
   PRIVATE
     crane_supervisor_parameters)
@@ -77,7 +79,7 @@ ament_export_include_directories(include)
 ament_export_libraries(supervisor_core)
 ament_export_dependencies(
   control_msgs controller_manager_msgs crane_msgs epsilon_crane_msgs rcl_interfaces rclcpp
-  std_srvs)
+  sensor_msgs std_srvs)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -157,6 +159,7 @@ if(BUILD_TESTING)
     ${crane_msgs_TARGETS}
     ${epsilon_crane_msgs_TARGETS}
     ${rcl_interfaces_TARGETS}
+    ${sensor_msgs_TARGETS}
     ${std_srvs_TARGETS})
 
   # The absence that is the feature: no publisher on a command topic, and no

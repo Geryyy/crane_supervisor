@@ -159,8 +159,6 @@ crane_supervisor::SupervisorInput healthy_input()
     input.streams[i].received = true;
     input.streams[i].age = 0.01;
   }
-  input.pendulum_state.valid = true;
-  input.pendulum_state.status = "complementary filter on the two bracketing IMUs";
   input.pendulum_state.velocity = {{0.0, 0.0}};
   input.sampled_at = kFirstCycle;
   input.remote_ctrl = held_remote();
@@ -498,44 +496,6 @@ TEST(SupervisorCore, AStampAheadOfTheClockIsAFaultRatherThanAFreshSample)
   EXPECT_NE(ahead.message.find("future"), std::string::npos) << ahead.message;
 }
 
-TEST(SupervisorCore, TheProducersOwnFlagIsTheThirdCauseAndItsAccountIsCarriedThrough)
-{
-  auto input = healthy_input();
-  input.pendulum_state.valid = false;
-  input.pendulum_state.status =
-    "not to be trusted: the upstream IMU on K5 answered with the same seven values for 10 cycles";
-
-  const auto decision = crane_supervisor::decide(default_config(), input);
-  EXPECT_EQ(decision.fault, crane_supervisor::Fault::StateHealth);
-  EXPECT_NE(decision.message.find(input.pendulum_state.status), std::string::npos)
-    << decision.message;
-  EXPECT_NE(decision.message.find("health flag"), std::string::npos) << decision.message;
-  EXPECT_NE(decision.message.find("refreshing"), std::string::npos) << decision.message;
-}
-
-TEST(SupervisorCore, AnInvalidStateWithNoStatusStillReportsACause)
-{
-  auto input = healthy_input();
-  input.pendulum_state.valid = false;
-  input.pendulum_state.status.clear();
-
-  const auto decision = crane_supervisor::decide(default_config(), input);
-  EXPECT_EQ(decision.fault, crane_supervisor::Fault::StateHealth);
-  EXPECT_FALSE(decision.message.empty());
-  EXPECT_NE(decision.message.find("no status string"), std::string::npos) << decision.message;
-}
-
-TEST(SupervisorCore, AbsenceOutranksInvalidity)
-{
-  const auto config = default_config();
-  auto input = healthy_input();
-  input.pendulum_state.valid = false;
-  input.stream(Input::PendulumState).age = 10.0;
-
-  const auto decision = crane_supervisor::decide(config, input);
-  EXPECT_NE(decision.message.find("stopped arriving"), std::string::npos) << decision.message;
-}
-
 TEST(SupervisorCore, AHealthyTracerClearsTheFaultAndStillSaysWhatIsNotWatched)
 {
   const auto decision = crane_supervisor::decide(default_config(), healthy_input());
@@ -570,8 +530,7 @@ TEST(SupervisorCore, TheDeadmanIsReportedOnEveryDecisionWhateverTheFaultIs)
 {
   const auto config = default_config();
   auto input = healthy_input();
-  input.pendulum_state.valid = false;
-  input.pendulum_state.status = "the upstream IMU on K5 does not report itself healthy";
+  input.stream(Input::PendulumState).age = 10.0;
 
   const auto degraded = crane_supervisor::decide(config, input);
   EXPECT_EQ(degraded.fault, crane_supervisor::Fault::StateHealth);
@@ -955,11 +914,10 @@ TEST(SupervisorCore, TheHealthCodeIsReportedInPreferenceToTheCommissioningCode)
     crane_supervisor::Fault::NotCommissioned);
 
   auto degraded_state = only_commissioning;
-  degraded_state.pendulum_state.valid = false;
-  degraded_state.pendulum_state.status = "the upstream IMU on K5 does not report itself healthy";
+  degraded_state.stream(Input::PendulumState).age = 10.0;
   const auto against_state = crane_supervisor::decide(config, degraded_state);
   EXPECT_EQ(against_state.fault, crane_supervisor::Fault::StateHealth);
-  EXPECT_NE(against_state.message.find(degraded_state.pendulum_state.status), std::string::npos)
+  EXPECT_NE(against_state.message.find("stopped arriving"), std::string::npos)
     << against_state.message;
 
   auto dead_controller = only_commissioning;
@@ -1049,12 +1007,11 @@ TEST(SupervisorCore, ADegradedEstimateIsStateHealthAndNeverSway)
   const auto config = default_config();
 
   auto invalid = swinging(9.0);
-  invalid.pendulum_state.valid = false;
-  invalid.pendulum_state.status = "the upstream IMU on K5 does not report itself healthy";
+  invalid.stream(Input::PendulumState).age = 10.0;
   const auto degraded = crane_supervisor::decide(config, invalid);
   EXPECT_EQ(degraded.fault, crane_supervisor::Fault::StateHealth);
   EXPECT_EQ(degraded.sway.settled, crane_supervisor::SwaySettled::Unknown);
-  EXPECT_NE(degraded.message.find(invalid.pendulum_state.status), std::string::npos)
+  EXPECT_NE(degraded.message.find("stopped arriving"), std::string::npos)
     << degraded.message;
 
   // The same for every way the stream itself can fail to be fresh.
@@ -1232,9 +1189,9 @@ std::vector<crane_supervisor::SupervisorInput> every_input()
 {
   std::vector<crane_supervisor::SupervisorInput> inputs;
   for (const bool received : {false, true}) {
-    for (const bool valid : {false, true}) {
+    {
       for (const double age : {-100.0, -0.05, 0.0, 0.05, 100.0}) {
-        for (const char * status : {"", "a cause the estimator distinguished"}) {
+        {
           for (const bool remote_received : {false, true}) {
             for (const bool em_stop : {false, true}) {
               for (const bool deadman : {false, true}) {
@@ -1250,8 +1207,6 @@ std::vector<crane_supervisor::SupervisorInput> every_input()
                         }
                         input.stream(Input::RemoteCtrl).received = remote_received;
                         input.stream(Input::ControllerState).received = controller_received;
-                        input.pendulum_state.valid = valid;
-                        input.pendulum_state.status = status;
                         input.remote_ctrl.em_stop = em_stop;
                         input.remote_ctrl.deadman_held = deadman;
                         input.estop_latched = latched;
@@ -1346,8 +1301,7 @@ TEST(SupervisorCore, TheSettledPredicateIsOnEveryDecisionAndIsNeverSettledWhileU
     for (const auto & input : every_input()) {
       const auto decision = crane_supervisor::decide(config, input);
       const auto causes = crane_supervisor::freshness(config, input);
-      const bool trusted = causes[index_of(Input::PendulumState)] == Staleness::Fresh &&
-        input.pendulum_state.valid;
+      const bool trusted = causes[index_of(Input::PendulumState)] == Staleness::Fresh;
       if (trusted) {
         EXPECT_NE(decision.sway.settled, crane_supervisor::SwaySettled::Unknown);
       } else {
@@ -1400,7 +1354,6 @@ TEST(SupervisorCore, TheFaultsThisSliceRaisesAreItsOwnFiveAndTheOtherLoopsFour)
       }
       if (fault == crane_supervisor::Fault::Sway) {
         EXPECT_TRUE(input.stream(Input::PendulumState).received);
-        EXPECT_TRUE(input.pendulum_state.valid);
       }
     }
   }

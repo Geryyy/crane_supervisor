@@ -18,8 +18,8 @@ decides is which controller holds the claim.
   `SupervisorStatus` is frozen and widening it is a slice of its own (PRD §15);
   it is published from the same cycle, off the same decision, with the same
   `header.stamp`.
-- four **inputs carried end to end** — `crane_msgs/PendulumState` on
-  `/crane/pendulum_state`, `epsilon_crane_msgs/RemoteCtrlStates` on
+- four **inputs carried end to end** — the passive pair as
+  `sensor_msgs/JointState` on `/joint_states`, `epsilon_crane_msgs/RemoteCtrlStates` on
   `/crane/remote_ctrl_states`, `control_msgs/JointTrajectoryControllerState`
   on `/crane/controller_state`, and `crane_msgs/VelocityControllerHealth` on
   `/crane/velocity_controller/health`.
@@ -173,7 +173,7 @@ merged as its producer numbered it.  They are resolved in this order:
 | Report | When |
 |---|---|
 | `FAULT_ESTOP` | `em_stop` is asserted on `/crane/remote_ctrl_states`, **or** that stream is not arriving at all, **or** a stop that was one of those is latched and not yet acknowledged |
-| `FAULT_STATE_HEALTH` | nothing has arrived on `/crane/pendulum_state` yet, or the stream stopped, or its stamp is further in this node's future than the margin, or `pendulum_state_broadcaster` marked the sample unusable |
+| `FAULT_STATE_HEALTH` | nothing naming the passive pair has arrived on `/joint_states` yet, or that half stopped, or its stamp is further in this node's future than the margin |
 | `FAULT_STATE_HEALTH` | the trajectory controller's own state has never arrived on `/crane/controller_state`, or it stopped, or its stamp is too far ahead — a controller that stopped publishing is not a crane that is tracking perfectly |
 | `FAULT_STATE_HEALTH` | the inner velocity loop's own health has never arrived on `/crane/velocity_controller/health`, or it stopped, or its stamp is too far ahead — an uncommissioned axis reported to nobody is the state that stream exists to end |
 | `FAULT_SOLVER` | `MODE_MPC` is the live mode and the horizon producer's newest report — inside `horizon_timeout` — carries a fault, carried through unedited |
@@ -491,7 +491,7 @@ checklist:
   subscribed *and* has a row *and* is assigned a deadline out of a parameter, in
   that order, and no contract name is written down twice.
 
-The deadlines are **per input**, not one number: `/crane/pendulum_state` comes
+The deadlines are **per input**, not one number: the passive pair comes
 off the manager's 100 Hz cycle and `/crane/remote_ctrl_states` is a 20 Hz
 contract, so an age that is healthy on one is a dead publisher on the other.
 The numbers and the derivation of each are in
@@ -512,8 +512,13 @@ of them is not symmetric, and the report says which fired:
 | Cause | Where it is measured | How it reads here |
 |---|---|---|
 | age | here, from `header.stamp` against this input's deadline | `never connected`, `stopped arriving`, or `stamped ahead of this clock` — three reports, because "the publisher never came up" and "the publisher died" are different things to chase |
-| health flag | the producer | `valid == false`, and the producer's own `status` string carried through unedited |
-| refresh | the producer | inside that same string.  There is **no topic-level version of it here on purpose**: `pendulum_state_broadcaster` can ask whether seven doubles moved because differenced-gyro noise is thirty times the quantiser, while a supervisor asking the same of `RemoteCtrlStates` would be asking whether twelve booleans moved, and an operator holding a button produces bit-identical payloads for minutes |
+
+There used to be a second cause here — the producer's own `valid == false`, with
+its `status` string carried through unedited.  `sensor_msgs/JointState` carries
+no such flag, so it is gone: age is the whole test for this input, and a dead
+IMU behind a live publisher will not be noticed.  That is a real capability loss
+and it is deliberate — the passive source has no health signal left to report,
+and a flag fed by something that cannot fail-report is worse than no flag.
 
 **Recovery is symmetric.**  An input that starts arriving again inside its
 deadline clears its own fault with no acknowledgement.  The emergency stop is
@@ -594,12 +599,6 @@ faults rather than a quiet `FAULT_NONE` — and the stop signal's absence is rea
 as asserted rather than merely reported.  How that is enforced for every input
 rather than for the ones somebody remembered is the section above.
 
-**The broadcaster's own cause is carried through, not restated.**
-`pendulum_state_broadcaster` separates six causes behind `valid == false` and
-says which in its `status` string.  That string is copied into `message`
-verbatim, because restating it would flatten a distinction the estimator went to
-some trouble to make.
-
 ## The tracking error, and why it is two quantities
 
 §5.0 is the reason this package exists at all.  The behaviour tree already
@@ -678,7 +677,7 @@ Two different things come off the passive rate and they are not interchangeable:
 | the predicate | **three-valued** — settled, not settled, unknown — held over a dwell and released through a hysteresis | `crane_msgs/SwaySettled` on `/crane/sway_settled`, **and** the clause every status report ends in |
 
 **Both are on the rate and neither is on the angle.**  Two independent reasons,
-either of which would be enough on its own.  `pendulum_state_broadcaster` reads
+either of which would be enough on its own.  `tip_tilt_state_broadcaster` reads
 the two passive coordinates out on the *nominal* hinge axes, because the
 calibrated 2-D spline for the real double hinge needs calibration data this
 workspace does not carry — so the published angle carries an uncalibrated

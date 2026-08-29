@@ -15,7 +15,6 @@
 #include "control_msgs/msg/joint_trajectory_controller_state.hpp"
 #include "controller_manager_msgs/srv/list_controllers.hpp"
 #include "controller_manager_msgs/srv/switch_controller.hpp"
-#include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/msg/solver_health.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
 #include "crane_msgs/msg/sway_settled.hpp"
@@ -25,6 +24,7 @@
 #include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
 #include "rcl_interfaces/srv/set_parameters.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
 #include "std_srvs/srv/trigger.hpp"
 
 namespace crane_supervisor
@@ -59,7 +59,9 @@ inline constexpr double kSwitchBudget = 3.0;
 inline constexpr double kProducerModeBudget = 0.5;
 
 /// The four input contract names, off the policy rows that already carry them.
-inline constexpr const char * kPendulumStateTopic = policy_of(Input::PendulumState).topic;
+/// The passive pair arrives on `/joint_states` beside the actuated six, in its own partial
+/// message, so this name is shared with `joint_state_broadcaster` rather than owned.
+inline constexpr const char * kPassiveStateTopic = policy_of(Input::PendulumState).topic;
 inline constexpr const char * kRemoteCtrlStatesTopic = policy_of(Input::RemoteCtrl).topic;
 inline constexpr const char * kControllerStateTopic = policy_of(Input::ControllerState).topic;
 inline constexpr const char * kControllerHealthTopic = policy_of(Input::ControllerHealth).topic;
@@ -126,7 +128,19 @@ private:
 
   SupervisorConfig config_;
   std::array<bool, kInputCount> claimed_{};
-  crane_msgs::msg::PendulumState::ConstSharedPtr pendulum_state_;
+  /// The newest passive pair off `/joint_states`, cached by joint name.
+  /**
+   * The topic carries partial messages from two broadcasters, so the pair is kept as values and
+   * a stamp rather than as the message: the newest message on the topic is usually the actuated
+   * six, and aging this input against that stamp would report a freshness that is not its own.
+   */
+  struct PassivePair
+  {
+    bool received{false};
+    rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
+    std::array<double, kPassiveAxisCount> velocity{{0.0, 0.0}};
+  };
+  PassivePair passive_pair_;
   epsilon_crane_msgs::msg::RemoteCtrlStates::ConstSharedPtr remote_ctrl_;
   control_msgs::msg::JointTrajectoryControllerState::ConstSharedPtr controller_state_;
   crane_msgs::msg::VelocityControllerHealth::ConstSharedPtr controller_health_;
@@ -138,7 +152,7 @@ private:
   bool ever_reported_{false};
   bool handback_attempted_{false};
 
-  rclcpp::Subscription<crane_msgs::msg::PendulumState>::SharedPtr pendulum_state_subscription_;
+  rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr pendulum_state_subscription_;
   rclcpp::Subscription<epsilon_crane_msgs::msg::RemoteCtrlStates>::SharedPtr
     remote_ctrl_subscription_;
   rclcpp::Subscription<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr

@@ -94,8 +94,6 @@ enum class Staleness : std::uint8_t
   /// The newest sample is older than this input's deadline. It was arriving.
   StoppedArriving = 2,
   StampAhead = 3,
-  /// It arrived, in time, and the producer marks its own output unusable.
-  ProducerUnhealthy = 4,
 };
 
 /// One input, and what its absence costs. One row per `Input`.
@@ -121,12 +119,12 @@ struct InputPolicy
 
 /// The one row per input, in enum order.
 inline constexpr std::array<InputPolicy, kInputCount> kInputPolicies{{
-  {Input::PendulumState, "the passive joint state", "/crane/pendulum_state",
-    "crane_msgs/PendulumState", "pendulum_state_broadcaster", "stopped arriving",
+  {Input::PendulumState, "the passive joint state", "/joint_states",
+    "sensor_msgs/JointState", "tip_tilt_state_broadcaster", "stopped arriving",
     "The passive joint state counts as unavailable, so nothing that closes on it may be trusted: "
     "a stale joint velocity makes the inner loop's integrator wind up against a value that is no "
     "longer true.",
-    "Check that pendulum_state_broadcaster is loaded and active on the controller manager.",
+    "Check that tip_tilt_state_broadcaster is loaded and active on the controller manager.",
     Fault::StateHealth, false},
   {Input::RemoteCtrl, "the operator remote", "/crane/remote_ctrl_states",
     "epsilon_crane_msgs/RemoteCtrlStates", "gpio_controller", "stopped arriving",
@@ -263,13 +261,15 @@ struct HorizonReport
   std::string status;
 };
 
-/// What `/crane/pendulum_state` said about itself this cycle.
+/// The passive pair off `/joint_states` this cycle.
+/**
+ * Freshness only, and no health: `sensor_msgs/JointState` carries no validity
+ * flag, so a producer that has stopped publishing is the whole of what this
+ * source can report about itself.
+ */
 struct PendulumStateReport
 {
-  /// `crane_msgs/PendulumState.valid`.
-  bool valid{false};
-  std::string status;
-  /// `crane_msgs/PendulumState.velocity`, rad/s, `[tip, tilt]`.
+  /// The passive velocities, rad/s, `[tip, tilt]`.
   std::array<double, kPassiveAxisCount> velocity{
     {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()}};
 };
@@ -388,8 +388,7 @@ struct ClearFaultOutcome
 
 /// Which input, and which staleness cause, in words an operator can act on.
 [[nodiscard]] std::string staleness_message(
-  const SupervisorConfig & config, Input input, Staleness cause, const StreamReport & stream,
-  const std::string & carried);
+  const SupervisorConfig & config, Input input, Staleness cause, const StreamReport & stream);
 
 /// True when a number is a tolerance: finite and positive.
 [[nodiscard]] bool is_tolerance(double dq_a) noexcept;

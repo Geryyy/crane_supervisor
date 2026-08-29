@@ -16,20 +16,19 @@
 #include <vector>
 
 #include "control_msgs/msg/joint_trajectory_controller_state.hpp"
-#include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
 #include "crane_msgs/msg/sway_settled.hpp"
 #include "crane_msgs/msg/velocity_controller_health.hpp"
 #include "crane_supervisor/supervisor_node.hpp"
 #include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/joint_state.hpp"
 #include "std_srvs/srv/trigger.hpp"
 
 namespace
 {
 
 using control_msgs::msg::JointTrajectoryControllerState;
-using crane_msgs::msg::PendulumState;
 using crane_msgs::msg::SupervisorStatus;
 using crane_msgs::msg::VelocityControllerHealth;
 using epsilon_crane_msgs::msg::RemoteCtrlStates;
@@ -44,6 +43,21 @@ const std::vector<std::string> kActuatedJoints{
 constexpr std::size_t kGripperAxis = 5;
 
 constexpr double kTestTimeout = 0.2;
+
+/// The passive pair as `tip_tilt_state_broadcaster` publishes it on `/joint_states`.
+/**
+ * `age` is how far in the past the pair is stamped when it goes out. It is the only way this
+ * fixture can degrade the input, because `sensor_msgs/JointState` carries no validity flag: a
+ * producer that has stopped publishing is the whole of what this source can report about itself.
+ */
+struct PassiveState
+{
+  double age{0.0};
+  std::array<double, crane_supervisor::kPassiveAxisCount> velocity{{0.0, 0.0}};
+};
+
+/// How far past its deadline a degraded pair is stamped, s.
+constexpr double kDeadAge = 10.0 * kTestTimeout;
 
 constexpr double kBudget = 10.0;
 
@@ -98,8 +112,8 @@ protected:
     sway_settled_ = observer_->create_subscription<SwaySettledMsg>(
       crane_supervisor::kSwaySettledTopic, qos,
       [this](SwaySettledMsg::ConstSharedPtr message) {settled_.push_back(*message);});
-    pendulum_state_ = observer_->create_publisher<PendulumState>(
-      crane_supervisor::kPendulumStateTopic, qos);
+    pendulum_state_ = observer_->create_publisher<sensor_msgs::msg::JointState>(
+      crane_supervisor::kPassiveStateTopic, qos);
     remote_ctrl_ = observer_->create_publisher<RemoteCtrlStates>(
       crane_supervisor::kRemoteCtrlStatesTopic, qos);
     controller_state_ = observer_->create_publisher<JointTrajectoryControllerState>(
@@ -136,14 +150,20 @@ protected:
     return done();
   }
 
-  /// A message the broadcaster would publish when the estimate is trusted.
-  PendulumState trusted_state() const
+  /// The pair the broadcaster would publish with both bracketing units refreshing.
+  PassiveState trusted_state() const {return PassiveState{};}
+
+  /// One passive pair on `/joint_states`, named and stamped as the broadcaster stamps it.
+  void publish_passive(const PassiveState & state)
   {
-    PendulumState message;
-    message.header.stamp = observer_->now();
-    message.valid = true;
-    message.status = "complementary filter on the two bracketing IMUs, both healthy";
-    return message;
+    sensor_msgs::msg::JointState message;
+    message.header.stamp = observer_->now() - rclcpp::Duration::from_seconds(state.age);
+    for (std::size_t axis = 0; axis < crane_supervisor::kPassiveAxisCount; ++axis) {
+      message.name.push_back(crane_supervisor::kPassiveAxisNames[axis].joint);
+      message.position.push_back(0.0);
+      message.velocity.push_back(state.velocity[axis]);
+    }
+    pendulum_state_->publish(message);
   }
 
   /// What gpio_controller publishes with the stop released and button 12 held.
@@ -224,12 +244,10 @@ protected:
 
   /// Publish all four inputs once, stamped now.
   void publish(
-    const PendulumState & state, const RemoteCtrlStates & remote,
+    const PassiveState & state, const RemoteCtrlStates & remote,
     const JointTrajectoryControllerState & controller, const VelocityControllerHealth & health)
   {
-    PendulumState fresh_state = state;
-    fresh_state.header.stamp = observer_->now();
-    pendulum_state_->publish(fresh_state);
+    publish_passive(state);
 
     RemoteCtrlStates fresh_remote = remote;
     fresh_remote.header.stamp = observer_->now();
@@ -245,20 +263,20 @@ protected:
   }
 
   void publish(
-    const PendulumState & state, const RemoteCtrlStates & remote,
+    const PassiveState & state, const RemoteCtrlStates & remote,
     const JointTrajectoryControllerState & controller)
   {
     publish(state, remote, controller, healthy_inner_loop());
   }
 
-  void publish(const PendulumState & state, const RemoteCtrlStates & remote)
+  void publish(const PassiveState & state, const RemoteCtrlStates & remote)
   {
     publish(state, remote, tracking_controller_state());
   }
 
   /// Spin, publishing every input every pass, until the newest report is `fault`.
   bool drive_to(
-    std::uint8_t fault, const PendulumState & state, const RemoteCtrlStates & remote,
+    std::uint8_t fault, const PassiveState & state, const RemoteCtrlStates & remote,
     const JointTrajectoryControllerState & controller, const VelocityControllerHealth & health)
   {
     return spin_until(
@@ -271,25 +289,25 @@ protected:
   }
 
   bool drive_to(
-    std::uint8_t fault, const PendulumState & state, const RemoteCtrlStates & remote,
+    std::uint8_t fault, const PassiveState & state, const RemoteCtrlStates & remote,
     const JointTrajectoryControllerState & controller)
   {
     return drive_to(fault, state, remote, controller, healthy_inner_loop());
   }
 
-  bool drive_to(std::uint8_t fault, const PendulumState & state, const RemoteCtrlStates & remote)
+  bool drive_to(std::uint8_t fault, const PassiveState & state, const RemoteCtrlStates & remote)
   {
     return drive_to(fault, state, remote, tracking_controller_state());
   }
 
-  bool drive_to(std::uint8_t fault, const PendulumState & state)
+  bool drive_to(std::uint8_t fault, const PassiveState & state)
   {
     return drive_to(fault, state, held_remote());
   }
 
   /// Call `/crane/clear_fault` and spin until it answers, publishing meanwhile.
   Trigger::Response::SharedPtr acknowledge(
-    const PendulumState & state, const RemoteCtrlStates & remote)
+    const PassiveState & state, const RemoteCtrlStates & remote)
   {
     if (!clear_fault_->wait_for_service(std::chrono::seconds(5))) {
       return nullptr;
@@ -359,7 +377,7 @@ protected:
   rclcpp::Node::SharedPtr observer_;
   rclcpp::Subscription<SupervisorStatus>::SharedPtr status_;
   rclcpp::Subscription<SwaySettledMsg>::SharedPtr sway_settled_;
-  rclcpp::Publisher<PendulumState>::SharedPtr pendulum_state_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr pendulum_state_;
   rclcpp::Publisher<RemoteCtrlStates>::SharedPtr remote_ctrl_;
   rclcpp::Publisher<JointTrajectoryControllerState>::SharedPtr controller_state_;
   rclcpp::Publisher<VelocityControllerHealth>::SharedPtr controller_health_;
@@ -468,7 +486,7 @@ TEST_F(StatusStream, AbsenceOfTheStopSignalIsAssertedBeforeAnythingArrives)
   expect_contract_of_every_report();
 }
 
-TEST_F(StatusStream, AbsenceIsNotHealthBeforeTheFirstPendulumStateArrives)
+TEST_F(StatusStream, AbsenceIsNotHealthBeforeTheFirstPassiveStateArrives)
 {
   ASSERT_TRUE(
     spin_until(
@@ -559,9 +577,7 @@ TEST_F(StatusStream, TheRemoteStoppingIsAssertedRatherThanReleased)
     spin_until(
       [this]() {return received_.back().fault == SupervisorStatus::FAULT_ESTOP;},
       [this]() {
-        PendulumState state = trusted_state();
-        state.header.stamp = observer_->now();
-        pendulum_state_->publish(state);
+        publish_passive(trusted_state());
         publish_controllers();
       }))
     << received_.back().message;
@@ -585,17 +601,15 @@ TEST_F(StatusStream, TheRemoteStoppingIsAssertedRatherThanReleased)
   expect_contract_of_every_report();
 }
 
-TEST_F(StatusStream, ThePendulumStateIsCarriedEndToEnd)
+TEST_F(StatusStream, ThePassiveStateIsCarriedEndToEnd)
 {
   ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state()))
     << received_.back().message;
 
-  PendulumState degraded = trusted_state();
-  degraded.valid = false;
-  degraded.status =
-    "not to be trusted: the upstream IMU on K5 does not report itself healthy";
+  PassiveState degraded = trusted_state();
+  degraded.age = kDeadAge;
   ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_STATE_HEALTH, degraded));
-  EXPECT_NE(received_.back().message.find(degraded.status), std::string::npos)
+  EXPECT_NE(received_.back().message.find("stopped arriving"), std::string::npos)
     << received_.back().message;
 
   expect_contract_of_every_report();
@@ -606,7 +620,7 @@ TEST_F(StatusStream, ASwingingLoadReachesTheStreamAsATypedCauseThatNamesTheCoord
   ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state()))
     << received_.back().message;
 
-  PendulumState swinging = trusted_state();
+  PassiveState swinging = trusted_state();
   swinging.velocity[1] = 0.9;
   ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_SWAY, swinging)) << received_.back().message;
 
@@ -617,12 +631,11 @@ TEST_F(StatusStream, ASwingingLoadReachesTheStreamAsATypedCauseThatNamesTheCoord
   EXPECT_NE(message.find("0.4000"), std::string::npos) << message;
   EXPECT_NE(message.find("Nothing was stopped"), std::string::npos) << message;
 
-  PendulumState degraded = swinging;
-  degraded.valid = false;
-  degraded.status = "not to be trusted: the upstream IMU on K5 stopped refreshing";
+  PassiveState degraded = swinging;
+  degraded.age = kDeadAge;
   ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_STATE_HEALTH, degraded))
     << received_.back().message;
-  EXPECT_NE(received_.back().message.find(degraded.status), std::string::npos)
+  EXPECT_NE(received_.back().message.find("stopped arriving"), std::string::npos)
     << received_.back().message;
 
   ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_NONE, trusted_state()))
@@ -656,9 +669,8 @@ TEST_F(StatusStreamWithShortDwell, TheSettledPredicateIsOnEveryReportAndPassesTh
     << received_.back().message;
   EXPECT_EQ(received_.back().fault, SupervisorStatus::FAULT_NONE) << received_.back().message;
 
-  PendulumState degraded = trusted_state();
-  degraded.valid = false;
-  degraded.status = "not to be trusted: no filter state";
+  PassiveState degraded = trusted_state();
+  degraded.age = kDeadAge;
   ASSERT_TRUE(drive_to(SupervisorStatus::FAULT_STATE_HEALTH, degraded))
     << received_.back().message;
   EXPECT_NE(received_.back().message.find("Sway: not known"), std::string::npos)
@@ -713,7 +725,7 @@ TEST_F(StatusStreamWithShortDwell, TheFieldAndTheSentenceAreOneDecisionAndCannot
   ASSERT_NE(cleared, nullptr);
   EXPECT_TRUE(cleared->success) << cleared->message;
 
-  PendulumState still = trusted_state();
+  PassiveState still = trusted_state();
   still.velocity[0] = 0.01;
   still.velocity[1] = -0.005;
   ASSERT_TRUE(
@@ -726,7 +738,7 @@ TEST_F(StatusStreamWithShortDwell, TheFieldAndTheSentenceAreOneDecisionAndCannot
   EXPECT_DOUBLE_EQ(settled_.back().velocity[0], 0.01);
   EXPECT_DOUBLE_EQ(settled_.back().velocity[1], -0.005);
 
-  PendulumState swinging = trusted_state();
+  PassiveState swinging = trusted_state();
   swinging.velocity[0] = 0.2;
   ASSERT_TRUE(
     spin_until(
@@ -737,9 +749,8 @@ TEST_F(StatusStreamWithShortDwell, TheFieldAndTheSentenceAreOneDecisionAndCannot
     << settled_.back().message;
   EXPECT_EQ(received_.back().fault, SupervisorStatus::FAULT_NONE) << received_.back().message;
 
-  PendulumState degraded = still;
-  degraded.valid = false;
-  degraded.status = "not to be trusted: no filter state";
+  PassiveState degraded = still;
+  degraded.age = kDeadAge;
   ASSERT_TRUE(
     spin_until(
       [this]() {
@@ -786,9 +797,7 @@ TEST_F(StatusStream, AControllerThatStopsPublishingIsAFaultAndNotAZeroError)
         return received_.back().fault == SupervisorStatus::FAULT_STATE_HEALTH;
       },
       [this]() {
-        PendulumState state = trusted_state();
-        state.header.stamp = observer_->now();
-        pendulum_state_->publish(state);
+        publish_passive(trusted_state());
         RemoteCtrlStates remote = held_remote();
         remote.header.stamp = observer_->now();
         remote_ctrl_->publish(remote);
@@ -958,15 +967,14 @@ TEST_F(StatusStream, TheInnerLoopsFaultReachesTheStreamAndNamesTheAxisItIsAbout)
   EXPECT_NE(received_.back().message.find("Nothing was stopped"), std::string::npos)
     << received_.back().message;
 
-  PendulumState degraded = trusted_state();
-  degraded.valid = false;
-  degraded.status = "not to be trusted: the upstream IMU on K5 does not report itself healthy";
+  PassiveState degraded = trusted_state();
+  degraded.age = kDeadAge;
   ASSERT_TRUE(
     drive_to(
       SupervisorStatus::FAULT_STATE_HEALTH, degraded, held_remote(),
       tracking_controller_state(), uncommissioned_gripper()))
     << received_.back().message;
-  EXPECT_NE(received_.back().message.find(degraded.status), std::string::npos)
+  EXPECT_NE(received_.back().message.find("stopped arriving"), std::string::npos)
     << received_.back().message;
 
   ASSERT_TRUE(
@@ -1002,9 +1010,7 @@ TEST_F(StatusStream, AnInnerLoopThatIsNotReportingIsAFaultRatherThanAClearReport
         return !received_.empty() && received_.back().fault == SupervisorStatus::FAULT_STATE_HEALTH;
       },
       [this]() {
-        PendulumState state = trusted_state();
-        state.header.stamp = observer_->now();
-        pendulum_state_->publish(state);
+        publish_passive(trusted_state());
         RemoteCtrlStates remote = held_remote();
         remote.header.stamp = observer_->now();
         remote_ctrl_->publish(remote);
@@ -1026,9 +1032,7 @@ TEST_F(StatusStream, AnInnerLoopThatIsNotReportingIsAFaultRatherThanAClearReport
     spin_until(
       [this]() {return received_.back().fault == SupervisorStatus::FAULT_STATE_HEALTH;},
       [this]() {
-        PendulumState state = trusted_state();
-        state.header.stamp = observer_->now();
-        pendulum_state_->publish(state);
+        publish_passive(trusted_state());
         RemoteCtrlStates remote = held_remote();
         remote.header.stamp = observer_->now();
         remote_ctrl_->publish(remote);

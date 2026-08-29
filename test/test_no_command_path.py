@@ -68,7 +68,7 @@ NON_SOURCE_DIRECTORIES = {".git", "__pycache__", "build", "install", "log"}
 
 STATUS_TOPIC = "/crane/supervisor/status"
 SWAY_SETTLED_TOPIC = "/crane/sway_settled"
-PENDULUM_STATE_TOPIC = "/crane/pendulum_state"
+PASSIVE_STATE_TOPIC = "/joint_states"
 REMOTE_CTRL_STATES_TOPIC = "/crane/remote_ctrl_states"
 CONTROLLER_STATE_TOPIC = "/crane/controller_state"
 CONTROLLER_HEALTH_TOPIC = "/crane/velocity_controller/health"
@@ -79,7 +79,7 @@ LIST_CONTROLLERS_SERVICE = "/controller_manager/list_controllers"
 SWITCH_CONTROLLER_SERVICE = "/controller_manager/switch_controller"
 
 PARAMETER_SERVICE_SUFFIX = "/set_parameters"
-PERMITTED_NAME_FRAGMENTS = {PARAMETER_SERVICE_SUFFIX}
+PERMITTED_NAME_FRAGMENTS = {PARAMETER_SERVICE_SUFFIX, PASSIVE_STATE_TOPIC}
 NAME_FRAGMENT = re.compile(r"/[A-Za-z_][A-Za-z0-9_]*")
 
 SOLVER_HEALTH_TOPIC = "/crane/mpc/solver_health"
@@ -87,7 +87,6 @@ SOLVER_HEALTH_TOPIC = "/crane/mpc/solver_health"
 PERMITTED_ROS_NAMES = {
     STATUS_TOPIC,
     SWAY_SETTLED_TOPIC,
-    PENDULUM_STATE_TOPIC,
     REMOTE_CTRL_STATES_TOPIC,
     CONTROLLER_STATE_TOPIC,
     CONTROLLER_HEALTH_TOPIC,
@@ -104,7 +103,7 @@ MENTIONED_ROS_NAMES = PERMITTED_ROS_NAMES | {HORIZON_TOPIC}
 ROS_NAME = re.compile(r"/[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)+")
 CRANE_NAME = re.compile(r"/crane/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*")
 
-FORBIDDEN_ROS_NAMES = ("/joint_states", "/cbs/")
+FORBIDDEN_ROS_NAMES = ("/cbs/",)
 
 FORBIDDEN_IDENTIFIERS = (
     "load_controller",
@@ -151,6 +150,7 @@ PERMITTED_DEPENDENCIES = {
     "generate_parameter_library",
     "rcl_interfaces",
     "rclcpp",
+    "sensor_msgs",
     "std_srvs",
     "velocity_controllers",
 }
@@ -287,7 +287,7 @@ def test_the_package_publishes_two_status_streams_and_only_reads_its_inputs():
     assert clients == PERMITTED_CLIENT_TYPES, clients
     assert subscriptions == ["MessageT", "crane_msgs::msg::SolverHealth"], subscriptions
     assert subscribed == [
-        "crane_msgs::msg::PendulumState",
+        "sensor_msgs::msg::JointState",
         "epsilon_crane_msgs::msg::RemoteCtrlStates",
         "control_msgs::msg::JointTrajectoryControllerState",
         "crane_msgs::msg::VelocityControllerHealth",

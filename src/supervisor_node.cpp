@@ -1,7 +1,9 @@
 #include "crane_supervisor/supervisor_node.hpp"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <iterator>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -140,10 +142,29 @@ SupervisorNode::SupervisorNode(const rclcpp::NodeOptions & options)
   sway_settled_publisher_ =
     create_publisher<crane_msgs::msg::SwaySettled>(kSwaySettledTopic, contract_qos());
 
-  pendulum_state_subscription_ = subscribe<crane_msgs::msg::PendulumState>(
+  // The passive pair, cached by joint name off the shared `/joint_states`: the topic carries one
+  // partial message per broadcaster, so a message that names neither passive joint is the actuated
+  // half and says nothing about this input's freshness.
+  pendulum_state_subscription_ = subscribe<sensor_msgs::msg::JointState>(
     Input::PendulumState,
-    [this](crane_msgs::msg::PendulumState::ConstSharedPtr message) {
-      pendulum_state_ = std::move(message);
+    [this](sensor_msgs::msg::JointState::ConstSharedPtr message) {
+      PassivePair pair;
+      for (std::size_t axis = 0; axis < kPassiveAxisCount; ++axis) {
+        const auto found = std::find(
+          message->name.begin(), message->name.end(), kPassiveAxisNames[axis].joint);
+        if (found == message->name.end()) {
+          return;
+        }
+        const std::size_t index =
+          static_cast<std::size_t>(std::distance(message->name.begin(), found));
+        if (index >= message->velocity.size()) {
+          return;
+        }
+        pair.velocity[axis] = message->velocity[index];
+      }
+      pair.received = true;
+      pair.stamp = rclcpp::Time(message->header.stamp, RCL_ROS_TIME);
+      passive_pair_ = pair;
     });
 
   remote_ctrl_subscription_ = subscribe<epsilon_crane_msgs::msg::RemoteCtrlStates>(
@@ -253,10 +274,10 @@ SupervisorInput SupervisorNode::observe() const
     };
 
   const std::array<bool, kInputCount> arrived{{
-    static_cast<bool>(pendulum_state_), static_cast<bool>(remote_ctrl_),
+    passive_pair_.received, static_cast<bool>(remote_ctrl_),
     static_cast<bool>(controller_state_), static_cast<bool>(controller_health_)}};
   const std::array<double, kInputCount> age{{
-    pendulum_state_ ? age_of(pendulum_state_) : 0.0,
+    passive_pair_.received ? (sampled_at - passive_pair_.stamp).seconds() : 0.0,
     remote_ctrl_ ? age_of(remote_ctrl_) : 0.0,
     controller_state_ ? age_of(controller_state_) : 0.0,
     controller_health_ ? age_of(controller_health_) : 0.0}};
@@ -265,10 +286,8 @@ SupervisorInput SupervisorNode::observe() const
     input.streams[i].age = age[i];
   }
 
-  if (pendulum_state_) {
-    input.pendulum_state.valid = pendulum_state_->valid;
-    input.pendulum_state.status = pendulum_state_->status;
-    input.pendulum_state.velocity = pendulum_state_->velocity;
+  if (passive_pair_.received) {
+    input.pendulum_state.velocity = passive_pair_.velocity;
   }
 
   if (remote_ctrl_) {

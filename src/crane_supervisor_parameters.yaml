@@ -4,8 +4,8 @@ crane_supervisor:
     default_value: 0.15
     read_only: true
     description: "Freshness deadline of Input::PendulumState: the longest age of
-      the newest crane_msgs/PendulumState on /crane/pendulum_state that still
-      counts as arriving, s. Past it the supervisor reports FAULT_STATE_HEALTH
+      the newest sensor_msgs/JointState on /joint_states naming the passive pair
+      that still counts as arriving, s. Past it the supervisor reports FAULT_STATE_HEALTH
       and says which of the staleness causes fired:
       wiki/control_architecture.md 5.3 allows no input to stop arriving without
       a defined consequence, and this deadline is what turns 'stopped' into that
@@ -14,9 +14,9 @@ crane_supervisor:
       old when it is read, and the worst control-cycle gap in the recorded
       machine data is a further 50.4 ms, so 150 ms clears a healthy stack
       without hiding a dead publisher for a human-perceptible time. It is a
-      topic-level margin and is not the broadcaster's own
-      health.max_measurement_age of 60 ms, which asks a different question one
-      layer down. Read-only: a margin an operator can move underneath a running
+      topic-level margin, and it is now the whole test: sensor_msgs/JointState
+      carries no validity flag, so a producer that has stopped publishing is the
+      only failure this source can report. Read-only: a margin an operator can move underneath a running
       stream makes the status unreproducible."
     validation:
       bounds<>: [0.001, 10.0]
@@ -253,8 +253,8 @@ crane_supervisor:
       default_value: [0.4, 0.4]
       read_only: true
       description: "The passive joint rate past which FAULT_SWAY is raised,
-        rad/s, over [tip, tilt] -- the same index order crane_msgs/PendulumState
-        publishes its arrays in. The fault names which of the two coordinates
+        rad/s, over [tip, tilt] -- the same index order
+        tip_tilt_state_broadcaster publishes the pair in. The fault names which of the two coordinates
         exceeded its own bound, because an operator watching the tool swing
         along the boom and one watching it swing across it are looking at two
         different things.

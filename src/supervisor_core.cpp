@@ -14,17 +14,13 @@ namespace crane_supervisor
 namespace
 {
 
-constexpr char kNoStatusGiven[] =
-  "(the producer set no status string, which is itself a defect -- the message carries the cause "
-  "in that field)";
-
 constexpr char kAbsenceIsNotHealth[] =
   " Absence is not health: wiki/control_architecture.md 5.3 allows no input to stop arriving "
   "without a defined consequence, so this is reported as a fault rather than left at FAULT_NONE. ";
 
 constexpr char kObserving[] =
-  "no fault: the passive joint state is arriving inside its margin and pendulum_state_broadcaster "
-  "reports it usable, neither passive rate is past its sway bound, the trajectory controller's own "
+  "no fault: the passive joint state is arriving inside its margin, "
+  "neither passive rate is past its sway bound, the trajectory controller's own "
   "state is arriving and no axis is outside its tolerance, the inner velocity loop is arriving and "
   "reports no fault of its own, the "
   "operator remote is arriving, its emergency stop is released and nothing is latched, and the "
@@ -499,7 +495,7 @@ std::string stop_message(
 {
   if (cause != Staleness::Fresh) {
     return staleness_message(
-      config, Input::RemoteCtrl, cause, input.stream(Input::RemoteCtrl), {}) +
+      config, Input::RemoteCtrl, cause, input.stream(Input::RemoteCtrl)) +
            kDiagnosisNotProtection;
   }
   if (input.remote_ctrl.em_stop) {
@@ -762,8 +758,7 @@ std::array<Staleness, kInputCount> freshness(
 }
 
 std::string staleness_message(
-  const SupervisorConfig & config, Input input, Staleness cause, const StreamReport & stream,
-  const std::string & carried)
+  const SupervisorConfig & config, Input input, Staleness cause, const StreamReport & stream)
 {
   const InputPolicy & policy = policy_of(input);
   const std::string deadline = seconds_text(config.deadline(input));
@@ -794,15 +789,6 @@ std::string staleness_message(
         "publishing it with this one; until then no staleness answer about that stream means "
         "anything (PRD user story 59). " + policy.consequence;
       break;
-    case Staleness::ProducerUnhealthy:
-      text += std::string(policy.label) + " arrived inside its freshness deadline of " + deadline +
-        " s and " + policy.producer +
-        " marks it unusable. Staleness cause: the producer's own health flag, which is the one "
-        "cause of the three this supervisor cannot measure off a topic. " + policy.producer +
-        " separates the flag, a sample that stopped refreshing behind a header that keeps moving, "
-        "and the measurement age, and says which in its own status string, so the string is "
-        "carried here unedited rather than restated: " +
-        (carried.empty() ? std::string(kNoStatusGiven) : carried);
       break;
     case Staleness::Fresh:
       text += std::string(policy.label) + " is arriving inside its freshness deadline of " +
@@ -884,7 +870,6 @@ SupervisorDecision resolve(
 
   const Staleness remote_cause = staleness[index_of(Input::RemoteCtrl)];
 
-  const PendulumStateReport & state = input.pendulum_state;
   const ControllerStateReport & controller = input.controller_state;
   const ControllerHealthReport & inner_loop = input.controller_health;
 
@@ -906,15 +891,7 @@ SupervisorDecision resolve(
     decision.fault = policy_of(Input::PendulumState).fault;
     decision.message = staleness_message(
       config, Input::PendulumState, staleness[index_of(Input::PendulumState)],
-      input.stream(Input::PendulumState), {});
-    return decision;
-  }
-
-  if (!state.valid) {
-    decision.fault = policy_of(Input::PendulumState).fault;
-    decision.message = staleness_message(
-      config, Input::PendulumState, Staleness::ProducerUnhealthy,
-      input.stream(Input::PendulumState), state.status);
+      input.stream(Input::PendulumState));
     return decision;
   }
 
@@ -923,7 +900,7 @@ SupervisorDecision resolve(
     if (cause != Staleness::Fresh) {
       decision.fault = policy_of(stream_input).fault;
       decision.message =
-        staleness_message(config, stream_input, cause, input.stream(stream_input), {});
+        staleness_message(config, stream_input, cause, input.stream(stream_input));
       return decision;
     }
   }
@@ -995,8 +972,7 @@ SupervisorDecision decide(const SupervisorConfig & config, const SupervisorInput
 {
   const std::array<Staleness, kInputCount> staleness = freshness(config, input);
 
-  const bool estimate_trusted =
-    staleness[index_of(Input::PendulumState)] == Staleness::Fresh && input.pendulum_state.valid;
+  const bool estimate_trusted = staleness[index_of(Input::PendulumState)] == Staleness::Fresh;
 
   const SwayVerdict sway = judge_sway(
     config.sway, input.pendulum_state.velocity, estimate_trusted, input.sampled_at, input.sway);
@@ -1231,7 +1207,6 @@ std::string mpc_horizon_refusal(
         deadline + kHorizonStampAheadEnd;
       break;
     case Staleness::Fresh:
-    case Staleness::ProducerUnhealthy:
       text += kHorizonOutcomeHead + deadline + kHorizonOutcomeMid +
         solve_outcome_name(horizon.outcome) + kHorizonOutcomeTail;
       break;

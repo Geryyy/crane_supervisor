@@ -3,23 +3,12 @@
 
 #include <cstdint>
 
-#include "crane_model/testing/mock_model.hpp"
 #include "crane_msgs/msg/solver_health.hpp"
 #include "crane_msgs/msg/supervisor_status.hpp"
 #include "crane_msgs/msg/sway_settled.hpp"
 #include "crane_supervisor/supervisor_core.hpp"
 #include "crane_supervisor/supervisor_node.hpp"
 #include "epsilon_crane_msgs/msg/remote_ctrl_states.hpp"
-
-TEST(CraneSupervisorContract, W08UsesInstalledModelDynamicsContract)
-{
-  const auto model = crane_model::testing::MockModel::create(crane_model::Tool::Pzs100);
-  ASSERT_TRUE(model.ok());
-  const auto result = model.value().inverse_dynamics(
-    crane_model::Q::Zero(), crane_model::DQ::Zero(), crane_model::DQ::Zero(),
-    crane_model::Payload{});
-  EXPECT_EQ(result.status().code, crane_model::ErrorCode::InvalidPayload);
-}
 
 TEST(CraneSupervisorContract, TheCoreIsNumberedAsTheMessageIsNumbered)
 {

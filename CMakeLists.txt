@@ -85,10 +85,9 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
   find_package(controller_manager REQUIRED)
-  find_package(crane_model REQUIRED)
 
-  # The seams outside this package: the installed `crane_model` dynamics
-  # contract, the numbering `crane_msgs/SupervisorStatus` fixes, and which
+  # The seams outside this package: the numbering
+  # `crane_msgs/SupervisorStatus` fixes, and which
   # `epsilon_crane_msgs/RemoteCtrlStates` boolean the configured deadman
   # selects. Message structs only -- the adapter is linked for one free
   # function, and no node is constructed, no clock read, no graph joined.
@@ -96,7 +95,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_contract
     supervisor_core
     supervisor_node
-    crane_model::mock_model
     ${crane_msgs_TARGETS}
     ${epsilon_crane_msgs_TARGETS})
 

@@ -120,11 +120,11 @@ struct InputPolicy
 /// The one row per input, in enum order.
 inline constexpr std::array<InputPolicy, kInputCount> kInputPolicies{{
   {Input::PendulumState, "the passive joint state", "/joint_states",
-    "sensor_msgs/JointState", "tip_tilt_state_broadcaster", "stopped arriving",
+    "sensor_msgs/JointState", "joint_state_broadcaster", "stopped arriving",
     "The passive joint state counts as unavailable, so nothing that closes on it may be trusted: "
     "a stale joint velocity makes the inner loop's integrator wind up against a value that is no "
     "longer true.",
-    "Check that tip_tilt_state_broadcaster is loaded and active on the controller manager.",
+    "Check that joint_state_broadcaster is loaded and active on the controller manager.",
     Fault::StateHealth, false},
   {Input::RemoteCtrl, "the operator remote", "/crane/remote_ctrl_states",
     "epsilon_crane_msgs/RemoteCtrlStates", "gpio_controller", "stopped arriving",

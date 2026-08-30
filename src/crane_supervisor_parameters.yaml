@@ -253,8 +253,8 @@ crane_supervisor:
       default_value: [0.4, 0.4]
       read_only: true
       description: "The passive joint rate past which FAULT_SWAY is raised,
-        rad/s, over [tip, tilt] -- the same index order
-        tip_tilt_state_broadcaster publishes the pair in. The fault names which of the two coordinates
+        rad/s, over [tip, tilt] -- the index order of Nomenclature 2. The
+        fault names which of the two coordinates
         exceeded its own bound, because an operator watching the tool swing
         along the boom and one watching it swing across it are looking at two
         different things.

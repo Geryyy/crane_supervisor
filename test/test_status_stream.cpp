@@ -44,7 +44,7 @@ constexpr std::size_t kGripperAxis = 5;
 
 constexpr double kTestTimeout = 0.2;
 
-/// The passive pair as `tip_tilt_state_broadcaster` publishes it on `/joint_states`.
+/// The passive pair as `joint_state_broadcaster` publishes it on `/joint_states`.
 /**
  * `age` is how far in the past the pair is stamped when it goes out. It is the only way this
  * fixture can degrade the input, because `sensor_msgs/JointState` carries no validity flag: a

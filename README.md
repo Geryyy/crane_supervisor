@@ -677,11 +677,10 @@ Two different things come off the passive rate and they are not interchangeable:
 | the predicate | **three-valued** — settled, not settled, unknown — held over a dwell and released through a hysteresis | `crane_msgs/SwaySettled` on `/crane/sway_settled`, **and** the clause every status report ends in |
 
 **Both are on the rate and neither is on the angle.**  Two independent reasons,
-either of which would be enough on its own.  `tip_tilt_state_broadcaster` reads
-the two passive coordinates out on the *nominal* hinge axes, because the
-calibrated 2-D spline for the real double hinge needs calibration data this
-workspace does not carry — so the published angle carries an uncalibrated
-constant offset, and `theta7_tilt_joint`'s limits are not centred on zero either.
+either of which would be enough on its own.  The published angle carries an
+uncalibrated constant offset — the calibrated 2-D spline for the real double
+hinge needs calibration data this workspace does not carry — and
+`theta7_tilt_joint`'s limits are not centred on zero either.
 The rate is a composition of the two gyro readings through the known chain rather
 than a derivative of the angle, so none of that reaches it.
 

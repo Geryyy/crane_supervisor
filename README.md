@@ -755,9 +755,11 @@ else can branch on, which is what it was for.
 
 `crane_velocity_controller` computes a `SupervisorStatus` fault code on every one
 of its 100 Hz cycles.  Until `/crane/velocity_controller/health` existed the only
-way to read it was `CraneVelocityController::fault()`, an accessor whose own
-documentation says it is there for the S5 harness and is never on the control
-path — so the fault stopped at the controller manager and reached nobody.  The
+way to read it was `CraneVelocityController::fault()`, an in-process accessor
+that was there for the S5 harness and never on the control path — so the fault
+stopped at the controller manager and reached nobody.  That accessor has since
+been removed along with the harness it served; the published stream is the only
+way out.  The
 concrete consequence: prerequisite 4, the uncalibrated PZS100 gripper axis, is
 reported as `FAULT_NOT_COMMISSIONED` on the `hardware` profile, and that report
 was going nowhere.

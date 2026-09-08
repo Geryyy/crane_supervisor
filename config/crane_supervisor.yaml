@@ -16,7 +16,18 @@ crane_supervisor:
       mpc:
         - crane_velocity_controller
 
-    tool_controllers: []
+    # `tool_controllers` is deliberately ABSENT, not empty. The parameter is
+    # declared `string_array` with a `[]` default in
+    # `src/crane_supervisor_parameters.yaml`, and that typed default is what
+    # should apply. Writing `tool_controllers: []` here instead routes an empty
+    # sequence through the params-file parser, which cannot infer an element
+    # type from zero elements, and the node aborts in its own constructor:
+    # `parameter_value_from failed for parameter 'tool_controllers': No
+    # parameter value set`. That abort is why `crane_supervisor` did not start
+    # on any profile -- `fake` and `hardware` compose it unconditionally -- and
+    # why the CBS behaviour-tree profile had to pass `start_supervisor:=false`.
+    # Give the key a real tool controller when one exists; until then leave it
+    # out.
 
     sway:
       dq_u_max: [0.4, 0.4]

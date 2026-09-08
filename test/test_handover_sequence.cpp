@@ -571,6 +571,33 @@ TEST_F(HandoverSequence, AWarmHorizonMovesTheClaimAndTheProducerInTheOrderStepTw
   EXPECT_EQ(producer_->mode(), "shadow");
 }
 
+TEST_F(HandoverSequence, AModeThatNeedsNoSwitchStillMovesTheProducer)
+{
+  // The profile that never composes a trajectory controller: the active set is
+  // already the mpc set on the first cycle, so MODE_MPC has nothing to
+  // deactivate. The claim not having to move says nothing about which mode the
+  // producer is in, and answering `success` while it is still in shadow is the
+  // one failure that looks like nothing at all -- /crane/mpc/horizon silent,
+  // the inner loop unchained with no producer, the caller told MODE_MPC was
+  // reached and the crane simply standing still.
+  clear_the_starting_latch();
+  manager_->set_state(kInnerLoop, "active");
+  ASSERT_TRUE(wait_until([this]() {return saw_mode(SupervisorStatus::MODE_MPC);}));
+  ASSERT_EQ(producer_->mode(), "shadow");
+
+  const auto to_mpc =
+    request_while_solving(SupervisorStatus::MODE_MPC, SolverHealth::SOLVE_CONVERGED);
+  ASSERT_NE(to_mpc, nullptr);
+  EXPECT_TRUE(to_mpc->success) << to_mpc->message;
+  EXPECT_EQ(to_mpc->active_mode, SupervisorStatus::MODE_MPC) << to_mpc->message;
+
+  EXPECT_EQ(manager_->switch_calls(), 0)
+    << "the active set already was the mpc set; nothing had to move";
+  EXPECT_EQ(producer_->mode(), "active")
+    << "MODE_MPC was accepted with the producer left in shadow, so nothing would "
+       "have driven the inner loop";
+}
+
 TEST_F(HandoverSequence, TheSupervisorAndNothingElseDecidesWhichPathIsLive)
 {
   clear_the_starting_latch();

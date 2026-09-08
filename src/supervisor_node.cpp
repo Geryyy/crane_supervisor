@@ -517,10 +517,31 @@ void SupervisorNode::set_mode(
 
   const ModeArbitration arbitration = arbitrate_mode(config_, request->mode, observe());
   if (!arbitration.accepted || !arbitration.switch_required) {
-    response->success = arbitration.accepted;
-    response->message = arbitration.message + mode_clause(config_, arbitration.active);
-    response->active_mode = static_cast<std::uint8_t>(arbitration.active.mode);
+    // A mode that needs no controller switch still owns the producer. Which
+    // controllers are up and which mode the producer is in are two facts, and
+    // only the first one is what `switch_required` is about: a profile that
+    // never spawned `trajectory_controller_a2b` is already in the mpc set the
+    // moment it starts, so MODE_MPC moves nothing -- and before this, returned
+    // accepted with `crane_mpc` still in shadow. Nothing then published
+    // `/crane/mpc/horizon`, the inner loop ran with no producer at all, and the
+    // caller had been told the mode was reached. The producer is set to what
+    // the accepted mode implies here for the same reason the switching path
+    // sets it: MODE_MPC means active, every other mode means shadow.
+    ProducerSwitch producer;
     if (arbitration.accepted) {
+      producer = set_horizon_producer_mode(arbitration.horizon_producer_active);
+    }
+    // Only a producer that was asked and refused unmakes the mode. Not asking
+    // at all is the composition's answer -- a deployment with no `crane_mpc`
+    // reaches every mode that does not need one -- and is left as it was.
+    const bool producer_holds = !producer.attempted || producer.accepted;
+    response->success = arbitration.accepted && producer_holds;
+    response->message = arbitration.message + mode_clause(config_, arbitration.active);
+    if (!producer_holds) {
+      response->message += " The horizon producer did not take that mode: " + producer.account;
+    }
+    response->active_mode = static_cast<std::uint8_t>(arbitration.active.mode);
+    if (response->success) {
       RCLCPP_INFO(get_logger(), "%s: %s", kSetModeService, response->message.c_str());
     } else {
       RCLCPP_WARN(get_logger(), "%s: %s", kSetModeService, response->message.c_str());

@@ -1290,6 +1290,12 @@ ModeArbitration arbitrate_mode(
 
   if (mode == arbitration.active.mode && !arbitration.active.partial) {
     arbitration.accepted = true;
+    // Which mode this is says which producer it implies, and that is true on
+    // every path out of here -- including this one, where the controllers
+    // already stand where the mode wants them. Leaving the field at its default
+    // here read as "this mode wants shadow", which is the opposite of what
+    // MODE_MPC means.
+    arbitration.horizon_producer_active = mode == Mode::Mpc;
     arbitration.message =
       kModeAlreadyActiveHead + std::string(mode_name(mode)) + kModeAlreadyActiveTail;
     return arbitration;
